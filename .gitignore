@@ -36,3 +36,6 @@ extension-extract/
 # Keep the source archive and guide tracked by default; uncomment to ignore
 # claude-chrome.zip
 # *.docx
+
+# Generated conversion output
+*_Safari/
