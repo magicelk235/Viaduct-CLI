@@ -1,0 +1,247 @@
+import { readFileSync, existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import type { Manifest, Issue } from "./types.js";
+
+export function loadManifest(extPath: string): Manifest {
+  const p = join(extPath, "manifest.json");
+  if (!existsSync(p)) throw new Error(`No manifest.json found in ${extPath}`);
+  return JSON.parse(readFileSync(p, "utf-8")) as Manifest;
+}
+
+/** Permissions Safari does not implement. Value = remediation note. */
+export const UNSUPPORTED_PERMISSIONS: Record<string, string> = {
+  identity: "Safari lacks chrome.identity; use a hosted web OAuth2 flow + window.postMessage.",
+  debugger: "chrome.debugger (CDP) is unsupported; build a Web Inspector Extension (devtools_page).",
+  sidePanel: "Safari has no sidePanel API; falling back to an action popup.",
+  tabGroups: "Safari has no tabGroups API.",
+  offscreen: "Safari has no offscreen documents API; use the service worker or web workers.",
+  webRequestBlocking: "Blocking webRequest is unsupported; use declarativeNetRequest.",
+  gcm: "chrome.gcm is Chrome-only; relay via APNs in the host app or poll with chrome.alarms.",
+  tts: "Text-to-speech API unavailable.",
+  ttsEngine: "TTS engine API unavailable.",
+  platformKeys: "platformKeys unavailable.",
+  "enterprise.platformKeys": "enterprise.platformKeys unavailable.",
+};
+
+/** chrome.* API call patterns flagged during JS scans. */
+export const UNSUPPORTED_APIS: Record<string, { severity: Issue["severity"]; message: string; fix: string }> = {
+  "chrome.identity.launchWebAuthFlow": {
+    severity: "warning",
+    message: "launchWebAuthFlow is unsupported and safari-web-extension:// redirects are blocked.",
+    fix: "Open hosted auth in a tab, redirect to your own HTTPS callback, postMessage the code back.",
+  },
+  "chrome.identity": {
+    severity: "warning",
+    message: "chrome.identity is unsupported in Safari (all platforms).",
+    fix: "Replace with a hosted OAuth2 redirect flow; shim stubs it so calls reject instead of throwing.",
+  },
+  "chrome.debugger": {
+    severity: "warning",
+    message: "chrome.debugger (Chrome DevTools Protocol) is unsupported.",
+    fix: "Build a Safari Web Inspector Extension via the devtools_page manifest key.",
+  },
+  "chrome.gcm": {
+    severity: "warning",
+    message: "chrome.gcm push messaging is Chrome-only.",
+    fix: "Use APNs in the native host app, or poll via chrome.alarms + fetch.",
+  },
+  "chrome.notifications": {
+    severity: "warning",
+    message: "chrome.notifications is missing in Safari.",
+    fix: "Bridge to native notifications via sendNativeMessage, or inject a DOM banner.",
+  },
+  "chrome.contextMenus": {
+    severity: "warning",
+    message: "chrome.contextMenus is unsupported on Safari iOS.",
+    fix: "Register a 'contextmenu' listener in a content script and relay via runtime.sendMessage.",
+  },
+  "cookies.onChanged": {
+    severity: "warning",
+    message: "cookies.onChanged is unsupported.",
+    fix: "Poll cookies, or monitor session state from a content script.",
+  },
+  "runtime.setUninstallURL": {
+    severity: "warning",
+    message: "runtime.setUninstallURL is unsupported.",
+    fix: "Remove or guard behind feature detection.",
+  },
+  "tabs.move": { severity: "warning", message: "tabs.move is unsupported.", fix: "Remove or rework UX." },
+  "tabs.highlighted": {
+    severity: "warning",
+    message: "tabs.highlighted query is unsupported.",
+    fix: "Use tabs.query({ active: true }).",
+  },
+  "webNavigation.onCreatedNavigationTarget": {
+    severity: "warning",
+    message: "webNavigation.onCreatedNavigationTarget is unsupported.",
+    fix: "Use webNavigation.onCommitted.",
+  },
+  "webNavigation.onHistoryStateUpdated": {
+    severity: "warning",
+    message: "webNavigation.onHistoryStateUpdated is unsupported.",
+    fix: "Monitor history changes from a content script.",
+  },
+};
+
+export interface ManifestAnalysis {
+  issues: Issue[];
+  permissionsToRemove: string[];
+}
+
+export function analyzeManifest(m: Manifest): ManifestAnalysis {
+  const issues: Issue[] = [];
+  const permissionsToRemove: string[] = [];
+  const allPerms = [...(m.permissions ?? []), ...(m.optional_permissions ?? [])];
+
+  for (const perm of allPerms) {
+    if (perm in UNSUPPORTED_PERMISSIONS) {
+      issues.push({
+        severity: perm === "identity" || perm === "debugger" ? "warning" : "warning",
+        category: "permission",
+        message: `Unsupported permission "${perm}" will be removed.`,
+        file: "manifest.json",
+        fix: UNSUPPORTED_PERMISSIONS[perm],
+        autoFixed: true,
+      });
+      permissionsToRemove.push(perm);
+    }
+  }
+
+  if (m.update_url) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: "update_url ignored by Safari (App Store updates only); removing.",
+      file: "manifest.json",
+      autoFixed: true,
+    });
+  }
+  if (m.minimum_chrome_version) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: "minimum_chrome_version is meaningless for Safari; removing.",
+      file: "manifest.json",
+      autoFixed: true,
+    });
+  }
+
+  const mv = m.manifest_version ?? 2;
+  if (mv === 2 && m.background?.persistent !== false) {
+    issues.push({
+      severity: "error",
+      category: "background",
+      message: "MV2 persistent background is unsupported; setting persistent:false.",
+      file: "manifest.json",
+      fix: "Prefer migrating to an MV3 service worker.",
+      autoFixed: true,
+    });
+  }
+
+  if (mv === 3 && m.background?.type === "module") {
+    issues.push({
+      severity: "warning",
+      category: "background",
+      message: 'background.type:"module" causes silent popup failures on Safari/TestFlight.',
+      file: "manifest.json",
+      fix: "Removing type:module (use --keep-module to preserve).",
+      autoFixed: true,
+    });
+  }
+
+  const action = m.action ?? m.browser_action;
+  if (!action?.default_popup) {
+    issues.push({
+      severity: "info",
+      category: "ui",
+      message: "Action has no default_popup; the toolbar button would be inert in Safari.",
+      file: "manifest.json",
+      fix: "Auto-wiring a detected popup/sidepanel HTML as default_popup.",
+      autoFixed: true,
+    });
+  }
+
+  if (m.externally_connectable?.ids?.length) {
+    issues.push({
+      severity: "warning",
+      category: "manifest",
+      message: "externally_connectable by extension IDs is unsupported in Safari.",
+      file: "manifest.json",
+      fix: "Use matches for web-page messaging; ID-based connections will not resolve.",
+    });
+  }
+
+  if (allPerms.includes("storage")) {
+    issues.push({
+      severity: "info",
+      category: "storage",
+      message: "storage.sync does NOT sync across iCloud devices in Safari (maps to local).",
+      file: "manifest.json",
+      fix: "Shim routes sync→local; implement custom cloud sync if cross-device is required.",
+    });
+  }
+
+  return { issues, permissionsToRemove };
+}
+
+/** Produce the Safari-ready manifest. Pure: does not write to disk. */
+export function transformManifest(
+  m: Manifest,
+  permissionsToRemove: string[],
+  extPath: string,
+  opts: { keepModuleBackground: boolean; shimFile?: string }
+): Manifest {
+  const out: Manifest = JSON.parse(JSON.stringify(m));
+
+  delete out.update_url;
+  delete out.key;
+  delete out.minimum_chrome_version;
+
+  const removeSet = new Set(permissionsToRemove);
+  if (out.permissions) out.permissions = out.permissions.filter((p) => !removeSet.has(p));
+  if (out.optional_permissions) {
+    out.optional_permissions = out.optional_permissions.filter((p) => !removeSet.has(p));
+    if (out.optional_permissions.length === 0) delete out.optional_permissions;
+  }
+
+  const mv = out.manifest_version ?? 2;
+  if (mv === 2) {
+    out.background = { ...(out.background ?? {}), persistent: false };
+  }
+  if (mv === 3 && out.background?.type === "module" && !opts.keepModuleBackground) {
+    delete out.background.type;
+  }
+
+  out.browser_specific_settings = {
+    ...(out.browser_specific_settings ?? {}),
+    safari: { strict_min_version: "15.4", strict_max_version: "18.*" },
+  };
+
+  // Ensure the toolbar button does something: wire a popup if one exists.
+  const actionKey = out.action ? "action" : out.browser_action ? "browser_action" : "action";
+  const action = (out[actionKey] as Manifest["action"]) ?? {};
+  if (!action.default_popup) {
+    for (const candidate of ["popup.html", "sidepanel.html", "panel.html", "index.html"]) {
+      if (existsSync(join(extPath, candidate))) {
+        action.default_popup = candidate;
+        break;
+      }
+    }
+  }
+  out[actionKey] = action;
+
+  // Prepend the compat shim to every content script so sync/identity/sidePanel are patched.
+  if (opts.shimFile && Array.isArray(out.content_scripts)) {
+    for (const cs of out.content_scripts) {
+      if (Array.isArray(cs.js) && !cs.js.includes(opts.shimFile)) {
+        cs.js.unshift(opts.shimFile);
+      }
+    }
+  }
+
+  return out;
+}
+
+export function writeManifest(targetDir: string, manifest: Manifest): void {
+  writeFileSync(join(targetDir, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n", "utf-8");
+}
