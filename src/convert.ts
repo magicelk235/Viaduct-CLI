@@ -6,7 +6,7 @@ import { extractExtension } from "./extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest } from "./manifest.js";
 import { scanJsFiles } from "./analyze.js";
 import { stageExtension } from "./stage.js";
-import { writeShim, SHIM_FILENAME } from "./shim.js";
+import { writeShim, injectShimIntoHtmlPages, injectPopupSizing, SHIM_FILENAME } from "./shim.js";
 import { writeTempLoadInstructions } from "./tempload.js";
 import {
   runPackager,
@@ -75,6 +75,8 @@ export function convert(opts: ConvertOptions): ConvertResult {
     let shimFile: string | undefined;
     if (opts.generateShim) {
       shimFile = writeShim(stageDir);
+      const n = injectShimIntoHtmlPages(stageDir);
+      if (n > 0) ok(`Shim injected into ${n} HTML page(s)`);
     }
 
     const transformed = transformManifest(manifest, permissionsToRemove, stageDir, {
@@ -82,6 +84,8 @@ export function convert(opts: ConvertOptions): ConvertResult {
       shimFile: shimFile === SHIM_FILENAME ? SHIM_FILENAME : undefined,
     });
     writeManifest(stageDir, transformed);
+    const popupFile = (transformed.action ?? transformed.browser_action)?.default_popup;
+    if (popupFile) injectPopupSizing(stageDir, popupFile);
     result.stagedPath = stageDir;
     ok(`Staged → ${stageDir}`);
 

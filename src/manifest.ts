@@ -214,7 +214,7 @@ export function transformManifest(
 
   out.browser_specific_settings = {
     ...(out.browser_specific_settings ?? {}),
-    safari: { strict_min_version: "15.4", strict_max_version: "18.*" },
+    safari: { strict_min_version: "15.4" },
   };
 
   // Ensure the toolbar button does something: wire a popup if one exists.

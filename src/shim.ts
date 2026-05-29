@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { writeFileSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 export const SHIM_FILENAME = "safari-compat-shim.js";
@@ -14,6 +14,12 @@ export function shimSource(): string {
   "use strict";
   var api = typeof browser !== "undefined" ? browser : (typeof chrome !== "undefined" ? chrome : null);
   if (!api) return;
+  var hasChrome = typeof chrome !== "undefined";
+
+  // Inert event stub so module-eval code that reads .addListener on a missing API does not throw.
+  function event() {
+    return { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } };
+  }
 
   // storage.sync has no iCloud sync in Safari; route it to local so data persists.
   if (api.storage && api.storage.local) {
@@ -74,6 +80,40 @@ export function shimSource(): string {
       getAll: function (cb) { if (cb) cb({}); return Promise.resolve({}); },
     };
   }
+
+  // tabGroups is absent in Safari. Stub enums + methods so module-eval (which reads
+  // chrome.tabGroups.Color / TAB_GROUP_ID_NONE at load) does not throw and blank the page.
+  if (hasChrome && !chrome.tabGroups) {
+    var noGroups = function () { return Promise.resolve([]); };
+    chrome.tabGroups = {
+      TAB_GROUP_ID_NONE: -1,
+      Color: { GREY: "grey", BLUE: "blue", RED: "red", YELLOW: "yellow", GREEN: "green", PINK: "pink", PURPLE: "purple", CYAN: "cyan", ORANGE: "orange" },
+      query: noGroups,
+      get: function () { return Promise.reject(new Error("tabGroups unsupported")); },
+      update: function () { return Promise.reject(new Error("tabGroups unsupported")); },
+      move: function () { return Promise.reject(new Error("tabGroups unsupported")); },
+      onCreated: event(), onUpdated: event(), onRemoved: event(), onMoved: event(),
+    };
+  }
+
+  // chrome.debugger (CDP) is unsupported; stub so calls reject and listeners no-op.
+  if (hasChrome && !chrome.debugger) {
+    var dbgFail = function () { return Promise.reject(new Error("chrome.debugger is unsupported in Safari.")); };
+    chrome.debugger = {
+      attach: dbgFail, detach: dbgFail, sendCommand: dbgFail, getTargets: function () { return Promise.resolve([]); },
+      onEvent: event(), onDetach: event(),
+    };
+  }
+
+  // offscreen documents do not exist in Safari; stub so createDocument/hasDocument resolve.
+  if (hasChrome && !chrome.offscreen) {
+    chrome.offscreen = {
+      Reason: { AUDIO_PLAYBACK: "AUDIO_PLAYBACK", BLOBS: "BLOBS", CLIPBOARD: "CLIPBOARD", DOM_PARSER: "DOM_PARSER", DOM_SCRAPING: "DOM_SCRAPING", IFRAME_SCRIPTING: "IFRAME_SCRIPTING", TESTING: "TESTING", USER_MEDIA: "USER_MEDIA", WORKERS: "WORKERS", DISPLAY_MEDIA: "DISPLAY_MEDIA", GEOLOCATION: "GEOLOCATION", LOCAL_STORAGE: "LOCAL_STORAGE", BATTERY_STATUS: "BATTERY_STATUS", MATCH_MEDIA: "MATCH_MEDIA", WEB_RTC: "WEB_RTC" },
+      createDocument: function () { return Promise.resolve(); },
+      closeDocument: function () { return Promise.resolve(); },
+      hasDocument: function () { return Promise.resolve(false); },
+    };
+  }
 })();
 `;
 }
@@ -82,4 +122,56 @@ export function writeShim(targetDir: string): string {
   const p = join(targetDir, SHIM_FILENAME);
   writeFileSync(p, shimSource(), "utf-8");
   return SHIM_FILENAME;
+}
+
+/**
+ * Inject the shim as the first <head> script of every top-level extension HTML page.
+ * Module scripts are deferred, so a classic script placed in <head> runs first — the
+ * shim patches missing chrome.* namespaces before bundle module-eval reads them.
+ */
+export function injectShimIntoHtmlPages(dir: string): number {
+  const tag = `<script src="/${SHIM_FILENAME}"></script>`;
+  let count = 0;
+  for (const name of readdirSync(dir)) {
+    if (!name.toLowerCase().endsWith(".html")) continue;
+    const file = join(dir, name);
+    let html = readFileSync(file, "utf-8");
+    if (html.includes(tag)) continue;
+    const headMatch = html.match(/<head[^>]*>/i);
+    if (headMatch) {
+      const at = headMatch.index! + headMatch[0].length;
+      html = html.slice(0, at) + "\n    " + tag + html.slice(at);
+    } else {
+      html = tag + "\n" + html;
+    }
+    writeFileSync(file, html, "utf-8");
+    count++;
+  }
+  return count;
+}
+
+/**
+ * Side-panel/full-height pages wired as a Safari action popup collapse to a tiny
+ * window because they carry no intrinsic size. Inject a sizing style so the popup
+ * opens at usable dimensions. style-src allows 'unsafe-inline' in typical MV3 CSPs.
+ */
+export function injectPopupSizing(dir: string, popupFile: string): void {
+  const file = join(dir, popupFile);
+  let html: string;
+  try {
+    html = readFileSync(file, "utf-8");
+  } catch {
+    return;
+  }
+  const marker = "c2s-popup-size";
+  if (html.includes(marker)) return;
+  const style = `<style id="${marker}">html,body{min-width:400px;width:400px;min-height:600px;height:600px;margin:0;overflow:auto;}</style>`;
+  const headMatch = html.match(/<head[^>]*>/i);
+  if (headMatch) {
+    const at = headMatch.index! + headMatch[0].length;
+    html = html.slice(0, at) + "\n    " + style + html.slice(at);
+  } else {
+    html = style + "\n" + html;
+  }
+  writeFileSync(file, html, "utf-8");
 }
