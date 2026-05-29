@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Tool runtime artifacts
+.chrome2safari-scratch/
+*.staged/
+staged_extension/
+out/
+build-output/
+
+# Xcode artifacts
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+*.appex
+*.app/
+build/
+*.xcarchive
+*.ipa
+*.dSYM/
+xcuserdata/
+*.xcuserstate
+*.build-log
+*.log
+
+# macOS
+.DS_Store
+
+# Local raw extension extracts
+extension-extract/
+*-extracted/
+
+# Keep the source archive and guide tracked by default; uncomment to ignore
+# claude-chrome.zip
+# *.docx
