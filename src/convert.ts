@@ -6,7 +6,9 @@ import { extractExtension } from "./extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest } from "./manifest.js";
 import { scanJsFiles } from "./analyze.js";
 import { stageExtension } from "./stage.js";
-import { writeShim, injectShimIntoHtmlPages, injectPopupSizing, SHIM_FILENAME } from "./shim.js";
+import { writeShim, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, SHIM_FILENAME } from "./shim.js";
+import { applyOAuthBridge } from "./oauth-bridge.js";
+import { applyDnr } from "./dnr.js";
 import { writeTempLoadInstructions } from "./tempload.js";
 import {
   runPackager,
@@ -83,6 +85,19 @@ export function convert(opts: ConvertOptions): ConvertResult {
       keepModuleBackground: opts.keepModuleBackground,
       shimFile: shimFile === SHIM_FILENAME ? SHIM_FILENAME : undefined,
     });
+
+    const dnrNotes = applyDnr(stageDir, transformed);
+    for (const n of dnrNotes) ok(n);
+
+    if (opts.oauthBridge !== false) {
+      const bridgeNotes = applyOAuthBridge(stageDir, transformed);
+      for (const n of bridgeNotes) ok(n);
+    }
+
+    if (convertServiceWorkerToBackgroundPage(stageDir, transformed)) {
+      ok("Service worker → persistent background page (Safari reachability)");
+    }
+
     writeManifest(stageDir, transformed);
     const popupFile = (transformed.action ?? transformed.browser_action)?.default_popup;
     if (popupFile) injectPopupSizing(stageDir, popupFile);
