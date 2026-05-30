@@ -65,6 +65,14 @@ export interface ConvertOptions {
   keepModuleBackground: boolean;
   /** Wire the Safari OAuth/externally_connectable bridge (default on). */
   oauthBridge?: boolean;
+  /** Copy the built app into ~/Applications and register it with Safari. */
+  install: boolean;
+  /** Override the install target dir (default ~/Applications). */
+  installDir?: string;
+  /** During --install, quit/relaunch Safari and write the unsigned toggle. */
+  safariRestart: boolean;
+  /** Apple Developer Team ID to sign with (real signing → persists across Safari quits). */
+  team?: string;
   verbose: boolean;
 }
 
@@ -77,4 +85,5 @@ export interface ConvertResult {
   xcodeProject?: string;
   appPath?: string;
   resolvedBundleId?: string;
+  installedAppPath?: string;
 }
