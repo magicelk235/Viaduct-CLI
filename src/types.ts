@@ -18,6 +18,7 @@ export interface Manifest {
   background?: {
     service_worker?: string;
     scripts?: string[];
+    page?: string;
     persistent?: boolean;
     type?: string;
   };
@@ -37,6 +38,9 @@ export interface Manifest {
   commands?: Record<string, unknown>;
   externally_connectable?: { ids?: string[]; matches?: string[] };
   content_security_policy?: Record<string, string> | string;
+  declarative_net_request?: {
+    rule_resources?: Array<{ id: string; enabled: boolean; path: string }>;
+  };
   update_url?: string;
   key?: string;
   minimum_chrome_version?: string;
@@ -59,6 +63,8 @@ export interface ConvertOptions {
   build: boolean;
   force: boolean;
   keepModuleBackground: boolean;
+  /** Wire the Safari OAuth/externally_connectable bridge (default on). */
+  oauthBridge?: boolean;
   verbose: boolean;
 }
 
