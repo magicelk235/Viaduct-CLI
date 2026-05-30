@@ -202,6 +202,19 @@ export function shimSource(): string {
           emitCdp(tabId, "Page.lifecycleEvent", { frameId: fid, name: "load" });
         }
       });
+      // A driven tab closing mid-run is an involuntary detach: Chrome fires
+      // onDetach("target_closed"). Without this the agent's onDetach cleanup
+      // never runs and waiters can hang on a dead tab.
+      if (chrome.tabs.onRemoved && chrome.tabs.onRemoved.addListener) {
+        chrome.tabs.onRemoved.addListener(function (tabId) {
+          if (!dbgAttached[tabId]) return;
+          delete dbgAttached[tabId];
+          var src = { tabId: tabId };
+          for (var i = 0; i < dbgDetList.length; i++) {
+            try { dbgDetList[i](src, "target_closed"); } catch (e) {}
+          }
+        });
+      }
     };
 
     var mapButton = function (b) { return b === "right" ? 2 : (b === "middle" ? 1 : 0); };

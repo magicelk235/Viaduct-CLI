@@ -71,7 +71,7 @@ function analyzeOnly(input: string, verbose: boolean): number {
     const { issues: mIssues } = analyzeManifest(manifest);
     const issues = [...mIssues, ...scanJsFiles(extPath)];
     printIssues(issues);
-    return 0;
+    return issues.some((i) => i.severity === "error") ? 1 : 0;
   } finally {
     if (existsSync(scratch)) rmSync(scratch, { recursive: true, force: true });
   }
