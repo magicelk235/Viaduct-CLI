@@ -228,7 +228,8 @@ export function transformManifest(
       }
     }
   }
-  out[actionKey] = action;
+  // Don't inject an empty action onto extensions that never had a toolbar button.
+  if (Object.keys(action).length > 0) out[actionKey] = action;
 
   // Prepend the compat shim to every content script so sync/identity/sidePanel are patched.
   if (opts.shimFile && Array.isArray(out.content_scripts)) {
