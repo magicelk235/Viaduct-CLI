@@ -405,12 +405,43 @@ export function shimSource(): string {
     };
   }
 
+  // Safari (current WebKit) CRASHES THE WHOLE BROWSER when a declarativeNetRequest
+  // ruleset contains a "modifyHeaders" action: reading the rule back from its SQLite
+  // store null-derefs in WebExtensionContext::loadDeclarativeNetRequestRules ->
+  // getRulesWithRuleIDs (EXC_BAD_ACCESS at 0x24). The Claude service worker registers
+  // a modifyHeaders SESSION rule to pin Origin for api.anthropic.com — which Safari
+  // ignores anyway (Origin is browser-controlled) and which the fetch/XHR header patch
+  // below already covers. Strip modifyHeaders rules out of update{Session,Dynamic}Rules
+  // so the crash never arms; block/redirect/allow rules pass through untouched.
+  if (hasChrome && chrome.declarativeNetRequest) {
+    var dnrNs = chrome.declarativeNetRequest;
+    var stripModifyHeaders = function (opts) {
+      if (!opts || !Array.isArray(opts.addRules)) return opts;
+      var safe = opts.addRules.filter(function (r) {
+        return !(r && r.action && r.action.type === "modifyHeaders");
+      });
+      return safe.length === opts.addRules.length ? opts : Object.assign({}, opts, { addRules: safe });
+    };
+    var wrapDnrUpdate = function (name) {
+      var orig = dnrNs[name];
+      if (typeof orig !== "function" || orig.__c2sWrapped) return;
+      dnrNs[name] = function (opts, cb) {
+        try { opts = stripModifyHeaders(opts); } catch (e) {}
+        return orig.call(dnrNs, opts, cb);
+      };
+      dnrNs[name].__c2sWrapped = true;
+    };
+    wrapDnrUpdate("updateSessionRules");
+    wrapDnrUpdate("updateDynamicRules");
+  }
+
   // api.anthropic.com requires the "anthropic-dangerous-direct-browser-access"
   // header on every browser-origin request; the SDK adds it to /v1/messages but
   // some hand-written fetches (e.g. /api/oauth/account/settings) omit it, giving
   // 401 "CORS requests must set 'anthropic-dangerous-direct-browser-access'
-  // header". DNR handles Origin (JS cannot set it), but THIS header is settable
-  // from JS, so inject it here — independent of the DNR ruleset. Covers fetch+XHR.
+  // header". Origin cannot be set in Safari at all (JS can't, and a DNR modifyHeaders
+  // rule crashes Safari so we strip it above), but THIS header IS settable from JS,
+  // so inject it here. Covers fetch+XHR.
   (function () {
     var ANTH = /(^|\.)api\.anthropic\.com/i;
     var HDR = "anthropic-dangerous-direct-browser-access";

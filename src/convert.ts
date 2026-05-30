@@ -10,6 +10,7 @@ import { writeShim, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWo
 import { applyOAuthBridge } from "./oauth-bridge.js";
 import { applyDnr } from "./dnr.js";
 import { writeTempLoadInstructions } from "./tempload.js";
+import { installToSafari } from "./installer.js";
 import {
   runPackager,
   patchProjectBundleIds,
@@ -87,7 +88,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
     });
 
     const dnrNotes = applyDnr(stageDir, transformed);
-    for (const n of dnrNotes) ok(n);
+    for (const n of dnrNotes) warn(n);
 
     if (opts.oauthBridge !== false) {
       const bridgeNotes = applyOAuthBridge(stageDir, transformed);
@@ -139,8 +140,8 @@ export function convert(opts: ConvertOptions): ConvertResult {
       return result;
     }
 
-    info("Building (ad-hoc signed) …");
-    const appPath = buildXcodeProject(xcodeproj, appName, outputDir, opts.platforms);
+    info(opts.team ? `Building (signed: team ${opts.team}) …` : "Building (ad-hoc signed) …");
+    const appPath = buildXcodeProject(xcodeproj, appName, outputDir, opts.platforms, opts.team);
     if (!appPath) {
       fail("Build failed. See output above.");
       printIssues(issues);
@@ -164,11 +165,31 @@ export function convert(opts: ConvertOptions): ConvertResult {
     const pk = pluginkitStatus();
     if (pk) info(`pluginkit:\n${pk}`);
 
-    const allowed = unsignedExtensionsAllowed();
-    if (allowed === false) {
-      warn('Safari "Allow Unsigned Extensions" is OFF — enable it (Develop menu) or the extension will not load.');
-    } else if (allowed === null) {
-      warn('Could not read Safari "Allow Unsigned Extensions"; enable it manually for ad-hoc builds.');
+    // The unsigned toggle only matters for ad-hoc builds; a team-signed app ignores it.
+    if (!opts.team) {
+      const allowed = unsignedExtensionsAllowed();
+      if (allowed === false) {
+        warn('Safari "Allow Unsigned Extensions" is OFF — enable it (Develop menu) or the extension will not load.');
+      } else if (allowed === null) {
+        warn('Could not read Safari "Allow Unsigned Extensions"; enable it manually for ad-hoc builds.');
+      }
+    }
+
+    if (opts.install) {
+      const inst = installToSafari({
+        builtAppPath: appPath,
+        appName,
+        bundleId,
+        installDir: opts.installDir,
+        safariRestart: opts.safariRestart,
+        signed: !!opts.team,
+      });
+      if (inst.installedAppPath) {
+        result.installedAppPath = inst.installedAppPath;
+        ok(`Installed → ${inst.installedAppPath}`);
+      } else {
+        warn("Install did not complete; the built app is still available above.");
+      }
     }
 
     result.success = true;

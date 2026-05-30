@@ -1,5 +1,6 @@
-import { readdirSync, statSync, existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { readdirSync, statSync, existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, basename } from "node:path";
 import { run, info, ok, warn } from "./util.js";
 import type { Platforms } from "./types.js";
 
@@ -108,19 +109,55 @@ function pickScheme(xcodeproj: string, appName: string, platforms: Platforms): s
   return byPlat ?? schemes[0] ?? null;
 }
 
-/** Build with ad-hoc signing (local dev). Returns path to the built .app. */
+/**
+ * Build the Xcode project. With `team` → automatic Apple-issued dev signing, which
+ * Safari loads WITHOUT the session-scoped "Allow Unsigned Extensions" toggle, so the
+ * extension survives quitting Safari. Without `team` → ad-hoc signing (needs the toggle,
+ * which resets every Safari session). Returns path to the built .app.
+ */
 export function buildXcodeProject(
   xcodeproj: string,
   appName: string,
   outputDir: string,
-  platforms: Platforms
+  platforms: Platforms,
+  team?: string
 ): string | null {
   const scheme = pickScheme(xcodeproj, appName, platforms);
   if (!scheme) {
     warn("No Xcode scheme found; skipping build.");
     return null;
   }
-  const derived = join(outputDir, "DerivedData");
+  // Build into a temp DerivedData OUTSIDE the project tree. When the project lives on
+  // an iCloud-synced volume (e.g. ~/Desktop or ~/Documents), the file provider stamps
+  // the freshly built .appex with `com.apple.fileprovider.fpfs#P` / `com.apple.FinderInfo`,
+  // and codesign then aborts with "resource fork, Finder information, or similar detritus
+  // not allowed" — so signing the App Sandbox entitlement fails and the build dies.
+  // $TMPDIR is never file-provider managed, so the bundle stays clean for signing.
+  const derived = mkdtempSync(join(tmpdir(), "c2s-dd-"));
+  const signing = team
+    ? [
+        // Real Apple-issued development signing. Automatic style + -allowProvisioningUpdates
+        // lets Xcode create/refresh the development provisioning profile (the App Sandbox
+        // entitlement requires one). A team-signed extension loads in Safari without the
+        // unsigned toggle and persists across restarts.
+        "-allowProvisioningUpdates",
+        "CODE_SIGN_STYLE=Automatic",
+        `DEVELOPMENT_TEAM=${team}`,
+        "CODE_SIGN_IDENTITY=Apple Development",
+      ]
+    : [
+        // Ad-hoc sign WITH entitlements. The targets set ENABLE_APP_SANDBOX=YES, which
+        // Xcode turns into the App Sandbox entitlement at sign time — and Safari refuses
+        // to register a web-extension appex that lacks it. CODE_SIGNING_ALLOWED=NO skips
+        // signing AND entitlement application, so the extension silently never appears in
+        // Safari. Manual style + empty team/profile lets the ad-hoc "-" identity sign
+        // without a provisioning profile.
+        "CODE_SIGN_IDENTITY=-",
+        "CODE_SIGN_STYLE=Manual",
+        "DEVELOPMENT_TEAM=",
+        "PROVISIONING_PROFILE_SPECIFIER=",
+        "CODE_SIGNING_REQUIRED=NO",
+      ];
   const args = [
     "-project",
     xcodeproj,
@@ -130,20 +167,30 @@ export function buildXcodeProject(
     "Release",
     "-derivedDataPath",
     derived,
-    "CODE_SIGN_IDENTITY=-",
-    "CODE_SIGNING_REQUIRED=NO",
-    "CODE_SIGNING_ALLOWED=NO",
+    ...signing,
     "build",
   ];
-  info(`xcodebuild -scheme "${scheme}" (ad-hoc signed)`);
+  info(`xcodebuild -scheme "${scheme}" (${team ? `team ${team}` : "ad-hoc"} signed)`);
   const res = run("xcodebuild", args);
   if (res.code !== 0) {
     warn(`build failed:\n${res.stderr.slice(-2000) || res.stdout.slice(-2000)}`);
+    rmSync(derived, { recursive: true, force: true });
     return null;
   }
   const productsDir = join(derived, "Build", "Products", "Release");
-  const apps = findFiles(productsDir, (n) => n.endsWith(".app"), 1);
-  return apps[0] ?? null;
+  const built = findFiles(productsDir, (n) => n.endsWith(".app"), 1)[0];
+  if (!built) {
+    rmSync(derived, { recursive: true, force: true });
+    return null;
+  }
+  // Move the signed .app into outputDir for a stable path. ditto preserves the
+  // signature/seal; copying back onto the synced volume only re-stamps xattrs on the
+  // already-signed bundle, which neither lsregister nor Safari rejects.
+  const stableApp = join(outputDir, basename(built));
+  if (existsSync(stableApp)) rmSync(stableApp, { recursive: true, force: true });
+  run("/usr/bin/ditto", [built, stableApp]);
+  rmSync(derived, { recursive: true, force: true });
+  return existsSync(stableApp) ? stableApp : null;
 }
 
 function plistValue(plistPath: string, key: string): string | null {
@@ -198,6 +245,21 @@ export function unsignedExtensionsAllowed(): boolean | null {
   const res = run("defaults", ["read", "com.apple.Safari", "AllowUnsignedAppExtensions"]);
   if (res.code !== 0) return null;
   return res.stdout.trim() === "1";
+}
+
+/**
+ * Best-effort read of an Apple Developer Team ID cached by Xcode. When an Apple
+ * account is signed into Xcode it records each team under
+ * IDEProvisioningTeamByIdentifier in com.apple.dt.Xcode (keyed by Apple ID). We
+ * return the first 10-char team id we can parse, so the tool can team-sign
+ * without the user knowing or passing the id. Returns null when no account is
+ * signed in or the value can't be read.
+ */
+export function detectXcodeTeam(): string | null {
+  const res = run("defaults", ["read", "com.apple.dt.Xcode", "IDEProvisioningTeamByIdentifier"]);
+  if (res.code !== 0) return null;
+  const ids = [...res.stdout.matchAll(/teamID\s*=\s*"?([A-Z0-9]{10})"?/g)].map((m) => m[1]);
+  return ids[0] ?? null;
 }
 
 export function defaultBundleId(appName: string): string {

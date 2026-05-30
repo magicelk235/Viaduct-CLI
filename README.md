@@ -27,9 +27,12 @@ Apple's `safari-web-extension-packager` and `xcodebuild` to produce a signed app
 - Auto-sizes side-panel pages wired as the action popup so the popup is not a
   collapsed, tiny window.
 - Packages the extension into an Xcode project, patches bundle identifiers, and
-  optionally builds an ad-hoc signed app.
+  optionally builds an ad-hoc or team-signed app.
 - Verifies the bundle identifier of the COMPILED `.appex`, not just the project
   files, so the wrong extension is never registered with Safari.
+- Optionally installs the built host app into `~/Applications` and registers it
+  with Safari (`--install`), so the extension persists across Safari restarts
+  when team-signed.
 
 ## Requirements
 
@@ -111,6 +114,11 @@ The default (without `--ci`) symlinks resources for live development edits; use
     --ci                Clean-copy resources (CI/TestFlight-safe)
     --temp-load         Stage only, for Safari 18 "Add Temporary Extension"
     --no-build          Generate the Xcode project but do not run xcodebuild
+    --install           Install the built app to ~/Applications + register w/ Safari
+    --install-dir <dir> Install target directory (default: ~/Applications)
+    --no-safari-restart With --install, don't quit/relaunch Safari or set the toggle
+    --team [<id>]       Sign with an Apple Team ID; --team auto (or plain --install)
+                        auto-detects it from Xcode. Omit for ad-hoc signing.
     --no-shim           Do not generate/inject the compatibility shim
     --keep-module       Keep background.type:"module" (default strips it)
     --force             Convert despite blocking errors
@@ -122,17 +130,50 @@ The default (without `--ci`) symlinks resources for live development edits; use
 
 ## Installing a built app
 
-After a full build the tool prints the app path. Copy it into Applications and
-launch it once so the system registers the extension:
+Let the tool install for you. It copies the built app into `~/Applications`,
+registers it with LaunchServices, and launches it once so Safari registers the
+extension:
 
 ```
-cp -R "<AppName>_Safari/.../Release/<AppName>.app" /Applications/
-open "/Applications/<AppName>.app"
+chrome2safari ./my-extension.zip --install
 ```
 
-Then enable the extension in Safari, Settings, Extensions. For ad-hoc (unsigned)
-builds, "Allow Unsigned Extensions" must be enabled in Safari's Develop menu;
-this setting resets every time Safari restarts.
+Then enable the extension in Safari, Settings, Extensions.
+
+### Persisting across Safari restarts (team signing)
+
+How the extension persists depends on how it was signed:
+
+- **Ad-hoc (no `--team`)**: Safari only loads it while "Allow Unsigned
+  Extensions" (Develop menu) is on, and that setting resets every time Safari
+  restarts. With `--install` the tool sets the toggle and bounces Safari for
+  you; pass `--no-safari-restart` to skip that.
+- **Team-signed (`--team`)**: signed with a real Apple Developer certificate, so
+  Safari loads it without the unsigned toggle and it survives quitting Safari.
+
+`--team auto` (or plain `--install`) auto-detects your Team ID from Xcode, so you
+do not need to know or type it:
+
+```
+chrome2safari ./my-extension.zip --install            # auto-detects the team
+chrome2safari ./my-extension.zip --install --team auto # same, explicit
+chrome2safari ./my-extension.zip --install --team V8K8L3ZSD5  # exact id
+```
+
+Auto-detection reads the team cached by Xcode (`IDEProvisioningTeamByIdentifier`
+in `com.apple.dt.Xcode`); it requires an Apple account signed into Xcode. If no
+team is found, the build falls back to ad-hoc signing.
+
+A free personal Apple team works, but its provisioning profile expires about
+every 7 days — re-run the command to re-sign. A paid Developer Program account
+lasts about a year.
+
+If you prefer to install manually, copy the printed app path yourself:
+
+```
+cp -R "<AppName>_Safari/<AppName>.app" ~/Applications/
+open "~/Applications/<AppName>.app"
+```
 
 ## Limitations
 
@@ -147,3 +188,8 @@ this setting resets every time Safari restarts.
   cannot be fixed by conversion alone.
 - `storage.sync` is mapped to `storage.local`; data persists but does not sync
   across devices.
+- `declarativeNetRequest` rules with a `modifyHeaders` action crash Safari's
+  WebKit rule loader, so the tool strips them (both static rulesets and dynamic
+  `updateSessionRules`/`updateDynamicRules` calls). Header-rewriting use cases —
+  for example a CORS bypass — are not converted; use a native-messaging proxy
+  instead.
