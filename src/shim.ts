@@ -1,7 +1,9 @@
 import { writeFileSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import type { Manifest } from "./types.js";
 
 export const SHIM_FILENAME = "safari-compat-shim.js";
+export const BACKGROUND_PAGE_FILENAME = "background.html";
 
 /**
  * Runtime compatibility shim, prepended to content scripts.
@@ -20,6 +22,62 @@ export function shimSource(): string {
   function event() {
     return { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } };
   }
+
+  // Chrome exposes runtime lifecycle event objects that Safari omits. The SW
+  // bundle reads chrome.runtime.<event>.addListener at module-eval; a missing one
+  // throws a TypeError that aborts module evaluation BEFORE onMessageExternal is
+  // registered (→ OAuth bridge "no external listener captured"). Backfill every
+  // standard runtime event as an inert stub if absent. Do NOT touch onMessage /
+  // onMessageExternal / onConnect* — those are real (or polyfilled) and carry the
+  // OAuth bridge handlers.
+  var rtEvents = ["onStartup", "onInstalled", "onSuspend", "onSuspendCanceled",
+    "onUpdateAvailable", "onBrowserUpdateAvailable", "onRestartRequired"];
+  function backfillRuntimeEvents(rt) {
+    if (!rt) return;
+    for (var ri = 0; ri < rtEvents.length; ri++) {
+      if (!rt[rtEvents[ri]]) { try { rt[rtEvents[ri]] = event(); } catch (e) {} }
+    }
+  }
+  backfillRuntimeEvents(typeof chrome !== "undefined" && chrome.runtime);
+  if (typeof browser !== "undefined" && browser !== chrome) backfillRuntimeEvents(browser.runtime);
+
+  // Safari's action popup (default_popup) is a POPOVER, not a side panel sharing
+  // the browser window. So tabs.query({active:true,currentWindow:true}) resolves
+  // currentWindow to the popover — which has no tabs — and returns []. Code that
+  // needs "the active tab" then throws "No active tab" and the chat/agent dies.
+  // Wrap tabs.query: if an active-tab query comes back empty, retry against the
+  // last-focused normal window, then any active tab. Supports callback + promise.
+  function wrapTabsQuery(ns, label) {
+    if (!ns || !ns.tabs || typeof ns.tabs.query !== "function" || ns.tabs.__c2sWrapped) return;
+    var _query = ns.tabs.query.bind(ns.tabs);
+    function runQuery(q) {
+      return new Promise(function (resolve) {
+        var settled = false;
+        var done = function (r) { if (!settled) { settled = true; resolve(r || []); } };
+        try {
+          var ret = _query(q, function (r) { done(r); });
+          if (ret && typeof ret.then === "function") ret.then(done, function () { done([]); });
+        } catch (e) { done([]); }
+      });
+    }
+    ns.tabs.query = function (qi, cb) {
+      var wantActive = qi && qi.active;
+      var p = runQuery(qi).then(function (res) {
+        if (res.length || !wantActive) return res;
+        var q2 = Object.assign({}, qi); delete q2.currentWindow; q2.lastFocusedWindow = true;
+        return runQuery(q2).then(function (r2) {
+          if (r2.length) return r2;
+          var q3 = Object.assign({}, qi); delete q3.currentWindow; delete q3.lastFocusedWindow;
+          return runQuery(q3);
+        });
+      });
+      if (typeof cb === "function") { p.then(function (r) { cb(r); }, function () { cb([]); }); return; }
+      return p;
+    };
+    ns.tabs.__c2sWrapped = true;
+  }
+  wrapTabsQuery(typeof chrome !== "undefined" ? chrome : null, "chrome");
+  if (typeof browser !== "undefined" && browser !== chrome) wrapTabsQuery(browser, "browser");
 
   // storage.sync has no iCloud sync in Safari; route it to local so data persists.
   if (api.storage && api.storage.local) {
@@ -63,22 +121,30 @@ export function shimSource(): string {
     };
   }
 
-  // chrome.notifications is missing; degrade to console + best-effort Web Notifications.
-  if (typeof chrome !== "undefined" && !chrome.notifications) {
-    chrome.notifications = {
-      create: function (id, opts, cb) {
-        try {
-          if (typeof Notification !== "undefined" && Notification.permission === "granted" && opts) {
-            new Notification(opts.title || "", { body: opts.message || "", icon: opts.iconUrl });
-          }
-        } catch (e) { /* ignore */ }
-        if (typeof cb === "function") cb(typeof id === "string" ? id : "");
-        return Promise.resolve(typeof id === "string" ? id : "");
-      },
-      clear: function (id, cb) { if (cb) cb(true); return Promise.resolve(true); },
-      update: function (id, opts, cb) { if (cb) cb(true); return Promise.resolve(true); },
-      getAll: function (cb) { if (cb) cb({}); return Promise.resolve({}); },
+  // chrome.notifications: Safari exposes only a PARTIAL object (create/clear) and
+  // omits the event objects (onClicked, onClosed, …). Module-eval that reads
+  // chrome.notifications.onClicked.addListener throws and aborts SW registration.
+  // Fill BOTH a missing object AND missing members on a partial one.
+  if (typeof chrome !== "undefined") {
+    var n = chrome.notifications || (chrome.notifications = {});
+    if (typeof n.create !== "function") n.create = function (id, opts, cb) {
+      try {
+        if (typeof Notification !== "undefined" && Notification.permission === "granted" && opts) {
+          new Notification(opts.title || "", { body: opts.message || "", icon: opts.iconUrl });
+        }
+      } catch (e) { /* ignore */ }
+      if (typeof cb === "function") cb(typeof id === "string" ? id : "");
+      return Promise.resolve(typeof id === "string" ? id : "");
     };
+    if (typeof n.clear !== "function") n.clear = function (id, cb) { if (cb) cb(true); return Promise.resolve(true); };
+    if (typeof n.update !== "function") n.update = function (id, opts, cb) { if (cb) cb(true); return Promise.resolve(true); };
+    if (typeof n.getAll !== "function") n.getAll = function (cb) { if (cb) cb({}); return Promise.resolve({}); };
+    if (typeof n.getPermissionLevel !== "function") n.getPermissionLevel = function (cb) { if (cb) cb("granted"); return Promise.resolve("granted"); };
+    if (!n.onClicked) n.onClicked = event();
+    if (!n.onClosed) n.onClosed = event();
+    if (!n.onButtonClicked) n.onButtonClicked = event();
+    if (!n.onShowSettings) n.onShowSettings = event();
+    if (!n.onPermissionLevelChanged) n.onPermissionLevelChanged = event();
   }
 
   // tabGroups is absent in Safari. Stub enums + methods so module-eval (which reads
@@ -96,12 +162,223 @@ export function shimSource(): string {
     };
   }
 
-  // chrome.debugger (CDP) is unsupported; stub so calls reject and listeners no-op.
+  // chrome.debugger (CDP) polyfill. Safari has no DevTools Protocol, but
+  // Claude-for-Chrome drives pages ENTIRELY through it: attach -> Page.enable ->
+  // captureScreenshot -> Input.* -> Runtime.evaluate, plus Page lifecycle events.
+  // A reject-stub makes the per-action attach throw, so every agent step (e.g.
+  // "Navigate to ...") hangs. Map the subset it uses onto Safari-supported
+  // tabs/scripting APIs. Coordinate contract matches CDP: Input.* gets CSS
+  // pixels (used as-is for elementFromPoint/clientX); captureScreenshot returns a
+  // device-pixel PNG (captureVisibleTab default). The Network domain cannot be
+  // reconstructed without CDP -> it no-ops (network request logs unavailable).
   if (hasChrome && !chrome.debugger) {
-    var dbgFail = function () { return Promise.reject(new Error("chrome.debugger is unsupported in Safari.")); };
+    var dbgAttached = Object.create(null); // tabId -> true
+    var dbgEvtList = [];                    // chrome.debugger.onEvent listeners
+    var dbgDetList = [];                    // chrome.debugger.onDetach listeners
+    var dbgHooked = false;
+
+    var emitCdp = function (tabId, method, params) {
+      var src = { tabId: tabId };
+      for (var i = 0; i < dbgEvtList.length; i++) {
+        try { dbgEvtList[i](src, method, params || {}); } catch (e) {}
+      }
+    };
+
+    // Synthesize the Page lifecycle events agent navigation waiters listen for,
+    // from chrome.tabs.onUpdated (CDP never fires in Safari).
+    var hookLifecycle = function () {
+      if (dbgHooked || !chrome.tabs || !chrome.tabs.onUpdated) return;
+      dbgHooked = true;
+      chrome.tabs.onUpdated.addListener(function (tabId, info, tab) {
+        if (!dbgAttached[tabId]) return;
+        var fid = String(tabId);
+        var url = (tab && tab.url) || info.url || "";
+        if (info.status === "loading") {
+          emitCdp(tabId, "Page.frameStartedLoading", { frameId: fid });
+          emitCdp(tabId, "Page.frameNavigated", { frame: { id: fid, loaderId: fid, url: url } });
+        } else if (info.status === "complete") {
+          emitCdp(tabId, "Page.loadEventFired", { timestamp: Date.now() / 1000 });
+          emitCdp(tabId, "Page.frameStoppedLoading", { frameId: fid });
+          emitCdp(tabId, "Page.lifecycleEvent", { frameId: fid, name: "load" });
+        }
+      });
+    };
+
+    var mapButton = function (b) { return b === "right" ? 2 : (b === "middle" ? 1 : 0); };
+
+    // --- functions injected into the target tab (must be self-contained) ---
+    var pageMouse = function (x, y, type, button, clickCount) {
+      var el = document.elementFromPoint(x, y) || document.body;
+      if (!el) return false;
+      var common = { bubbles: true, cancelable: true, composed: true, view: window,
+        clientX: x, clientY: y, button: button, buttons: type === "mousePressed" ? 1 : 0 };
+      var fire = function (name, Ctor) {
+        try { el.dispatchEvent(new Ctor(name, Object.assign({ pointerId: 1, isPrimary: true, pointerType: "mouse" }, common))); }
+        catch (e) { try { el.dispatchEvent(new MouseEvent(name, common)); } catch (e2) {} }
+      };
+      if (type === "mousePressed") {
+        fire("pointerdown", window.PointerEvent || MouseEvent);
+        fire("mousedown", MouseEvent);
+        if (typeof el.focus === "function") { try { el.focus(); } catch (e) {} }
+      } else if (type === "mouseReleased") {
+        fire("pointerup", window.PointerEvent || MouseEvent);
+        fire("mouseup", MouseEvent);
+        try { el.dispatchEvent(new MouseEvent("click", Object.assign({}, common, { detail: clickCount || 1 }))); } catch (e) {}
+        if ((clickCount || 1) >= 2) { try { el.dispatchEvent(new MouseEvent("dblclick", common)); } catch (e) {} }
+      } else if (type === "mouseMoved") {
+        fire("pointermove", window.PointerEvent || MouseEvent);
+        fire("mousemove", MouseEvent);
+      }
+      return true;
+    };
+
+    var pageWheel = function (x, y, dx, dy) {
+      var el = document.elementFromPoint(x, y) || document.scrollingElement || document.body;
+      try { el.dispatchEvent(new WheelEvent("wheel", { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, deltaX: dx || 0, deltaY: dy || 0 })); } catch (e) {}
+      var sc = document.scrollingElement || document.documentElement;
+      if (sc) { sc.scrollLeft += dx || 0; sc.scrollTop += dy || 0; }
+      return true;
+    };
+
+    var pageKey = function (type, key, code, keyCode, text, modifiers) {
+      var target = document.activeElement || document.body;
+      var name = type === "keyUp" ? "keyup" : (type === "rawKeyDown" || type === "keyDown" ? "keydown" : null);
+      var init = { bubbles: true, cancelable: true, composed: true, key: key || "", code: code || "",
+        keyCode: keyCode || 0, which: keyCode || 0,
+        altKey: !!(modifiers & 1), ctrlKey: !!(modifiers & 2), metaKey: !!(modifiers & 4), shiftKey: !!(modifiers & 8) };
+      if (name && target) { try { target.dispatchEvent(new KeyboardEvent(name, init)); } catch (e) {} }
+      if ((type === "char" || type === "keyDown") && text && text.length) {
+        var t = document.activeElement;
+        if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) {
+          var s = t.selectionStart != null ? t.selectionStart : t.value.length;
+          var e2 = t.selectionEnd != null ? t.selectionEnd : t.value.length;
+          t.value = t.value.slice(0, s) + text + t.value.slice(e2);
+          t.selectionStart = t.selectionEnd = s + text.length;
+          try { t.dispatchEvent(new Event("input", { bubbles: true })); } catch (e) {}
+        } else if (t && t.isContentEditable) {
+          try { document.execCommand("insertText", false, text); } catch (e) {}
+          try { t.dispatchEvent(new InputEvent("input", { bubbles: true, data: text })); } catch (e) {}
+        }
+      }
+      return true;
+    };
+
+    var pageInsertText = function (text) {
+      var t = document.activeElement;
+      if (!t) return false;
+      if (t.tagName === "INPUT" || t.tagName === "TEXTAREA") {
+        var s = t.selectionStart != null ? t.selectionStart : t.value.length;
+        var e2 = t.selectionEnd != null ? t.selectionEnd : t.value.length;
+        t.value = t.value.slice(0, s) + text + t.value.slice(e2);
+        t.selectionStart = t.selectionEnd = s + text.length;
+        try { t.dispatchEvent(new Event("input", { bubbles: true })); } catch (e) {}
+        return true;
+      }
+      if (t.isContentEditable) {
+        try { document.execCommand("insertText", false, text); } catch (e) {}
+        try { t.dispatchEvent(new InputEvent("input", { bubbles: true, data: text })); } catch (e) {}
+        return true;
+      }
+      return false;
+    };
+
+    var inject = function (tabId, fn, args) {
+      if (!chrome.scripting || !chrome.scripting.executeScript || tabId == null) return Promise.resolve(undefined);
+      return chrome.scripting.executeScript({ target: { tabId: tabId }, func: fn, args: args }).then(
+        function (r) { return (r && r[0]) ? r[0].result : undefined; },
+        function () { return undefined; }
+      );
+    };
+
+    var screenshot = function (tabId, params) {
+      params = params || {};
+      var opts = { format: params.format === "jpeg" ? "jpeg" : "png" };
+      if (opts.format === "jpeg" && params.quality != null) opts.quality = params.quality;
+      var capture = function (windowId) {
+        return new Promise(function (resolve, reject) {
+          try {
+            chrome.tabs.captureVisibleTab(windowId, opts, function (dataUrl) {
+              if (chrome.runtime.lastError || !dataUrl) { reject(new Error(chrome.runtime.lastError ? chrome.runtime.lastError.message : "captureVisibleTab failed")); return; }
+              var d = String(dataUrl); var ci = d.indexOf(",");
+              resolve({ data: ci >= 0 ? d.slice(ci + 1) : d });
+            });
+          } catch (e) { reject(e); }
+        });
+      };
+      return new Promise(function (resolve, reject) {
+        try {
+          chrome.tabs.get(tabId, function (tab) {
+            if (chrome.runtime.lastError || !tab) { capture().then(resolve, reject); return; }
+            capture(tab.windowId).then(resolve, reject);
+          });
+        } catch (e) { capture().then(resolve, reject); }
+      });
+    };
+
+    var evaluate = function (tabId, params) {
+      params = params || {};
+      return inject(tabId, function (code) {
+        try { return { ok: true, value: (0, eval)(code) }; }
+        catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+      }, [params.expression || ""]).then(function (res) {
+        if (res && res.ok) return { result: { type: typeof res.value, value: res.value } };
+        return { result: { type: "undefined" }, exceptionDetails: { text: (res && res.error) || "evaluate failed" } };
+      });
+    };
+
+    var runCommand = function (target, method, params) {
+      var tabId = target && target.tabId;
+      params = params || {};
+      switch (method) {
+        case "Page.captureScreenshot": return screenshot(tabId, params);
+        case "Runtime.evaluate": return evaluate(tabId, params);
+        case "Input.dispatchMouseEvent":
+          if (params.type === "mouseWheel") return inject(tabId, pageWheel, [params.x || 0, params.y || 0, params.deltaX || 0, params.deltaY || 0]).then(function () { return {}; });
+          return inject(tabId, pageMouse, [params.x || 0, params.y || 0, params.type, mapButton(params.button), params.clickCount || 1]).then(function () { return {}; });
+        case "Input.dispatchKeyEvent":
+          return inject(tabId, pageKey, [params.type, params.key, params.code, params.windowsVirtualKeyCode || params.nativeVirtualKeyCode || 0, params.text, params.modifiers || 0]).then(function () { return {}; });
+        case "Input.insertText":
+          return inject(tabId, pageInsertText, [params.text || ""]).then(function () { return {}; });
+        default:
+          // Page.enable/disable, Runtime.enable, Network.*, *.handleJavaScriptDialog,
+          // Emulation.*, DOM.* and any unknown command -> resolve so the loop proceeds.
+          return Promise.resolve({});
+      }
+    };
+
+    var withCb = function (promise, cb) {
+      if (typeof cb === "function") { promise.then(function (r) { try { cb(r); } catch (e) {} }, function () { try { cb(); } catch (e) {} }); return; }
+      return promise;
+    };
+
     chrome.debugger = {
-      attach: dbgFail, detach: dbgFail, sendCommand: dbgFail, getTargets: function () { return Promise.resolve([]); },
-      onEvent: event(), onDetach: event(),
+      attach: function (target, version, cb) {
+        if (target && target.tabId != null) dbgAttached[target.tabId] = true;
+        hookLifecycle();
+        return withCb(Promise.resolve(), cb);
+      },
+      detach: function (target, cb) {
+        if (target && target.tabId != null) delete dbgAttached[target.tabId];
+        return withCb(Promise.resolve(), cb);
+      },
+      sendCommand: function (target, method, params, cb) {
+        if (typeof params === "function") { cb = params; params = {}; }
+        return withCb(runCommand(target, method, params).catch(function () { return {}; }), cb);
+      },
+      getTargets: function (cb) {
+        var list = Object.keys(dbgAttached).map(function (id) { return { tabId: Number(id), attached: true, type: "page" }; });
+        return withCb(Promise.resolve(list), cb);
+      },
+      onEvent: {
+        addListener: function (fn) { if (typeof fn === "function") dbgEvtList.push(fn); },
+        removeListener: function (fn) { var i = dbgEvtList.indexOf(fn); if (i >= 0) dbgEvtList.splice(i, 1); },
+        hasListener: function (fn) { return dbgEvtList.indexOf(fn) >= 0; },
+      },
+      onDetach: {
+        addListener: function (fn) { if (typeof fn === "function") dbgDetList.push(fn); },
+        removeListener: function (fn) { var i = dbgDetList.indexOf(fn); if (i >= 0) dbgDetList.splice(i, 1); },
+        hasListener: function (fn) { return dbgDetList.indexOf(fn) >= 0; },
+      },
     };
   }
 
@@ -113,6 +390,87 @@ export function shimSource(): string {
       closeDocument: function () { return Promise.resolve(); },
       hasDocument: function () { return Promise.resolve(false); },
     };
+  }
+
+  // api.anthropic.com requires the "anthropic-dangerous-direct-browser-access"
+  // header on every browser-origin request; the SDK adds it to /v1/messages but
+  // some hand-written fetches (e.g. /api/oauth/account/settings) omit it, giving
+  // 401 "CORS requests must set 'anthropic-dangerous-direct-browser-access'
+  // header". DNR handles Origin (JS cannot set it), but THIS header is settable
+  // from JS, so inject it here — independent of the DNR ruleset. Covers fetch+XHR.
+  (function () {
+    var ANTH = /(^|\.)api\.anthropic\.com/i;
+    var HDR = "anthropic-dangerous-direct-browser-access";
+    var g = (typeof self !== "undefined") ? self : (typeof window !== "undefined" ? window : null);
+    if (g && typeof g.fetch === "function" && !g.fetch.__c2sPatched) {
+      var _fetch = g.fetch;
+      g.fetch = function (input, init) {
+        try {
+          var url = typeof input === "string" ? input : (input && input.url) || "";
+          if (ANTH.test(url)) {
+            var base = init || {};
+            var srcH = base.headers || (typeof input !== "string" && input && input.headers) || {};
+            var h = new Headers(srcH);
+            if (!h.has(HDR)) h.set(HDR, "true");
+            init = Object.assign({}, base, { headers: h });
+          }
+        } catch (e) { /* fall through with original args */ }
+        return _fetch.call(this, input, init);
+      };
+      g.fetch.__c2sPatched = true;
+    }
+    if (typeof XMLHttpRequest !== "undefined" && !XMLHttpRequest.prototype.__c2sPatched) {
+      var _open = XMLHttpRequest.prototype.open;
+      var _send = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function (m, u) {
+        try { this.__c2sAnthropic = ANTH.test(String(u)); } catch (e) {}
+        return _open.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype.send = function () {
+        try { if (this.__c2sAnthropic) this.setRequestHeader(HDR, "true"); } catch (e) {}
+        return _send.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype.__c2sPatched = true;
+    }
+  })();
+
+  // Safari: the action popup (sidepanel.html) opens as a POPOVER with no
+  // ?tabId=<id> query param (Chrome injects one) and not mode=window. A side
+  // panel that reads new URLSearchParams(location.search).get("tabId") to learn
+  // which browser tab to drive then gets null, leaving it with no active tab.
+  // Resolve the active tab now (tabs.query is already wrapped to fall back to the
+  // last-focused normal window) and make get("tabId") return it when the param is
+  // missing. Runs only in a side-panel document.
+  if (typeof window !== "undefined" && typeof location !== "undefined" &&
+      /sidepanel/i.test(location.pathname || "")) {
+    try {
+      var hasParam = !!new URLSearchParams(location.search).get("tabId");
+      if (!hasParam) {
+        var c2sTabId = null;
+        var qns = (typeof chrome !== "undefined" && chrome.tabs) ? chrome.tabs : (api && api.tabs);
+        var assign = function (r) {
+          if (c2sTabId == null && r && r[0] && r[0].id != null) {
+            c2sTabId = String(r[0].id);
+            try {
+              var u = new URL(location.href); u.searchParams.set("tabId", c2sTabId);
+              history.replaceState(history.state, "", u.toString());
+            } catch (e) {}
+          }
+        };
+        if (qns && qns.query) {
+          try {
+            var qret = qns.query({ active: true, currentWindow: true }, assign);
+            if (qret && typeof qret.then === "function") qret.then(assign);
+          } catch (e) {}
+        }
+        var _uspGet = URLSearchParams.prototype.get;
+        URLSearchParams.prototype.get = function (k) {
+          var val = _uspGet.call(this, k);
+          if (val == null && k === "tabId" && c2sTabId != null) return c2sTabId;
+          return val;
+        };
+      }
+    } catch (e) { /* ignore */ }
   }
 })();
 `;
@@ -174,4 +532,28 @@ export function injectPopupSizing(dir: string, popupFile: string): void {
     html = style + "\n" + html;
   }
   writeFileSync(file, html, "utf-8");
+}
+
+/**
+ * Safari starts module service workers unreliably for temp-loaded extensions —
+ * the SW often never runs, so anything probing it (e.g. the OAuth content-script
+ * bridge) times out with "background not running/reachable". Convert the MV3
+ * service worker into a PERSISTENT background page that loads the compat shim
+ * first (so missing chrome.* events are backfilled before the bundle module-evals
+ * and aborts) then the SW loader as a module. Mutates `manifest`. No-op when there
+ * is no service_worker. Must run AFTER the OAuth bridge so the loader already
+ * imports its polyfill.
+ */
+export function convertServiceWorkerToBackgroundPage(dir: string, manifest: Manifest): boolean {
+  const sw = manifest.background?.service_worker;
+  if (!sw) return false;
+  const html = `<!DOCTYPE html>
+<meta charset="utf-8">
+<title>${manifest.name ?? "Extension"} background</title>
+<script src="${SHIM_FILENAME}"></script>
+<script type="module" src="${sw}"></script>
+`;
+  writeFileSync(join(dir, BACKGROUND_PAGE_FILENAME), html, "utf-8");
+  manifest.background = { page: BACKGROUND_PAGE_FILENAME, persistent: true };
+  return true;
 }
