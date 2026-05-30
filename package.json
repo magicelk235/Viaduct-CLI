@@ -10,7 +10,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node -e \"require('node:fs').cpSync('src/templates','dist/templates',{recursive:true})\"",
     "dev": "tsc --watch",
     "start": "node dist/cli.js",
     "prepublishOnly": "npm run build"
