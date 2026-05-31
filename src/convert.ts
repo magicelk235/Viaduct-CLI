@@ -21,7 +21,7 @@ import {
   defaultBundleId,
 } from "./packager.js";
 import { printIssues, countBlocking } from "./report.js";
-import { info, ok, warn, fail, color } from "./util.js";
+import { info, ok, warn, fail, color, moveBundle } from "./util.js";
 
 export function convert(opts: ConvertOptions): ConvertResult {
   const result: ConvertResult = {
@@ -32,8 +32,11 @@ export function convert(opts: ConvertOptions): ConvertResult {
   };
 
   const scratch = mkdtempSync(join(tmpdir(), "chrome2safari-"));
+  // Throwaway DerivedData from buildXcodeProject; removed once the built app is moved out.
+  let derivedDir: string | undefined;
   const cleanup = () => {
     if (existsSync(scratch)) rmSync(scratch, { recursive: true, force: true });
+    if (derivedDir && existsSync(derivedDir)) rmSync(derivedDir, { recursive: true, force: true });
   };
   const onSignal = () => {
     cleanup();
@@ -141,17 +144,18 @@ export function convert(opts: ConvertOptions): ConvertResult {
     }
 
     info(opts.team ? `Building (signed: team ${opts.team}) …` : "Building (ad-hoc signed) …");
-    const appPath = buildXcodeProject(xcodeproj, appName, outputDir, opts.platforms, opts.team);
-    if (!appPath) {
+    const build = buildXcodeProject(xcodeproj, appName, opts.platforms, opts.team);
+    if (!build) {
       fail("Build failed. See output above.");
       printIssues(issues);
       return result;
     }
-    result.appPath = appPath;
-    ok(`Built → ${appPath}`);
+    const builtApp = build.builtApp;
+    derivedDir = build.derivedDir;
+    ok(`Built & signed → ${builtApp}`);
 
-    // The check v2 lacked: confirm the COMPILED bundle ids match intent.
-    const v = verifyBuiltBundleId(appPath, bundleId);
+    // The check v2 lacked: confirm the COMPILED bundle ids match intent (before it moves).
+    const v = verifyBuiltBundleId(builtApp, bundleId);
     if (!v.ok) {
       fail("Bundle identifier mismatch in the built app — Safari would register the wrong extension.");
       console.error(`    app  expected ${v.expectedAppId}  got ${v.appId ?? "∅"}`);
@@ -176,8 +180,9 @@ export function convert(opts: ConvertOptions): ConvertResult {
     }
 
     if (opts.install) {
+      // Move the Release product straight into ~/Applications — no intermediate copy.
       const inst = installToSafari({
-        builtAppPath: appPath,
+        builtAppPath: builtApp,
         appName,
         bundleId,
         installDir: opts.installDir,
@@ -185,10 +190,23 @@ export function convert(opts: ConvertOptions): ConvertResult {
         signed: !!opts.team,
       });
       if (inst.installedAppPath) {
+        result.appPath = inst.installedAppPath;
         result.installedAppPath = inst.installedAppPath;
         ok(`Installed → ${inst.installedAppPath}`);
       } else {
-        warn("Install did not complete; the built app is still available above.");
+        const stableApp = join(outputDir, basename(builtApp));
+        if (moveBundle(builtApp, stableApp)) result.appPath = stableApp;
+        warn(`Install did not complete; the built app is at ${result.appPath ?? builtApp}.`);
+      }
+    } else {
+      // No install: relocate the signed product out of the throwaway build dir to a
+      // stable path in the output dir. A move, not a copy.
+      const stableApp = join(outputDir, basename(builtApp));
+      if (moveBundle(builtApp, stableApp)) {
+        result.appPath = stableApp;
+        ok(`Built app → ${stableApp}`);
+      } else {
+        warn("Could not relocate the built app out of the temporary build dir.");
       }
     }
 

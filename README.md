@@ -14,7 +14,9 @@ Apple's `safari-web-extension-packager` and `xcodebuild` to produce a signed app
   - Removes Chrome-only keys (`update_url`, `key`, `minimum_chrome_version`).
   - Strips permissions Safari does not implement (for example `tabGroups`,
     `offscreen`, `sidePanel`, `debugger`).
-  - Forces `persistent: false` on MV2 backgrounds; strips
+  - Converts an MV3 service worker to a non-persistent background page and forces
+    `persistent: false` on MV2 backgrounds too (Safari rejects a persistent MV3
+    background: "a manifest_version >= 3 must be non-persistent"); strips
     `background.type: "module"` (a known cause of silent popup failures).
   - Injects `browser_specific_settings.safari` with a minimum version and no
     maximum cap (an `18.*` cap hides the extension on Safari 18+ and Safari 26).
@@ -30,9 +32,9 @@ Apple's `safari-web-extension-packager` and `xcodebuild` to produce a signed app
   optionally builds an ad-hoc or team-signed app.
 - Verifies the bundle identifier of the COMPILED `.appex`, not just the project
   files, so the wrong extension is never registered with Safari.
-- Optionally installs the built host app into `~/Applications` and registers it
-  with Safari (`--install`), so the extension persists across Safari restarts
-  when team-signed.
+- Optionally moves the built host app into `~/Applications` (no intermediate
+  copy) and registers it with Safari (`--install`), so the extension persists
+  across Safari restarts when team-signed.
 
 ## Requirements
 
@@ -130,9 +132,9 @@ The default (without `--ci`) symlinks resources for live development edits; use
 
 ## Installing a built app
 
-Let the tool install for you. It copies the built app into `~/Applications`,
-registers it with LaunchServices, and launches it once so Safari registers the
-extension:
+Let the tool install for you. It moves the built app into `~/Applications` (no
+duplicate copy left behind), registers it with LaunchServices, and launches it
+once so Safari registers the extension:
 
 ```
 chrome2safari ./my-extension.zip --install
