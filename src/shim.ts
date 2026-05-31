@@ -582,7 +582,7 @@ export function injectPopupSizing(dir: string, popupFile: string): void {
  * Safari starts module service workers unreliably for temp-loaded extensions —
  * the SW often never runs, so anything probing it (e.g. the OAuth content-script
  * bridge) times out with "background not running/reachable". Convert the MV3
- * service worker into a PERSISTENT background page that loads the compat shim
+ * service worker into a non-persistent background page that loads the compat shim
  * first (so missing chrome.* events are backfilled before the bundle module-evals
  * and aborts) then the SW loader as a module. Mutates `manifest`. No-op when there
  * is no service_worker. Must run AFTER the OAuth bridge so the loader already
@@ -598,6 +598,7 @@ export function convertServiceWorkerToBackgroundPage(dir: string, manifest: Mani
 <script type="module" src="${sw}"></script>
 `;
   writeFileSync(join(dir, BACKGROUND_PAGE_FILENAME), html, "utf-8");
-  manifest.background = { page: BACKGROUND_PAGE_FILENAME, persistent: true };
+  // MV3 (Safari) rejects persistent background: "A manifest_version >= 3 must be non-persistent."
+  manifest.background = { page: BACKGROUND_PAGE_FILENAME, persistent: false };
   return true;
 }

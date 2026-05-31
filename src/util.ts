@@ -1,4 +1,5 @@
 import { spawnSync, type SpawnSyncOptions } from "node:child_process";
+import { existsSync, renameSync, rmSync } from "node:fs";
 
 const RESET = "\x1b[0m";
 const COLORS = {
@@ -54,4 +55,21 @@ export function warn(msg: string): void {
 }
 export function fail(msg: string): void {
   console.error(`${color("red", "✗")} ${msg}`);
+}
+
+/**
+ * Move a bundle/dir to `dest`, leaving NO copy behind. A same-volume rename is
+ * instant and preserves the code signature untouched; across volumes (EXDEV) we
+ * ditto-copy then delete the source, so the end state is still a single moved app.
+ */
+export function moveBundle(src: string, dest: string): boolean {
+  if (existsSync(dest)) rmSync(dest, { recursive: true, force: true });
+  try {
+    renameSync(src, dest);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EXDEV") throw e;
+    if (run("/usr/bin/ditto", [src, dest]).code !== 0) return false;
+    rmSync(src, { recursive: true, force: true });
+  }
+  return existsSync(dest);
 }

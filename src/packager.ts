@@ -1,6 +1,6 @@
 import { readdirSync, statSync, existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, basename } from "node:path";
+import { join } from "node:path";
 import { run, info, ok, warn } from "./util.js";
 import type { Platforms } from "./types.js";
 
@@ -113,15 +113,16 @@ function pickScheme(xcodeproj: string, appName: string, platforms: Platforms): s
  * Build the Xcode project. With `team` → automatic Apple-issued dev signing, which
  * Safari loads WITHOUT the session-scoped "Allow Unsigned Extensions" toggle, so the
  * extension survives quitting Safari. Without `team` → ad-hoc signing (needs the toggle,
- * which resets every Safari session). Returns path to the built .app.
+ * which resets every Safari session). Returns the freshly built .app still sitting in
+ * the throwaway DerivedData dir, plus that dir — the caller MOVES the app to its final
+ * home (no intermediate copy) and then deletes the dir.
  */
 export function buildXcodeProject(
   xcodeproj: string,
   appName: string,
-  outputDir: string,
   platforms: Platforms,
   team?: string
-): string | null {
+): { builtApp: string; derivedDir: string } | null {
   const scheme = pickScheme(xcodeproj, appName, platforms);
   if (!scheme) {
     warn("No Xcode scheme found; skipping build.");
@@ -183,14 +184,10 @@ export function buildXcodeProject(
     rmSync(derived, { recursive: true, force: true });
     return null;
   }
-  // Move the signed .app into outputDir for a stable path. ditto preserves the
-  // signature/seal; copying back onto the synced volume only re-stamps xattrs on the
-  // already-signed bundle, which neither lsregister nor Safari rejects.
-  const stableApp = join(outputDir, basename(built));
-  if (existsSync(stableApp)) rmSync(stableApp, { recursive: true, force: true });
-  run("/usr/bin/ditto", [built, stableApp]);
-  rmSync(derived, { recursive: true, force: true });
-  return existsSync(stableApp) ? stableApp : null;
+  // Hand the signed .app back where it sits (in DerivedData). The caller moves it to its
+  // final home in one hop — no copy onto the iCloud-synced project tree — then deletes
+  // derivedDir. A move preserves the signature/seal untouched (no re-stamp, no re-sign).
+  return { builtApp: built, derivedDir: derived };
 }
 
 function plistValue(plistPath: string, key: string): string | null {

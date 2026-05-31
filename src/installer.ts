@@ -1,7 +1,7 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { run, info, ok, warn } from "./util.js";
+import { run, info, ok, warn, moveBundle } from "./util.js";
 import { pluginkitStatus } from "./packager.js";
 
 /** Full path to LaunchServices' lsregister (not on PATH). */
@@ -63,20 +63,19 @@ export function installToSafari(opts: InstallOptions): InstallResult {
   mkdirSync(targetDir, { recursive: true });
   const dest = join(targetDir, `${opts.appName}.app`);
 
-  // Replace any stale copy so removed files don't linger.
-  if (existsSync(dest)) rmSync(dest, { recursive: true, force: true });
   info(`Installing host app → ${dest}`);
-  const cp = run("/usr/bin/ditto", [opts.builtAppPath, dest]);
-  if (cp.code !== 0) {
-    warn(`Install copy failed: ${cp.stderr.trim() || cp.stdout.trim() || `ditto exit ${cp.code}`}`);
+  // Move (not copy) the signed Release product here, leaving no duplicate behind. A
+  // same-volume rename is atomic and preserves the signature/seal untouched.
+  if (!moveBundle(opts.builtAppPath, dest)) {
+    warn(`Install move failed: ${opts.builtAppPath} → ${dest}`);
     return result;
   }
   result.installedAppPath = dest;
-  ok(`Copied host app to ${dest}`);
+  ok(`Moved host app to ${dest}`);
 
-  // The build already ad-hoc signs with the App Sandbox entitlement and seals the
-  // bundle; ditto preserves that. Do NOT re-sign here — a plain `codesign --sign -`
-  // would strip the entitlements and Safari would stop registering the appex.
+  // The build already signs with the App Sandbox entitlement and seals the bundle; the
+  // move preserves that. Do NOT re-sign here — a plain `codesign --sign -` would strip
+  // the entitlements and Safari would stop registering the appex.
   const reg = run(LSREGISTER, ["-f", dest]);
   if (reg.code === 0) ok("Registered with LaunchServices");
   else warn(`lsregister exit ${reg.code} — Safari may take a moment to see the app.`);
