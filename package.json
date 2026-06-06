@@ -1,6 +1,6 @@
 {
   "name": "chrome2safari",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Convert a Chrome extension into a Safari Web Extension (macOS/iOS) ready for local dev or CI/CD.",
   "type": "module",
   "bin": {
