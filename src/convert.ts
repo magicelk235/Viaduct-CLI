@@ -4,9 +4,9 @@ import { join, resolve, basename } from "node:path";
 import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
 import { extractExtension } from "./extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest } from "./manifest.js";
-import { scanJsFiles } from "./analyze.js";
+import { scanJsFiles, scanExtensionDir } from "./analyze.js";
 import { stageExtension } from "./stage.js";
-import { writeShim, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, SHIM_FILENAME } from "./shim.js";
+import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, SHIM_FILENAME } from "./shim.js";
 import { applyOAuthBridge } from "./oauth-bridge.js";
 import { applyDnr } from "./dnr.js";
 import { writeTempLoadInstructions } from "./tempload.js";
@@ -56,7 +56,8 @@ export function convert(opts: ConvertOptions): ConvertResult {
 
     const { issues: manifestIssues, permissionsToRemove } = analyzeManifest(manifest);
     const jsIssues = scanJsFiles(extPath);
-    const issues: Issue[] = [...manifestIssues, ...jsIssues];
+    const dirIssues = scanExtensionDir(extPath, manifest, opts.platforms);
+    const issues: Issue[] = [...manifestIssues, ...jsIssues, ...dirIssues];
     result.issues = issues;
 
     const blocking = countBlocking(issues);

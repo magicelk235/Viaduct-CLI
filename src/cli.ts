@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { convert } from "./convert.js";
 import { extractExtension } from "./extract.js";
 import { loadManifest, analyzeManifest } from "./manifest.js";
-import { scanJsFiles } from "./analyze.js";
+import { scanJsFiles, scanExtensionDir } from "./analyze.js";
 import { printIssues } from "./report.js";
 import { run, info, ok, warn, fail, color, commandExists } from "./util.js";
 import { LSREGISTER } from "./installer.js";
@@ -74,14 +74,14 @@ function doctor(): number {
   return allOk ? 0 : 1;
 }
 
-function analyzeOnly(input: string, verbose: boolean): number {
+function analyzeOnly(input: string, platforms: Platforms, verbose: boolean): number {
   const scratch = mkdtempSync(join(tmpdir(), "chrome2safari-"));
   try {
     const extPath = extractExtension(resolve(input), scratch);
     const manifest = loadManifest(extPath);
     info(`${manifest.name ?? "Unknown"} (MV${manifest.manifest_version ?? 3})`);
     const { issues: mIssues } = analyzeManifest(manifest);
-    const issues = [...mIssues, ...scanJsFiles(extPath)];
+    const issues = [...mIssues, ...scanJsFiles(extPath), ...scanExtensionDir(extPath, manifest, platforms)];
     printIssues(issues);
     return issues.some((i) => i.severity === "error") ? 1 : 0;
   } finally {
@@ -151,7 +151,7 @@ function main(): void {
     process.exit(2);
   }
 
-  if (values.analyze) process.exit(analyzeOnly(input, values.verbose));
+  if (values.analyze) process.exit(analyzeOnly(input, platforms, values.verbose));
 
   let team = values.team;
   if (team === "auto" || (team === undefined && values.install)) {

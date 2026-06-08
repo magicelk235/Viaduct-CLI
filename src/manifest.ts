@@ -96,7 +96,7 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
   for (const perm of allPerms) {
     if (perm in UNSUPPORTED_PERMISSIONS) {
       issues.push({
-        severity: perm === "identity" || perm === "debugger" ? "warning" : "warning",
+        severity: "warning",
         category: "permission",
         message: `Unsupported permission "${perm}" will be removed.`,
         file: "manifest.json",
@@ -178,6 +178,57 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
       message: "storage.sync does NOT sync across iCloud devices in Safari (maps to local).",
       file: "manifest.json",
       fix: "Shim routes sync→local; implement custom cloud sync if cross-device is required.",
+    });
+  }
+
+  if (m.commands && Object.keys(m.commands).length > 0) {
+    issues.push({
+      severity: "info",
+      category: "ui",
+      message: "Keyboard commands are only partially supported in Safari; some chords are unavailable.",
+      file: "manifest.json",
+      fix: "Verify each shortcut in Safari → Settings → Extensions; provide an in-UI fallback.",
+    });
+  }
+
+  if (m.chrome_url_overrides?.newtab) {
+    issues.push({
+      severity: "warning",
+      category: "ui",
+      message: "chrome_url_overrides.newtab has gaps in Safari and behaves inconsistently per platform.",
+      file: "manifest.json",
+      fix: "Test the new-tab override on macOS and iOS; consider dropping it if unreliable.",
+    });
+  }
+  for (const k of Object.keys(m.chrome_url_overrides ?? {})) {
+    if (k !== "newtab") {
+      issues.push({
+        severity: "warning",
+        category: "ui",
+        message: `chrome_url_overrides.${k} is not supported in Safari.`,
+        file: "manifest.json",
+        fix: "Remove the override; Safari only partially honors newtab.",
+      });
+    }
+  }
+
+  if (m.devtools_page) {
+    issues.push({
+      severity: "warning",
+      category: "ui",
+      message: "devtools_page panels use a different surface in Safari (Web Inspector Extensions).",
+      file: "manifest.json",
+      fix: "Reimplement DevTools panels via Safari Web Inspector extension APIs, or drop.",
+    });
+  }
+
+  if (m.incognito) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: `incognito:"${m.incognito}" maps to Safari Private Browsing (off by default; user opts in per extension).`,
+      file: "manifest.json",
+      fix: "Don't rely on split-process isolation; assume spanning-like and re-test state separation.",
     });
   }
 

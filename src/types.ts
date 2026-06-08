@@ -45,6 +45,10 @@ export interface Manifest {
   key?: string;
   minimum_chrome_version?: string;
   browser_specific_settings?: Record<string, unknown>;
+  default_locale?: string;
+  incognito?: string;
+  chrome_url_overrides?: Record<string, string>;
+  devtools_page?: string;
   [key: string]: unknown;
 }
 
