@@ -1,7 +1,84 @@
-import { readdirSync, statSync, readFileSync } from "node:fs";
+import { readdirSync, statSync, readFileSync, existsSync } from "node:fs";
 import { join, relative } from "node:path";
-import type { Issue } from "./types.js";
+import type { Issue, Manifest, Platforms } from "./types.js";
 import { UNSUPPORTED_APIS } from "./manifest.js";
+
+function walkFiles(dir: string, exts: string[], acc: string[] = []): string[] {
+  for (const entry of readdirSync(dir)) {
+    if (entry === "node_modules" || entry === ".git" || entry.startsWith("__MACOSX")) continue;
+    const full = join(dir, entry);
+    const st = statSync(full);
+    if (st.isDirectory()) walkFiles(full, exts, acc);
+    else if (exts.some((e) => entry.endsWith(e))) acc.push(full);
+  }
+  return acc;
+}
+
+/**
+ * Disk- and platform-aware checks that need the extension dir (not just the
+ * manifest object): _locales/default_locale consistency, favicon access, and
+ * iOS-specific distribution/UI caveats. Complements analyzeManifest().
+ */
+export function scanExtensionDir(extPath: string, manifest: Manifest, platforms: Platforms): Issue[] {
+  const issues: Issue[] = [];
+
+  // _locales dir present but no default_locale → Chrome AND Safari reject the load.
+  if (existsSync(join(extPath, "_locales")) && !manifest.default_locale) {
+    issues.push({
+      severity: "error",
+      category: "i18n",
+      message: "_locales/ is present but default_locale is missing; the extension will fail to load.",
+      file: "manifest.json",
+      fix: "Add a default_locale key matching one of your _locales subfolders.",
+    });
+  }
+
+  // _favicon / chrome://favicon has no Safari equivalent.
+  for (const file of walkFiles(extPath, [".js", ".html", ".css"])) {
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    if (/chrome:\/\/favicon|[/'"]_favicon\//.test(content)) {
+      const idx = content.search(/chrome:\/\/favicon|[/'"]_favicon\//);
+      issues.push({
+        severity: "warning",
+        category: "api",
+        message: "Favicon access via chrome://favicon / _favicon has no Safari equivalent.",
+        file: relative(extPath, file),
+        line: content.slice(0, idx).split("\n").length,
+        fix: "Fetch favicons directly (e.g. <link> from the page) or drop the favicon UI.",
+      });
+      break; // one note is enough
+    }
+  }
+
+  if (platforms === "ios" || platforms === "all") {
+    issues.push({
+      severity: "info",
+      category: "ios",
+      message: "Targeting iOS/iPadOS: popup/options UI must be responsive; side-by-side layouts break on small screens.",
+      file: "manifest.json",
+      fix: "Add responsive CSS; test in Safari on iOS. Distribution is App Store only (no dev-direct for end users).",
+    });
+    const platformGated = ["contextMenus", "notifications", "downloads", "cookies"].filter((p) =>
+      [...(manifest.permissions ?? []), ...(manifest.optional_permissions ?? [])].includes(p)
+    );
+    if (platformGated.length) {
+      issues.push({
+        severity: "info",
+        category: "ios",
+        message: `Some APIs (${platformGated.join(", ")}) behave differently or are gated on iOS.`,
+        file: "manifest.json",
+        fix: "Feature-detect and gate per platform; don't assume macOS parity on iOS.",
+      });
+    }
+  }
+
+  return issues;
+}
 
 function walkJs(dir: string, acc: string[] = []): string[] {
   for (const entry of readdirSync(dir)) {
