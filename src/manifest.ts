@@ -365,7 +365,7 @@ export function transformManifest(
   m: Manifest,
   permissionsToRemove: string[],
   extPath: string,
-  opts: { keepModuleBackground: boolean; shimFile?: string }
+  opts: { keepModuleBackground: boolean; shimFile?: string; polyfillFile?: string }
 ): Manifest {
   const out: Manifest = JSON.parse(JSON.stringify(m));
 
@@ -407,12 +407,14 @@ export function transformManifest(
   // Don't inject an empty action onto extensions that never had a toolbar button.
   if (Object.keys(action).length > 0) out[actionKey] = action;
 
-  // Prepend the compat shim to every content script so sync/identity/sidePanel are patched.
-  if (opts.shimFile && Array.isArray(out.content_scripts)) {
+  // Prepend the compat shim to every content script so sync/identity/sidePanel are
+  // patched. Then prepend the polyfill so `browser` exists before the shim runs —
+  // final order per script: [polyfill, shim, ...original].
+  if ((opts.shimFile || opts.polyfillFile) && Array.isArray(out.content_scripts)) {
     for (const cs of out.content_scripts) {
-      if (Array.isArray(cs.js) && !cs.js.includes(opts.shimFile)) {
-        cs.js.unshift(opts.shimFile);
-      }
+      if (!Array.isArray(cs.js)) continue;
+      if (opts.shimFile && !cs.js.includes(opts.shimFile)) cs.js.unshift(opts.shimFile);
+      if (opts.polyfillFile && !cs.js.includes(opts.polyfillFile)) cs.js.unshift(opts.polyfillFile);
     }
   }
 

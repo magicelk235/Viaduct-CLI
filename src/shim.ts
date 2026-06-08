@@ -1,9 +1,28 @@
-import { writeFileSync, readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { writeFileSync, readFileSync, readdirSync, copyFileSync, existsSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Manifest } from "./types.js";
 
+const TEMPLATE_DIR = join(dirname(fileURLToPath(import.meta.url)), "templates");
+
 export const SHIM_FILENAME = "safari-compat-shim.js";
+export const POLYFILL_FILENAME = "browser-polyfill.min.js";
 export const BACKGROUND_PAGE_FILENAME = "background.html";
+
+/**
+ * Copy the bundled webextension-polyfill into the staged extension so Chrome code
+ * that calls promise-based `browser.*` runs on every browser. The polyfill no-ops
+ * when a native `browser` already exists (Safari/Firefox) and otherwise wraps
+ * `chrome.*` callbacks as promises. Must load BEFORE the compat shim so the shim's
+ * `browser`-namespace patches apply to the polyfilled object. Returns the filename
+ * or undefined if the template is unavailable.
+ */
+export function writePolyfill(targetDir: string): string | undefined {
+  const src = join(TEMPLATE_DIR, POLYFILL_FILENAME);
+  if (!existsSync(src)) return undefined;
+  copyFileSync(src, join(targetDir, POLYFILL_FILENAME));
+  return POLYFILL_FILENAME;
+}
 
 /**
  * Runtime compatibility shim, prepended to content scripts.
@@ -655,24 +674,31 @@ export function writeShim(targetDir: string): string {
 }
 
 /**
- * Inject the shim as the first <head> script of every top-level extension HTML page.
- * Module scripts are deferred, so a classic script placed in <head> runs first — the
- * shim patches missing chrome.* namespaces before bundle module-eval reads them.
+ * Inject the polyfill (optional) + shim as the first <head> scripts of every
+ * top-level extension HTML page. Module scripts are deferred, so classic scripts
+ * placed in <head> run first — the polyfill defines `browser`, then the shim
+ * patches missing chrome / browser namespaces, all before bundle module-eval.
  */
-export function injectShimIntoHtmlPages(dir: string): number {
-  const tag = `<script src="/${SHIM_FILENAME}"></script>`;
+export function injectShimIntoHtmlPages(dir: string, polyfillFile?: string): number {
+  const shimTag = `<script src="/${SHIM_FILENAME}"></script>`;
+  const polyTag = polyfillFile ? `<script src="/${polyfillFile}"></script>` : "";
+  const block = polyTag ? `${polyTag}\n    ${shimTag}` : shimTag;
   let count = 0;
   for (const name of readdirSync(dir)) {
     if (!name.toLowerCase().endsWith(".html")) continue;
     const file = join(dir, name);
     let html = readFileSync(file, "utf-8");
-    if (html.includes(tag)) continue;
+    // Already fully injected (both tags when a polyfill is in play) → skip.
+    if (html.includes(shimTag) && (!polyTag || html.includes(polyTag))) continue;
+    // Partial prior injection (shim but no polyfill): inject only the missing tag(s).
+    const toInsert = html.includes(shimTag) ? polyTag : block;
+    if (!toInsert) continue;
     const headMatch = html.match(/<head[^>]*>/i);
     if (headMatch) {
       const at = headMatch.index! + headMatch[0].length;
-      html = html.slice(0, at) + "\n    " + tag + html.slice(at);
+      html = html.slice(0, at) + "\n    " + toInsert + html.slice(at);
     } else {
-      html = tag + "\n" + html;
+      html = toInsert + "\n" + html;
     }
     writeFileSync(file, html, "utf-8");
     count++;
@@ -716,13 +742,14 @@ export function injectPopupSizing(dir: string, popupFile: string): void {
  * is no service_worker. Must run AFTER the OAuth bridge so the loader already
  * imports its polyfill.
  */
-export function convertServiceWorkerToBackgroundPage(dir: string, manifest: Manifest): boolean {
+export function convertServiceWorkerToBackgroundPage(dir: string, manifest: Manifest, polyfillFile?: string): boolean {
   const sw = manifest.background?.service_worker;
   if (!sw) return false;
+  const polyTag = polyfillFile && existsSync(join(dir, polyfillFile)) ? `<script src="${polyfillFile}"></script>\n` : "";
   const html = `<!DOCTYPE html>
 <meta charset="utf-8">
 <title>${manifest.name ?? "Extension"} background</title>
-<script src="${SHIM_FILENAME}"></script>
+${polyTag}<script src="${SHIM_FILENAME}"></script>
 <script type="module" src="${sw}"></script>
 `;
   writeFileSync(join(dir, BACKGROUND_PAGE_FILENAME), html, "utf-8");
