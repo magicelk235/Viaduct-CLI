@@ -17,10 +17,40 @@ export const UNSUPPORTED_PERMISSIONS: Record<string, string> = {
   offscreen: "Safari has no offscreen documents API; use the service worker or web workers.",
   webRequestBlocking: "Blocking webRequest is unsupported; use declarativeNetRequest.",
   gcm: "chrome.gcm is Chrome-only; relay via APNs in the host app or poll with chrome.alarms.",
-  tts: "Text-to-speech API unavailable.",
+  tts: "Text-to-speech API unavailable; bridge to AVSpeechSynthesizer natively or use Web Speech API.",
   ttsEngine: "TTS engine API unavailable.",
   platformKeys: "platformKeys unavailable.",
   "enterprise.platformKeys": "enterprise.platformKeys unavailable.",
+  // OS-capability APIs — route through the native container app or drop.
+  tabCapture: "tabCapture is unsupported; use getDisplayMedia() or a native bridge.",
+  desktopCapture: "desktopCapture is unsupported; use getDisplayMedia() or a native bridge.",
+  pageCapture: "pageCapture is unsupported; drop or reimplement via a native bridge.",
+  proxy: "chrome.proxy has no Safari equivalent; drop or configure proxy natively.",
+  privacy: "chrome.privacy has no Safari equivalent; drop.",
+  contentSettings: "chrome.contentSettings has no Safari equivalent; drop.",
+  browsingData: "chrome.browsingData has no Safari equivalent; drop.",
+  management: "chrome.management has no Safari equivalent; drop or move to the native host app.",
+  power: "chrome.power has no Safari equivalent; use IOKit natively or drop.",
+  "system.cpu": "chrome.system.cpu has no Safari equivalent; native bridge or drop.",
+  "system.memory": "chrome.system.memory has no Safari equivalent; native bridge or drop.",
+  "system.storage": "chrome.system.storage has no Safari equivalent; native bridge or drop.",
+  "system.display": "chrome.system.display has no Safari equivalent; native bridge or drop.",
+  // Chrome-UI APIs — no Safari surface; reshape to popup/page or drop.
+  omnibox: "Safari has no address-bar keyword API; drop the omnibox feature.",
+  // ChromeOS-only APIs — always drop on Safari.
+  fileBrowserHandler: "fileBrowserHandler is ChromeOS-only; drop.",
+  fileSystemProvider: "fileSystemProvider is ChromeOS-only; drop.",
+  documentScan: "documentScan is ChromeOS-only; drop.",
+  printerProvider: "printerProvider is ChromeOS/print-only; drop or move to a native bridge.",
+  printing: "chrome.printing is ChromeOS-only; drop.",
+  printingMetrics: "chrome.printingMetrics is ChromeOS-only; drop.",
+  certificateProvider: "certificateProvider is ChromeOS-enterprise-only; drop.",
+  vpnProvider: "vpnProvider is ChromeOS-only; use a Network Extension natively or drop.",
+  wallpaper: "chrome.wallpaper is ChromeOS-only; drop.",
+  loginScreenStorage: "loginScreenStorage is ChromeOS-kiosk-only; drop.",
+  webAuthenticationProxy: "webAuthenticationProxy is enterprise-only; drop.",
+  accessibilityFeatures: "accessibilityFeatures has no Safari equivalent; drop.",
+  fontSettings: "fontSettings has no Safari equivalent; drop.",
 };
 
 /** chrome.* API call patterns flagged during JS scans. */
@@ -80,6 +110,101 @@ export const UNSUPPORTED_APIS: Record<string, { severity: Issue["severity"]; mes
     severity: "warning",
     message: "webNavigation.onHistoryStateUpdated is unsupported.",
     fix: "Monitor history changes from a content script.",
+  },
+  "chrome.tts\\b": {
+    severity: "warning",
+    message: "chrome.tts (text-to-speech) is unsupported in Safari.",
+    fix: "Use the Web Speech API (speechSynthesis), or bridge to AVSpeechSynthesizer in the native host.",
+  },
+  "chrome.ttsEngine": {
+    severity: "warning",
+    message: "chrome.ttsEngine is unsupported in Safari.",
+    fix: "Provide TTS via the native host (AVSpeechSynthesizer); there is no Safari TTS-engine API.",
+  },
+  "chrome.tabCapture": {
+    severity: "warning",
+    message: "chrome.tabCapture is unsupported in Safari.",
+    fix: "Use navigator.mediaDevices.getDisplayMedia(), or a native bridge.",
+  },
+  "chrome.desktopCapture": {
+    severity: "warning",
+    message: "chrome.desktopCapture is unsupported in Safari.",
+    fix: "Use navigator.mediaDevices.getDisplayMedia(), or a native bridge.",
+  },
+  "chrome.pageCapture": {
+    severity: "warning",
+    message: "chrome.pageCapture is unsupported in Safari.",
+    fix: "Reconstruct via content-script DOM serialization, or drop.",
+  },
+  "chrome.proxy": {
+    severity: "warning",
+    message: "chrome.proxy has no Safari equivalent.",
+    fix: "Configure proxying natively (Network Extension) or drop the feature.",
+  },
+  "chrome.privacy": {
+    severity: "warning",
+    message: "chrome.privacy has no Safari equivalent.",
+    fix: "Remove or guard behind feature detection.",
+  },
+  "chrome.contentSettings": {
+    severity: "warning",
+    message: "chrome.contentSettings has no Safari equivalent.",
+    fix: "Remove or guard behind feature detection.",
+  },
+  "chrome.browsingData": {
+    severity: "warning",
+    message: "chrome.browsingData has no Safari equivalent.",
+    fix: "Remove or guard behind feature detection.",
+  },
+  "chrome.management": {
+    severity: "warning",
+    message: "chrome.management has no Safari equivalent.",
+    fix: "Remove, or move management logic to the native host app.",
+  },
+  "chrome.power": {
+    severity: "warning",
+    message: "chrome.power has no Safari equivalent.",
+    fix: "Use IOKit in the native host, or drop wake-lock behavior.",
+  },
+  "chrome.system": {
+    severity: "warning",
+    message: "chrome.system.* (cpu/memory/storage/display) has no Safari equivalent.",
+    fix: "Route through a native bridge, or drop.",
+  },
+  "chrome.omnibox": {
+    severity: "warning",
+    message: "chrome.omnibox has no Safari equivalent (no address-bar keyword).",
+    fix: "Drop the omnibox feature; expose the action via the popup instead.",
+  },
+  "chrome.fontSettings": {
+    severity: "warning",
+    message: "chrome.fontSettings has no Safari equivalent.",
+    fix: "Remove or guard behind feature detection.",
+  },
+  "chrome.accessibilityFeatures": {
+    severity: "warning",
+    message: "chrome.accessibilityFeatures has no Safari equivalent.",
+    fix: "Remove or guard behind feature detection.",
+  },
+  "chrome.readingList": {
+    severity: "warning",
+    message: "chrome.readingList has no JS API in Safari (native Reading List only).",
+    fix: "Bridge through the native host, or drop.",
+  },
+  "chrome.bookmarks": {
+    severity: "info",
+    message: "chrome.bookmarks is limited/gated in Safari.",
+    fix: "Verify availability + permission; feature-detect and degrade.",
+  },
+  "chrome.history": {
+    severity: "info",
+    message: "chrome.history is limited in Safari.",
+    fix: "Verify availability; feature-detect and degrade.",
+  },
+  "chrome.downloads": {
+    severity: "info",
+    message: "chrome.downloads is only partially supported in Safari.",
+    fix: "Test the flow; fall back to an <a download> link if unavailable.",
   },
 };
 

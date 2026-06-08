@@ -405,6 +405,134 @@ export function shimSource(): string {
     };
   }
 
+  // Namespaces with NO Safari equivalent that Chrome extensions still reference at
+  // module-eval (reading <ns>.<event>.addListener or an enum) throw a TypeError that
+  // aborts SW/page evaluation and blanks the surface — same failure class as
+  // tabGroups/notifications above. Backfill each absent namespace with inert stubs:
+  // event objects no-op, methods resolve/reject so callers degrade instead of crash.
+  if (hasChrome) {
+    var rejectUnsupported = function (name) {
+      return function () { return Promise.reject(new Error(name + " is unsupported in Safari.")); };
+    };
+    var resolveEmpty = function (val) {
+      return function () { return Promise.resolve(val); };
+    };
+    // Fill members the host omitted WITHOUT clobbering ones it provides. Safari may
+    // expose a PARTIAL namespace (e.g. chrome.system with only .cpu), so a blanket
+    // "if (!chrome.X)" guard would skip backfill and let chrome.X.missing.foo throw.
+    var fill = function (obj, members) {
+      if (!obj) return;
+      for (var k in members) { if (!obj[k]) { try { obj[k] = members[k]; } catch (e) {} } }
+    };
+    // A ChromeSetting leaf (chrome.privacy.*, chrome.contentSettings.*): get/set/clear + event.
+    var chromeSetting = function () {
+      return { get: resolveEmpty({ value: undefined, levelOfControl: "not_controllable" }), set: resolveEmpty(undefined), clear: resolveEmpty(undefined), onChange: event() };
+    };
+
+    // chrome.omnibox — no address-bar keyword surface. Listeners never fire.
+    chrome.omnibox = chrome.omnibox || {};
+    fill(chrome.omnibox, {
+      setDefaultSuggestion: function () {},
+      onInputStarted: event(), onInputChanged: event(),
+      onInputEntered: event(), onInputCancelled: event(), onDeleteSuggestion: event(),
+    });
+
+    // chrome.tts — route callers to Web Speech API when present, else no-op.
+    chrome.tts = chrome.tts || {};
+    fill(chrome.tts, {
+      speak: function (text, opts, cb) {
+        if (typeof opts === "function") { cb = opts; opts = {}; }
+        try {
+          if (typeof speechSynthesis !== "undefined" && text) {
+            var u = new SpeechSynthesisUtterance(String(text));
+            if (opts) { if (opts.rate) u.rate = opts.rate; if (opts.pitch) u.pitch = opts.pitch; if (opts.volume != null) u.volume = opts.volume; if (opts.lang) u.lang = opts.lang; }
+            speechSynthesis.speak(u);
+          }
+        } catch (e) {}
+        if (typeof cb === "function") { cb(); return; }
+        return Promise.resolve();
+      },
+      stop: function () { try { if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel(); } catch (e) {} },
+      pause: function () { try { if (typeof speechSynthesis !== "undefined") speechSynthesis.pause(); } catch (e) {} },
+      resume: function () { try { if (typeof speechSynthesis !== "undefined") speechSynthesis.resume(); } catch (e) {} },
+      isSpeaking: function (cb) { var s = (typeof speechSynthesis !== "undefined") && speechSynthesis.speaking; if (typeof cb === "function") { cb(s); return; } return Promise.resolve(s); },
+      getVoices: resolveEmpty([]),
+      onEvent: event(),
+    });
+
+    // chrome.proxy — settings object so .set()/.get() and .onProxyError don't throw.
+    chrome.proxy = chrome.proxy || {};
+    fill(chrome.proxy, { settings: chromeSetting(), onProxyError: event() });
+
+    // chrome.power — keepAwake/releaseKeepAwake are fire-and-forget no-ops.
+    chrome.power = chrome.power || {};
+    fill(chrome.power, { requestKeepAwake: function () {}, releaseKeepAwake: function () {}, reportActivity: function (cb) { if (cb) cb(); } });
+
+    // chrome.system.* — each sub-namespace returns empty info. Backfill per
+    // sub-namespace so a partial host (e.g. only chrome.system.cpu) is completed.
+    chrome.system = chrome.system || {};
+    fill(chrome.system, {
+      cpu: { getInfo: resolveEmpty({ numOfProcessors: 0, archName: "", modelName: "", features: [], processors: [] }) },
+      memory: { getInfo: resolveEmpty({ capacity: 0, availableCapacity: 0 }) },
+      storage: { getInfo: resolveEmpty([]), onAttached: event(), onDetached: event() },
+      display: { getInfo: resolveEmpty([]), onDisplayChanged: event() },
+    });
+
+    // chrome.management — only self-introspection is plausibly needed; stub the rest.
+    chrome.management = chrome.management || {};
+    fill(chrome.management, {
+      getSelf: function (cb) {
+        var info = { id: (chrome.runtime && chrome.runtime.id) || "", enabled: true, installType: "normal", name: "", version: "" };
+        if (typeof cb === "function") { cb(info); return; }
+        return Promise.resolve(info);
+      },
+      getAll: resolveEmpty([]), get: rejectUnsupported("management.get"),
+      getPermissionWarningsById: resolveEmpty([]), getPermissionWarningsByManifest: resolveEmpty([]),
+      setEnabled: rejectUnsupported("management.setEnabled"), uninstallSelf: resolveEmpty(undefined),
+      onInstalled: event(), onUninstalled: event(), onEnabled: event(), onDisabled: event(),
+    });
+
+    // Settings-style read/write APIs with no Safari surface. Each leaf is a full
+    // ChromeSetting so chrome.privacy.network.<x>.get()/.set() never throw.
+    chrome.privacy = chrome.privacy || {};
+    fill(chrome.privacy, { network: {}, services: {}, websites: {} });
+    fill(chrome.privacy.network, { networkPredictionEnabled: chromeSetting(), webRTCIPHandlingPolicy: chromeSetting() });
+    fill(chrome.privacy.services, { autofillAddressEnabled: chromeSetting(), autofillCreditCardEnabled: chromeSetting(), passwordSavingEnabled: chromeSetting(), safeBrowsingEnabled: chromeSetting() });
+    fill(chrome.privacy.websites, { thirdPartyCookiesAllowed: chromeSetting(), referrersEnabled: chromeSetting(), hyperlinkAuditingEnabled: chromeSetting(), doNotTrackEnabled: chromeSetting() });
+    chrome.contentSettings = chrome.contentSettings || {};
+    fill(chrome.contentSettings, {
+      cookies: chromeSetting(), images: chromeSetting(), javascript: chromeSetting(), location: chromeSetting(),
+      notifications: chromeSetting(), popups: chromeSetting(), camera: chromeSetting(), microphone: chromeSetting(),
+    });
+    chrome.browsingData = chrome.browsingData || {};
+    fill(chrome.browsingData, { remove: resolveEmpty(undefined), settings: resolveEmpty({ options: {}, dataToRemove: {}, dataRemovalPermitted: {} }) });
+
+    // Capture APIs → defer to getDisplayMedia where possible, else reject.
+    chrome.tabCapture = chrome.tabCapture || {};
+    fill(chrome.tabCapture, { capture: rejectUnsupported("tabCapture"), getCapturedTabs: resolveEmpty([]), onStatusChanged: event() });
+    chrome.desktopCapture = chrome.desktopCapture || {};
+    // chooseDesktopMedia MUST invoke its callback (Chrome calls it with "" on cancel);
+    // returning only a request id leaves callers waiting forever. Signal cancellation.
+    fill(chrome.desktopCapture, {
+      chooseDesktopMedia: function (sources, targetTab, cb) {
+        if (typeof targetTab === "function") cb = targetTab;
+        if (typeof cb === "function") { try { cb(""); } catch (e) {} }
+        return -1;
+      },
+      cancelChooseDesktopMedia: function () {},
+    });
+    chrome.pageCapture = chrome.pageCapture || {};
+    fill(chrome.pageCapture, { saveAsMHTML: rejectUnsupported("pageCapture") });
+
+    // chrome.readingList — native Reading List has no JS API.
+    chrome.readingList = chrome.readingList || {};
+    fill(chrome.readingList, {
+      addEntry: rejectUnsupported("readingList.addEntry"), removeEntry: rejectUnsupported("readingList.removeEntry"),
+      updateEntry: rejectUnsupported("readingList.updateEntry"), query: resolveEmpty([]),
+      onEntryAdded: event(), onEntryRemoved: event(), onEntryUpdated: event(),
+    });
+  }
+
   // Safari (current WebKit) CRASHES THE WHOLE BROWSER when a declarativeNetRequest
   // ruleset contains a "modifyHeaders" action: reading the rule back from its SQLite
   // store null-derefs in WebExtensionContext::loadDeclarativeNetRequestRules ->
