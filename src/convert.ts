@@ -80,15 +80,19 @@ export function convert(opts: ConvertOptions): ConvertResult {
     stageExtension(extPath, stageDir);
 
     let shimFile: string | undefined;
+    let polyfillFile: string | undefined;
     if (opts.generateShim) {
+      polyfillFile = writePolyfill(stageDir);
+      if (polyfillFile) ok("Bundled webextension-polyfill (browser.* promises on all browsers)");
       shimFile = writeShim(stageDir);
-      const n = injectShimIntoHtmlPages(stageDir);
-      if (n > 0) ok(`Shim injected into ${n} HTML page(s)`);
+      const n = injectShimIntoHtmlPages(stageDir, polyfillFile);
+      if (n > 0) ok(`Shim${polyfillFile ? " + polyfill" : ""} injected into ${n} HTML page(s)`);
     }
 
     const transformed = transformManifest(manifest, permissionsToRemove, stageDir, {
       keepModuleBackground: opts.keepModuleBackground,
       shimFile: shimFile === SHIM_FILENAME ? SHIM_FILENAME : undefined,
+      polyfillFile,
     });
 
     const dnrNotes = applyDnr(stageDir, transformed);
@@ -99,7 +103,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
       for (const n of bridgeNotes) ok(n);
     }
 
-    if (convertServiceWorkerToBackgroundPage(stageDir, transformed)) {
+    if (convertServiceWorkerToBackgroundPage(stageDir, transformed, polyfillFile)) {
       ok("Service worker → persistent background page (Safari reachability)");
     }
 
