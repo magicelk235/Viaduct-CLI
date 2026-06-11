@@ -1,4 +1,4 @@
-import { readFileSync, existsSync, writeFileSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Manifest, Issue } from "./types.js";
 
@@ -6,6 +6,49 @@ export function loadManifest(extPath: string): Manifest {
   const p = join(extPath, "manifest.json");
   if (!existsSync(p)) throw new Error(`No manifest.json found in ${extPath}`);
   return JSON.parse(readFileSync(p, "utf-8")) as Manifest;
+}
+
+/**
+ * Resolve a __MSG_key__ manifest value from _locales. Chrome substitutes these
+ * at load time; the converter needs the literal text to derive the app name /
+ * bundle id / output dir (otherwise they become "__MSG_extName___Safari").
+ * Lookup order: default_locale, English variants, then any locale present.
+ * Message names are case-insensitive, matching Chrome. Returns the input
+ * unchanged when it is not a __MSG_ reference; undefined when unresolvable.
+ */
+export function resolveI18nString(value: string | undefined, extPath: string, defaultLocale?: string): string | undefined {
+  if (!value) return value;
+  const ref = /^__MSG_(.+?)__$/.exec(value);
+  if (!ref) return value;
+  const key = ref[1].toLowerCase();
+  const localesDir = join(extPath, "_locales");
+  if (!existsSync(localesDir)) return undefined;
+  let available: string[] = [];
+  try {
+    available = readdirSync(localesDir);
+  } catch {
+    return undefined;
+  }
+  const preferred = [defaultLocale, "en", "en_US", "en_GB"].filter((l): l is string => !!l);
+  const seen = new Set<string>();
+  for (const loc of [...preferred, ...available]) {
+    if (seen.has(loc)) continue;
+    seen.add(loc);
+    const p = join(localesDir, loc, "messages.json");
+    if (!existsSync(p)) continue;
+    try {
+      const msgs = JSON.parse(readFileSync(p, "utf-8")) as Record<string, { message?: string }>;
+      for (const k of Object.keys(msgs)) {
+        if (k.toLowerCase() === key) {
+          const msg = msgs[k]?.message;
+          if (typeof msg === "string" && msg.trim()) return msg.trim();
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
 }
 
 /** Permissions Safari does not implement. Value = remediation note. */
@@ -37,6 +80,13 @@ export const UNSUPPORTED_PERMISSIONS: Record<string, string> = {
   "system.display": "chrome.system.display has no Safari equivalent; native bridge or drop.",
   // Chrome-UI APIs — no Safari surface; reshape to popup/page or drop.
   omnibox: "Safari has no address-bar keyword API; drop the omnibox feature.",
+  sessions: "chrome.sessions is unsupported; shim returns empty results.",
+  topSites: "chrome.topSites is unsupported; shim returns an empty list.",
+  search: "chrome.search is unsupported; shim opens queries in a search-engine tab.",
+  declarativeContent: "declarativeContent rules never fire in Safari; use content scripts + chrome.action.",
+  userScripts: "chrome.userScripts is unsupported; declare content scripts statically or use chrome.scripting.",
+  idle: "chrome.idle is unsupported; shim derives state from page visibility.",
+  instanceID: "instanceID push plumbing is Chrome-only; use APNs natively or poll.",
   // ChromeOS-only APIs — always drop on Safari.
   fileBrowserHandler: "fileBrowserHandler is ChromeOS-only; drop.",
   fileSystemProvider: "fileSystemProvider is ChromeOS-only; drop.",
@@ -191,6 +241,41 @@ export const UNSUPPORTED_APIS: Record<string, { severity: Issue["severity"]; mes
     message: "chrome.readingList has no JS API in Safari (native Reading List only).",
     fix: "Bridge through the native host, or drop.",
   },
+  "chrome.sessions": {
+    severity: "info",
+    message: "chrome.sessions has no Safari equivalent; shim returns empty results.",
+    fix: "Feature-detect; hide recently-closed UI on Safari.",
+  },
+  "chrome.topSites": {
+    severity: "info",
+    message: "chrome.topSites has no Safari equivalent; shim returns an empty list.",
+    fix: "Feature-detect; hide top-sites UI on Safari.",
+  },
+  "chrome.declarativeContent": {
+    severity: "warning",
+    message: "chrome.declarativeContent rules never fire in Safari (shim stubs the constructors).",
+    fix: "Use content scripts + chrome.action instead of declarative page rules.",
+  },
+  "chrome.search\\b": {
+    severity: "info",
+    message: "chrome.search has no Safari equivalent; shim opens the query in a search-engine tab.",
+    fix: "Acceptable fallback for most flows; otherwise open a search URL yourself.",
+  },
+  "chrome.userScripts": {
+    severity: "warning",
+    message: "chrome.userScripts is unsupported in Safari; registration rejects.",
+    fix: "Statically declare content scripts, or inject via chrome.scripting.",
+  },
+  "chrome.idle": {
+    severity: "info",
+    message: "chrome.idle is unsupported; shim derives state from page visibility.",
+    fix: "Don't rely on machine-level idle detection on Safari.",
+  },
+  "chrome.instanceID": {
+    severity: "warning",
+    message: "chrome.instanceID (push plumbing) is Chrome-only; calls reject.",
+    fix: "Use APNs via the native host, or poll with chrome.alarms.",
+  },
   "chrome.bookmarks": {
     severity: "info",
     message: "chrome.bookmarks is limited/gated in Safari.",
@@ -218,7 +303,9 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
   const permissionsToRemove: string[] = [];
   const allPerms = [...(m.permissions ?? []), ...(m.optional_permissions ?? [])];
 
-  for (const perm of allPerms) {
+  // Set-dedupe: a permission listed in BOTH permissions and optional_permissions
+  // would otherwise produce two identical issues.
+  for (const perm of new Set(allPerms)) {
     if (perm in UNSUPPORTED_PERMISSIONS) {
       issues.push({
         severity: "warning",
@@ -241,6 +328,39 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
       autoFixed: true,
     });
   }
+  if (m.version && m.version.split(".").length > 3) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: `4-part version "${m.version}" exceeds Apple's 3-part CFBundleShortVersionString; truncating.`,
+      file: "manifest.json",
+      autoFixed: true,
+    });
+  }
+  if (m.version_name) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: "version_name has no Safari/App Store meaning; removing.",
+      file: "manifest.json",
+      autoFixed: true,
+    });
+  }
+
+  const csp =
+    typeof m.content_security_policy === "string"
+      ? m.content_security_policy
+      : Object.values(m.content_security_policy ?? {}).join(" ");
+  if (csp.includes("unsafe-eval")) {
+    issues.push({
+      severity: "warning",
+      category: "manifest",
+      message: "CSP allows 'unsafe-eval'; Safari rejects eval in extension contexts regardless.",
+      file: "manifest.json",
+      fix: "Remove eval()/new Function usage; precompile templates or use JSON.parse.",
+    });
+  }
+
   if (m.minimum_chrome_version) {
     issues.push({
       severity: "info",
@@ -252,7 +372,7 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
   }
 
   const mv = m.manifest_version ?? 2;
-  if (mv === 2 && m.background?.persistent !== false) {
+  if (mv === 2 && m.background && m.background.persistent !== false) {
     issues.push({
       severity: "error",
       category: "background",
@@ -347,6 +467,27 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
     });
   }
 
+  const hosts = [...(m.host_permissions ?? []), ...(m.permissions ?? [])];
+  if (hosts.some((h) => h === "<all_urls>" || h === "*://*/*" || h === "http://*/*" || h === "https://*/*")) {
+    issues.push({
+      severity: "info",
+      category: "permission",
+      message: "Broad host access (<all_urls>): Safari asks the user per-site and defaults to 'Ask'.",
+      file: "manifest.json",
+      fix: "Expect degraded behavior until the user grants access; handle permission denials gracefully.",
+    });
+  }
+
+  if (!m.icons || Object.keys(m.icons).length === 0) {
+    issues.push({
+      severity: "info",
+      category: "ui",
+      message: "No icons in the manifest; Safari shows a generic placeholder in the toolbar and Settings.",
+      file: "manifest.json",
+      fix: "Add at least 48px/96px (and 128px for the App Store) PNG icons under the icons key.",
+    });
+  }
+
   if (m.incognito) {
     issues.push({
       severity: "info",
@@ -372,6 +513,12 @@ export function transformManifest(
   delete out.update_url;
   delete out.key;
   delete out.minimum_chrome_version;
+  delete out.version_name;
+
+  if (out.version) {
+    const parts = out.version.split(".");
+    if (parts.length > 3) out.version = parts.slice(0, 3).join(".");
+  }
 
   const removeSet = new Set(permissionsToRemove);
   if (out.permissions) out.permissions = out.permissions.filter((p) => !removeSet.has(p));
@@ -381,8 +528,8 @@ export function transformManifest(
   }
 
   const mv = out.manifest_version ?? 2;
-  if (mv === 2) {
-    out.background = { ...(out.background ?? {}), persistent: false };
+  if (mv === 2 && out.background) {
+    out.background.persistent = false;
   }
   if (mv === 3 && out.background?.type === "module" && !opts.keepModuleBackground) {
     delete out.background.type;

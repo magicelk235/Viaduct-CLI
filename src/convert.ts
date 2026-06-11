@@ -3,10 +3,10 @@ import { tmpdir } from "node:os";
 import { join, resolve, basename } from "node:path";
 import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
 import { extractExtension } from "./extract.js";
-import { loadManifest, analyzeManifest, transformManifest, writeManifest } from "./manifest.js";
-import { scanJsFiles, scanExtensionDir } from "./analyze.js";
+import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString } from "./manifest.js";
+import { scanExtension } from "./analyze.js";
 import { stageExtension } from "./stage.js";
-import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, SHIM_FILENAME } from "./shim.js";
+import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage } from "./shim.js";
 import { applyOAuthBridge } from "./oauth-bridge.js";
 import { applyDnr } from "./dnr.js";
 import { writeTempLoadInstructions } from "./tempload.js";
@@ -50,14 +50,12 @@ export function convert(opts: ConvertOptions): ConvertResult {
     const extPath = extractExtension(resolve(opts.input), scratch);
 
     const manifest = loadManifest(extPath);
-    result.extensionName = manifest.name ?? "Unknown";
+    result.extensionName = resolveI18nString(manifest.name, extPath, manifest.default_locale) ?? manifest.name ?? "Unknown";
     result.manifestVersion = manifest.manifest_version ?? 3;
     ok(`Loaded "${result.extensionName}" (MV${result.manifestVersion})`);
 
     const { issues: manifestIssues, permissionsToRemove } = analyzeManifest(manifest);
-    const jsIssues = scanJsFiles(extPath);
-    const dirIssues = scanExtensionDir(extPath, manifest, opts.platforms);
-    const issues: Issue[] = [...manifestIssues, ...jsIssues, ...dirIssues];
+    const issues: Issue[] = [...manifestIssues, ...scanExtension(extPath, manifest, opts.platforms)];
     result.issues = issues;
 
     const blocking = countBlocking(issues);
@@ -67,7 +65,9 @@ export function convert(opts: ConvertOptions): ConvertResult {
       return result;
     }
 
-    const appName = (opts.appName ?? result.extensionName).replace(/\s+/g, "");
+    // Strip whitespace plus path/scheme separators — the name becomes a directory
+    // name, an xcodebuild scheme, and part of the bundle id.
+    const appName = (opts.appName ?? result.extensionName).replace(/[\s/\\:]+/g, "") || "Extension";
     const bundleId = opts.bundleId ?? defaultBundleId(appName);
     result.resolvedBundleId = bundleId;
 
@@ -91,7 +91,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
 
     const transformed = transformManifest(manifest, permissionsToRemove, stageDir, {
       keepModuleBackground: opts.keepModuleBackground,
-      shimFile: shimFile === SHIM_FILENAME ? SHIM_FILENAME : undefined,
+      shimFile,
       polyfillFile,
     });
 

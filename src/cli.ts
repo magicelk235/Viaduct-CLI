@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { convert } from "./convert.js";
 import { extractExtension } from "./extract.js";
-import { loadManifest, analyzeManifest } from "./manifest.js";
-import { scanJsFiles, scanExtensionDir } from "./analyze.js";
+import { loadManifest, analyzeManifest, resolveI18nString } from "./manifest.js";
+import { scanExtension } from "./analyze.js";
 import { printIssues } from "./report.js";
 import { run, info, ok, warn, fail, color, commandExists } from "./util.js";
 import { LSREGISTER } from "./installer.js";
@@ -43,6 +43,7 @@ OPTIONS
       --keep-module         Keep background.type:"module" (default strips it)
       --force               Convert despite blocking errors
       --analyze             Analyze and report only
+      --json                With --analyze, print a machine-readable JSON report
       --doctor              Verify xcrun/packager/xcodebuild availability
   -v, --verbose             Verbose output
   -h, --help                Show this help
@@ -57,7 +58,7 @@ function doctor(): number {
       "Requires a full Xcode install (not just CLT).",
     ],
     ["xcodebuild", () => run("xcodebuild", ["-version"]).code === 0, "Requires full Xcode."],
-    ["plutil", () => run("plutil", ["-help"]).code === 0 || true, ""],
+    ["plutil", () => commandExists("plutil"), "Part of macOS."],
     ["pluginkit", () => run("/usr/bin/which", ["pluginkit"]).code === 0, ""],
     ["ditto", () => commandExists("ditto"), "Part of macOS."],
     ["osascript", () => commandExists("osascript"), "Part of macOS."],
@@ -74,15 +75,35 @@ function doctor(): number {
   return allOk ? 0 : 1;
 }
 
-function analyzeOnly(input: string, platforms: Platforms, verbose: boolean): number {
+function analyzeOnly(input: string, platforms: Platforms, json: boolean): number {
   const scratch = mkdtempSync(join(tmpdir(), "chrome2safari-"));
   try {
     const extPath = extractExtension(resolve(input), scratch);
     const manifest = loadManifest(extPath);
-    info(`${manifest.name ?? "Unknown"} (MV${manifest.manifest_version ?? 3})`);
+    const name = resolveI18nString(manifest.name, extPath, manifest.default_locale) ?? manifest.name ?? "Unknown";
+    if (!json) info(`${name} (MV${manifest.manifest_version ?? 3})`);
     const { issues: mIssues } = analyzeManifest(manifest);
-    const issues = [...mIssues, ...scanJsFiles(extPath), ...scanExtensionDir(extPath, manifest, platforms)];
-    printIssues(issues);
+    const issues = [...mIssues, ...scanExtension(extPath, manifest, platforms)];
+    if (json) {
+      const counts = { error: 0, warning: 0, info: 0 };
+      for (const i of issues) counts[i.severity]++;
+      console.log(
+        JSON.stringify(
+          {
+            name,
+            version: manifest.version,
+            manifestVersion: manifest.manifest_version ?? 3,
+            platforms,
+            counts,
+            issues,
+          },
+          null,
+          2
+        )
+      );
+    } else {
+      printIssues(issues);
+    }
     return issues.some((i) => i.severity === "error") ? 1 : 0;
   } finally {
     if (existsSync(scratch)) rmSync(scratch, { recursive: true, force: true });
@@ -110,6 +131,7 @@ function main(): void {
         "keep-module": { type: "boolean", default: false },
         force: { type: "boolean", default: false },
         analyze: { type: "boolean", default: false },
+        json: { type: "boolean", default: false },
         doctor: { type: "boolean", default: false },
         verbose: { type: "boolean", short: "v", default: false },
         help: { type: "boolean", short: "h", default: false },
@@ -151,7 +173,11 @@ function main(): void {
     process.exit(2);
   }
 
-  if (values.analyze) process.exit(analyzeOnly(input, platforms, values.verbose));
+  if (values.analyze) process.exit(analyzeOnly(input, platforms, values.json));
+  if (values.json) {
+    fail("--json is only valid with --analyze.");
+    process.exit(2);
+  }
 
   let team = values.team;
   if (team === "auto" || (team === undefined && values.install)) {
