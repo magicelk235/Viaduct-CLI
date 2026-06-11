@@ -1,21 +1,24 @@
-import { readdirSync, statSync, existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readdirSync, existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { run, info, ok, warn } from "./util.js";
 import type { Platforms } from "./types.js";
 
 function findFiles(dir: string, predicate: (name: string, full: string) => boolean, depth = 3, acc: string[] = []): string[] {
-  if (depth < 0 || !existsSync(dir)) return acc;
-  for (const entry of readdirSync(dir)) {
-    const full = join(dir, entry);
-    let st;
-    try {
-      st = statSync(full);
-    } catch {
-      continue;
+  if (depth < 0) return acc;
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return acc;
+  }
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+    if (predicate(entry.name, full)) acc.push(full);
+    // staged_extension is the web-extension payload — never contains Xcode artifacts.
+    if (entry.isDirectory() && entry.name !== "node_modules" && entry.name !== "staged_extension") {
+      findFiles(full, predicate, depth - 1, acc);
     }
-    if (predicate(entry, full)) acc.push(full);
-    if (st.isDirectory() && entry !== "node_modules") findFiles(full, predicate, depth - 1, acc);
   }
   return acc;
 }

@@ -47,7 +47,13 @@ function crxToZip(crxPath: string): Buffer {
 function resolveExtensionRoot(dir: string): string {
   if (existsSync(join(dir, "manifest.json"))) return dir;
   const entries = readdirSync(dir).filter((e) => !e.startsWith("__MACOSX") && e !== ".DS_Store");
-  const subdirs = entries.filter((e) => statSync(join(dir, e)).isDirectory());
+  const subdirs = entries.filter((e) => {
+    try {
+      return statSync(join(dir, e)).isDirectory();
+    } catch {
+      return false; // broken symlink or unreadable entry
+    }
+  });
   if (subdirs.length === 1 && existsSync(join(dir, subdirs[0], "manifest.json"))) {
     return join(dir, subdirs[0]);
   }
