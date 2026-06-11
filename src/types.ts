@@ -14,6 +14,7 @@ export interface Manifest {
   manifest_version?: number;
   name?: string;
   version?: string;
+  version_name?: string;
   description?: string;
   background?: {
     service_worker?: string;
@@ -46,6 +47,7 @@ export interface Manifest {
   minimum_chrome_version?: string;
   browser_specific_settings?: Record<string, unknown>;
   default_locale?: string;
+  icons?: Record<string, string>;
   incognito?: string;
   chrome_url_overrides?: Record<string, string>;
   devtools_page?: string;
