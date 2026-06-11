@@ -109,6 +109,9 @@ export function shimSource(): string {
       getBytesInUse: function () {
         return local.getBytesInUse ? local.getBytesInUse.apply(local, arguments) : Promise.resolve(0);
       },
+      // Bundles read storage.sync.onChanged.addListener at module-eval; a stub
+      // without it throws and aborts evaluation. Mirror local's event when present.
+      onChanged: local.onChanged || event(),
     };
   }
 
@@ -550,6 +553,438 @@ export function shimSource(): string {
       updateEntry: rejectUnsupported("readingList.updateEntry"), query: resolveEmpty([]),
       onEntryAdded: event(), onEntryRemoved: event(), onEntryUpdated: event(),
     });
+
+    // dual(value, cb): honor Chrome's callback form AND return a promise otherwise.
+    var dual = function (value, cb) {
+      if (typeof cb === "function") { try { cb(value); } catch (e) {} return; }
+      return Promise.resolve(value);
+    };
+
+    // MV2 aliases: browserAction/pageAction code running on an MV3/Safari manifest.
+    // Point both at chrome.action so setBadgeText/setIcon/onClicked keep working.
+    if (chrome.action) {
+      if (!chrome.browserAction) chrome.browserAction = chrome.action;
+      if (!chrome.pageAction) {
+        chrome.pageAction = Object.assign(Object.create(chrome.action), {
+          show: function (tabId, cb) { return dual(undefined, cb); },
+          hide: function (tabId, cb) { return dual(undefined, cb); },
+        });
+      }
+    }
+
+    // chrome.extension (MV2 legacy surface).
+    chrome.extension = chrome.extension || {};
+    fill(chrome.extension, {
+      getURL: function (p) { return chrome.runtime && chrome.runtime.getURL ? chrome.runtime.getURL(p) : p; },
+      getViews: function () { return []; },
+      getBackgroundPage: function () { return null; },
+      isAllowedIncognitoAccess: function (cb) { return dual(false, cb); },
+      isAllowedFileSchemeAccess: function (cb) { return dual(false, cb); },
+      inIncognitoContext: false,
+      onRequest: event(), onRequestExternal: event(),
+    });
+
+    // chrome.alarms — Safari has it, but temp-loaded/background-page contexts can
+    // omit it. Full polyfill on setTimeout: one-shot + periodic, name registry.
+    if (!chrome.alarms) {
+      var alarmReg = Object.create(null);
+      var alarmList = [];
+      var alarmInfo = function (a) { return { name: a.name, scheduledTime: a.when, periodInMinutes: a.period || undefined }; };
+      var armAlarm = function (a) {
+        a.t = setTimeout(function () {
+          if (a.period) { a.when = Date.now() + a.period * 60000; armAlarm(a); }
+          else delete alarmReg[a.name];
+          for (var i = 0; i < alarmList.length; i++) { try { alarmList[i](alarmInfo(a)); } catch (e) {} }
+        }, Math.max(0, a.when - Date.now()));
+      };
+      chrome.alarms = {
+        create: function (name, info, cb) {
+          if (typeof name === "object") { cb = info; info = name; name = ""; }
+          if (typeof info === "function") { cb = info; info = undefined; }
+          info = info || {};
+          var when = info.when != null ? info.when : Date.now() + (info.delayInMinutes != null ? info.delayInMinutes : (info.periodInMinutes || 0)) * 60000;
+          var prev = alarmReg[name]; if (prev) clearTimeout(prev.t);
+          armAlarm(alarmReg[name] = { name: name, when: when, period: info.periodInMinutes || null });
+          return dual(undefined, cb);
+        },
+        get: function (name, cb) { var a = alarmReg[name || ""]; return dual(a ? alarmInfo(a) : undefined, cb); },
+        getAll: function (cb) { var out = []; for (var k in alarmReg) out.push(alarmInfo(alarmReg[k])); return dual(out, cb); },
+        clear: function (name, cb) { var a = alarmReg[name || ""]; if (a) { clearTimeout(a.t); delete alarmReg[name || ""]; } return dual(!!a, cb); },
+        clearAll: function (cb) { var any = false; for (var k in alarmReg) { clearTimeout(alarmReg[k].t); delete alarmReg[k]; any = true; } return dual(any, cb); },
+        onAlarm: {
+          addListener: function (fn) { if (typeof fn === "function") alarmList.push(fn); },
+          removeListener: function (fn) { var i = alarmList.indexOf(fn); if (i >= 0) alarmList.splice(i, 1); },
+          hasListener: function (fn) { return alarmList.indexOf(fn) >= 0; },
+        },
+      };
+    }
+
+    // storage.session (Safari < 16.4 lacks it) — in-memory map, correct get() key
+    // semantics (string | array | object-with-defaults | null = everything).
+    if (chrome.storage && !chrome.storage.session) {
+      var sessMem = Object.create(null);
+      var sessGet = function (keys) {
+        var out = {};
+        if (keys == null) { for (var k in sessMem) out[k] = sessMem[k]; return out; }
+        if (typeof keys === "string") keys = [keys];
+        if (Array.isArray(keys)) { for (var i = 0; i < keys.length; i++) { if (keys[i] in sessMem) out[keys[i]] = sessMem[keys[i]]; } return out; }
+        for (var d in keys) out[d] = (d in sessMem) ? sessMem[d] : keys[d];
+        return out;
+      };
+      chrome.storage.session = {
+        get: function (keys, cb) { if (typeof keys === "function") { cb = keys; keys = null; } return dual(sessGet(keys), cb); },
+        set: function (items, cb) { for (var k in items) sessMem[k] = items[k]; return dual(undefined, cb); },
+        remove: function (keys, cb) { if (typeof keys === "string") keys = [keys]; for (var i = 0; i < keys.length; i++) delete sessMem[keys[i]]; return dual(undefined, cb); },
+        clear: function (cb) { sessMem = Object.create(null); return dual(undefined, cb); },
+        getBytesInUse: function (k, cb) { if (typeof k === "function") { cb = k; } return dual(0, cb); },
+        setAccessLevel: function (o, cb) { return dual(undefined, cb); },
+        onChanged: event(),
+      };
+    }
+    // storage.managed — no MDM-policy surface; reads come back empty.
+    if (chrome.storage && !chrome.storage.managed) {
+      chrome.storage.managed = {
+        get: function (keys, cb) { if (typeof keys === "function") { cb = keys; } return dual({}, cb); },
+        getBytesInUse: function (k, cb) { if (typeof k === "function") { cb = k; } return dual(0, cb); },
+        onChanged: event(),
+      };
+    }
+
+    // chrome.idle — derive state from page visibility where a document exists;
+    // a background context simply reports "active".
+    chrome.idle = chrome.idle || {};
+    fill(chrome.idle, {
+      queryState: function (sec, cb) {
+        var state = (typeof document !== "undefined" && document.visibilityState === "hidden") ? "idle" : "active";
+        return dual(state, cb);
+      },
+      setDetectionInterval: function () {},
+      getAutoLockDelay: function (cb) { return dual(0, cb); },
+      onStateChanged: event(),
+    });
+
+    // chrome.downloads — no Safari API. Creative fallback: navigate a tab to the
+    // URL so WebKit's downloader takes over (or click an <a download> when a DOM
+    // exists). Enough for "save this file" flows; queries return empty.
+    chrome.downloads = chrome.downloads || {};
+    fill(chrome.downloads, {
+      download: function (opts, cb) {
+        var url = (opts && opts.url) || "";
+        var id = Date.now() % 2147483647;
+        try {
+          if (typeof document !== "undefined" && document.body) {
+            var a = document.createElement("a");
+            a.href = url; if (opts && opts.filename) a.download = opts.filename;
+            document.body.appendChild(a); a.click(); a.remove();
+          } else if (chrome.tabs && chrome.tabs.create) {
+            chrome.tabs.create({ url: url, active: false });
+          }
+        } catch (e) {}
+        return dual(id, cb);
+      },
+      search: function (q, cb) { return dual([], cb); },
+      cancel: function (id, cb) { return dual(undefined, cb); },
+      pause: function (id, cb) { return dual(undefined, cb); },
+      resume: function (id, cb) { return dual(undefined, cb); },
+      erase: function (q, cb) { return dual([], cb); },
+      open: rejectUnsupported("downloads.open"), show: function () {}, showDefaultFolder: function () {},
+      getFileIcon: function (id, o, cb) { if (typeof o === "function") { cb = o; } return dual("", cb); },
+      setUiOptions: function (o, cb) { return dual(undefined, cb); },
+      onCreated: event(), onChanged: event(), onErased: event(), onDeterminingFilename: event(),
+    });
+
+    // chrome.search — no Safari surface; open the query in a search-engine tab.
+    chrome.search = chrome.search || {};
+    fill(chrome.search, {
+      query: function (opts, cb) {
+        var text = (opts && opts.text) || "";
+        var url = "https://www.google.com/search?q=" + encodeURIComponent(text);
+        try {
+          if (chrome.tabs && chrome.tabs.create) {
+            if (opts && opts.disposition === "CURRENT_TAB" && chrome.tabs.update) chrome.tabs.update({ url: url });
+            else chrome.tabs.create({ url: url });
+          }
+        } catch (e) {}
+        return dual(undefined, cb);
+      },
+      Disposition: { CURRENT_TAB: "CURRENT_TAB", NEW_TAB: "NEW_TAB", NEW_WINDOW: "NEW_WINDOW" },
+    });
+
+    // chrome.history — Safari gates it behind extra entitlements; complete the
+    // missing members so feature-detection degrades instead of crashing.
+    chrome.history = chrome.history || {};
+    fill(chrome.history, {
+      search: function (q, cb) { return dual([], cb); },
+      getVisits: function (d, cb) { return dual([], cb); },
+      addUrl: function (d, cb) { return dual(undefined, cb); },
+      deleteUrl: function (d, cb) { return dual(undefined, cb); },
+      deleteRange: function (d, cb) { return dual(undefined, cb); },
+      deleteAll: function (cb) { return dual(undefined, cb); },
+      onVisited: event(), onVisitRemoved: event(),
+    });
+
+    // chrome.bookmarks — same: partial/gated. Reads return an empty tree.
+    chrome.bookmarks = chrome.bookmarks || {};
+    fill(chrome.bookmarks, {
+      getTree: function (cb) { return dual([{ id: "0", title: "", children: [] }], cb); },
+      get: function (ids, cb) { return dual([], cb); },
+      getChildren: function (id, cb) { return dual([], cb); },
+      getRecent: function (n, cb) { return dual([], cb); },
+      getSubTree: function (id, cb) { return dual([], cb); },
+      search: function (q, cb) { return dual([], cb); },
+      create: rejectUnsupported("bookmarks.create"), move: rejectUnsupported("bookmarks.move"),
+      update: rejectUnsupported("bookmarks.update"), remove: rejectUnsupported("bookmarks.remove"),
+      removeTree: rejectUnsupported("bookmarks.removeTree"),
+      onCreated: event(), onRemoved: event(), onChanged: event(), onMoved: event(),
+      onChildrenReordered: event(), onImportBegan: event(), onImportEnded: event(),
+    });
+
+    // chrome.sessions / chrome.topSites — no Safari surface; empty reads.
+    chrome.sessions = chrome.sessions || {};
+    fill(chrome.sessions, {
+      MAX_SESSION_RESULTS: 25,
+      getRecentlyClosed: function (f, cb) { if (typeof f === "function") { cb = f; } return dual([], cb); },
+      getDevices: function (f, cb) { if (typeof f === "function") { cb = f; } return dual([], cb); },
+      restore: rejectUnsupported("sessions.restore"),
+      onChanged: event(),
+    });
+    chrome.topSites = chrome.topSites || {};
+    fill(chrome.topSites, { get: function (cb) { return dual([], cb); } });
+
+    // chrome.commands — Safari wires manifest shortcuts itself; complete the JS side.
+    chrome.commands = chrome.commands || {};
+    fill(chrome.commands, {
+      getAll: function (cb) { return dual([], cb); },
+      onCommand: event(),
+    });
+
+    // chrome.contextMenus — supported on macOS, absent on iOS. Complete missing
+    // members so cross-platform code registers without crashing.
+    chrome.contextMenus = chrome.contextMenus || {};
+    fill(chrome.contextMenus, {
+      ContextType: { ALL: "all", PAGE: "page", SELECTION: "selection", LINK: "link", IMAGE: "image", VIDEO: "video", AUDIO: "audio", FRAME: "frame", EDITABLE: "editable", ACTION: "action" },
+      ItemType: { NORMAL: "normal", CHECKBOX: "checkbox", RADIO: "radio", SEPARATOR: "separator" },
+      create: function (props, cb) { if (typeof cb === "function") { try { cb(); } catch (e) {} } return (props && props.id) || Date.now(); },
+      update: function (id, props, cb) { return dual(undefined, cb); },
+      remove: function (id, cb) { return dual(undefined, cb); },
+      removeAll: function (cb) { return dual(undefined, cb); },
+      onClicked: event(),
+    });
+
+    // chrome.webNavigation — Safari ships a subset; backfill the events Chrome
+    // bundles read at module-eval plus frame queries.
+    chrome.webNavigation = chrome.webNavigation || {};
+    fill(chrome.webNavigation, {
+      getFrame: function (d, cb) { return dual(null, cb); },
+      getAllFrames: function (d, cb) { return dual([], cb); },
+      onBeforeNavigate: event(), onCommitted: event(), onDOMContentLoaded: event(),
+      onCompleted: event(), onErrorOccurred: event(), onCreatedNavigationTarget: event(),
+      onReferenceFragmentUpdated: event(), onTabReplaced: event(), onHistoryStateUpdated: event(),
+    });
+
+    // chrome.cookies — present in Safari but without onChanged; empty fallbacks.
+    chrome.cookies = chrome.cookies || {};
+    fill(chrome.cookies, {
+      get: function (d, cb) { return dual(null, cb); },
+      getAll: function (d, cb) { return dual([], cb); },
+      set: function (d, cb) { return dual(null, cb); },
+      remove: function (d, cb) { return dual(null, cb); },
+      getAllCookieStores: function (cb) { return dual([{ id: "0", tabIds: [] }], cb); },
+      onChanged: event(),
+    });
+
+    // chrome.permissions — answer "not granted" rather than throw, so callers
+    // take their no-permission code path.
+    chrome.permissions = chrome.permissions || {};
+    fill(chrome.permissions, {
+      contains: function (p, cb) { return dual(false, cb); },
+      getAll: function (cb) { return dual({ permissions: [], origins: [] }, cb); },
+      request: function (p, cb) { return dual(false, cb); },
+      remove: function (p, cb) { return dual(false, cb); },
+      onAdded: event(), onRemoved: event(),
+    });
+
+    // chrome.webRequest — observation-only in Safari (macOS); backfill the event
+    // objects + handler behavior constant so listener registration never throws.
+    chrome.webRequest = chrome.webRequest || {};
+    fill(chrome.webRequest, {
+      MAX_HANDLER_BEHAVIOR_CHANGED_CALLS_PER_10_MINUTES: 20,
+      handlerBehaviorChanged: function (cb) { return dual(undefined, cb); },
+      onBeforeRequest: event(), onBeforeSendHeaders: event(), onSendHeaders: event(),
+      onHeadersReceived: event(), onAuthRequired: event(), onResponseStarted: event(),
+      onBeforeRedirect: event(), onCompleted: event(), onErrorOccurred: event(),
+      onActionIgnored: event(),
+    });
+
+    // chrome.declarativeContent — bundles construct matchers at module-eval
+    // (new chrome.declarativeContent.PageStateMatcher(...)); rules never fire.
+    if (!chrome.declarativeContent) {
+      var DCtor = function (o) { Object.assign(this, o || {}); };
+      chrome.declarativeContent = {
+        PageStateMatcher: DCtor, ShowAction: DCtor, ShowPageAction: DCtor, SetIcon: DCtor,
+        RequestContentScript: DCtor,
+        onPageChanged: {
+          addRules: function (r, cb) { return dual([], cb); },
+          removeRules: function (ids, cb) { return dual(undefined, cb); },
+          getRules: function (ids, cb) { if (typeof ids === "function") { cb = ids; } return dual([], cb); },
+        },
+      };
+    }
+
+    // chrome.gcm / chrome.instanceID — Chrome push plumbing; registration rejects
+    // so callers fall back to their polling path.
+    chrome.gcm = chrome.gcm || {};
+    fill(chrome.gcm, {
+      MAX_MESSAGE_SIZE: 4096,
+      register: rejectUnsupported("gcm.register"), unregister: rejectUnsupported("gcm.unregister"),
+      send: rejectUnsupported("gcm.send"),
+      onMessage: event(), onMessagesDeleted: event(), onSendError: event(),
+    });
+    chrome.instanceID = chrome.instanceID || {};
+    fill(chrome.instanceID, {
+      getID: rejectUnsupported("instanceID.getID"), getCreationTime: rejectUnsupported("instanceID.getCreationTime"),
+      getToken: rejectUnsupported("instanceID.getToken"), deleteToken: rejectUnsupported("instanceID.deleteToken"),
+      deleteID: rejectUnsupported("instanceID.deleteID"),
+      onTokenRefresh: event(),
+    });
+
+    // chrome.fontSettings / accessibilityFeatures — ChromeSetting-style leaves.
+    chrome.fontSettings = chrome.fontSettings || {};
+    fill(chrome.fontSettings, {
+      getFontList: function (cb) { return dual([], cb); },
+      getFont: function (d, cb) { return dual({ fontId: "", levelOfControl: "not_controllable" }, cb); },
+      setFont: function (d, cb) { return dual(undefined, cb); },
+      clearFont: function (d, cb) { return dual(undefined, cb); },
+      getDefaultFontSize: function (d, cb) { if (typeof d === "function") { cb = d; } return dual({ pixelSize: 16, levelOfControl: "not_controllable" }, cb); },
+      setDefaultFontSize: function (d, cb) { return dual(undefined, cb); },
+      onFontChanged: event(), onDefaultFontSizeChanged: event(), onDefaultFixedFontSizeChanged: event(), onMinimumFontSizeChanged: event(),
+    });
+    chrome.accessibilityFeatures = chrome.accessibilityFeatures || {};
+    fill(chrome.accessibilityFeatures, {
+      spokenFeedback: chromeSetting(), largeCursor: chromeSetting(), stickyKeys: chromeSetting(),
+      highContrast: chromeSetting(), screenMagnifier: chromeSetting(), autoclick: chromeSetting(),
+      virtualKeyboard: chromeSetting(), caretHighlight: chromeSetting(), cursorHighlight: chromeSetting(),
+      animationPolicy: chromeSetting(),
+    });
+
+    // chrome.ttsEngine / userScripts / dom — fill remaining dev-facing surfaces.
+    chrome.ttsEngine = chrome.ttsEngine || {};
+    fill(chrome.ttsEngine, {
+      updateVoices: function () {},
+      onSpeak: event(), onStop: event(), onPause: event(), onResume: event(),
+    });
+    chrome.userScripts = chrome.userScripts || {};
+    fill(chrome.userScripts, {
+      register: rejectUnsupported("userScripts.register"), unregister: function (f, cb) { return dual(undefined, cb); },
+      update: rejectUnsupported("userScripts.update"),
+      getScripts: function (f, cb) { if (typeof f === "function") { cb = f; } return dual([], cb); },
+      configureWorld: function (p, cb) { return dual(undefined, cb); },
+    });
+    chrome.dom = chrome.dom || {};
+    fill(chrome.dom, {
+      openOrClosedShadowRoot: function (el) { return (el && el.shadowRoot) || null; },
+    });
+
+    // ChromeOS / enterprise / kiosk tail — every remaining chrome.* namespace gets
+    // an inert object so feature probes and module-eval reads can't crash.
+    var inertNamespaces = {
+      fileBrowserHandler: { onExecute: event() },
+      fileSystemProvider: {
+        mount: rejectUnsupported("fileSystemProvider.mount"), unmount: rejectUnsupported("fileSystemProvider.unmount"),
+        getAll: function (cb) { return dual([], cb); }, get: rejectUnsupported("fileSystemProvider.get"),
+        onUnmountRequested: event(), onGetMetadataRequested: event(), onReadDirectoryRequested: event(),
+        onOpenFileRequested: event(), onCloseFileRequested: event(), onReadFileRequested: event(),
+      },
+      documentScan: { scan: rejectUnsupported("documentScan.scan") },
+      printerProvider: { onGetPrintersRequested: event(), onGetCapabilityRequested: event(), onPrintRequested: event(), onGetUsbPrinterInfoRequested: event() },
+      printing: {
+        submitJob: rejectUnsupported("printing.submitJob"), cancelJob: rejectUnsupported("printing.cancelJob"),
+        getPrinters: function (cb) { return dual([], cb); }, getPrinterInfo: rejectUnsupported("printing.getPrinterInfo"),
+        onJobStatusChanged: event(),
+      },
+      printingMetrics: { getPrintJobs: function (cb) { return dual([], cb); }, onPrintJobFinished: event() },
+      certificateProvider: {
+        requestPin: rejectUnsupported("certificateProvider.requestPin"), stopPinRequest: rejectUnsupported("certificateProvider.stopPinRequest"),
+        setCertificates: rejectUnsupported("certificateProvider.setCertificates"), reportSignature: rejectUnsupported("certificateProvider.reportSignature"),
+        onCertificatesUpdateRequested: event(), onSignatureRequested: event(),
+      },
+      vpnProvider: {
+        createConfig: rejectUnsupported("vpnProvider.createConfig"), destroyConfig: rejectUnsupported("vpnProvider.destroyConfig"),
+        setParameters: rejectUnsupported("vpnProvider.setParameters"), sendPacket: rejectUnsupported("vpnProvider.sendPacket"),
+        notifyConnectionStateChanged: rejectUnsupported("vpnProvider.notifyConnectionStateChanged"),
+        onPlatformMessage: event(), onPacketReceived: event(), onConfigRemoved: event(), onConfigCreated: event(), onUIEvent: event(),
+      },
+      wallpaper: { setWallpaper: rejectUnsupported("wallpaper.setWallpaper") },
+      loginState: {
+        getProfileType: function (cb) { return dual("USER_PROFILE", cb); },
+        getSessionState: function (cb) { return dual("IN_SESSION", cb); },
+        onSessionStateChanged: event(),
+      },
+      loginScreenStorage: {
+        storePersistentData: rejectUnsupported("loginScreenStorage.storePersistentData"),
+        retrievePersistentData: rejectUnsupported("loginScreenStorage.retrievePersistentData"),
+        storeCredentials: rejectUnsupported("loginScreenStorage.storeCredentials"),
+        retrieveCredentials: rejectUnsupported("loginScreenStorage.retrieveCredentials"),
+      },
+      signedInDevices: { get: function (d, cb) { if (typeof d === "function") { cb = d; } return dual([], cb); }, onDeviceInfoChange: event() },
+      processes: {
+        getProcessInfo: rejectUnsupported("processes.getProcessInfo"), terminate: rejectUnsupported("processes.terminate"),
+        getProcessIdForTab: rejectUnsupported("processes.getProcessIdForTab"),
+        onUpdated: event(), onUpdatedWithMemory: event(), onCreated: event(), onExited: event(),
+      },
+      webAuthenticationProxy: {
+        attach: rejectUnsupported("webAuthenticationProxy.attach"), detach: rejectUnsupported("webAuthenticationProxy.detach"),
+        completeCreateRequest: rejectUnsupported("webAuthenticationProxy.completeCreateRequest"),
+        completeGetRequest: rejectUnsupported("webAuthenticationProxy.completeGetRequest"),
+        completeIsUvpaaRequest: rejectUnsupported("webAuthenticationProxy.completeIsUvpaaRequest"),
+        onCreateRequest: event(), onGetRequest: event(), onIsUvpaaRequest: event(), onRequestCanceled: event(),
+      },
+      platformKeys: {
+        selectClientCertificates: rejectUnsupported("platformKeys.selectClientCertificates"),
+        getKeyPair: rejectUnsupported("platformKeys.getKeyPair"), getKeyPairBySpki: rejectUnsupported("platformKeys.getKeyPairBySpki"),
+        subtleCrypto: function () { return (typeof crypto !== "undefined" && crypto.subtle) || null; },
+        verifyTLSServerCertificate: rejectUnsupported("platformKeys.verifyTLSServerCertificate"),
+      },
+    };
+    for (var nsName in inertNamespaces) {
+      chrome[nsName] = chrome[nsName] || {};
+      fill(chrome[nsName], inertNamespaces[nsName]);
+    }
+    chrome.enterprise = chrome.enterprise || {};
+    fill(chrome.enterprise, {
+      platformKeys: {
+        getTokens: function (cb) { return dual([], cb); },
+        getCertificates: function (t, cb) { return dual([], cb); },
+        importCertificate: rejectUnsupported("enterprise.platformKeys.importCertificate"),
+        removeCertificate: rejectUnsupported("enterprise.platformKeys.removeCertificate"),
+        challengeKey: rejectUnsupported("enterprise.platformKeys.challengeKey"),
+      },
+      deviceAttributes: {
+        getDirectoryDeviceId: function (cb) { return dual("", cb); },
+        getDeviceSerialNumber: function (cb) { return dual("", cb); },
+        getDeviceAssetId: function (cb) { return dual("", cb); },
+        getDeviceAnnotatedLocation: function (cb) { return dual("", cb); },
+        getDeviceHostname: function (cb) { return dual("", cb); },
+      },
+      hardwarePlatform: { getHardwarePlatformInfo: function (cb) { return dual({ manufacturer: "", model: "" }, cb); } },
+      networkingAttributes: { getNetworkDetails: rejectUnsupported("enterprise.networkingAttributes.getNetworkDetails") },
+    });
+
+    // chrome.runtime stragglers.
+    if (chrome.runtime) {
+      fill(chrome.runtime, {
+        requestUpdateCheck: function (cb) { return dual({ status: "no_update" }, cb); },
+        setUninstallURL: function (u, cb) { return dual(undefined, cb); },
+        openOptionsPage: function (cb) {
+          try {
+            var m = chrome.runtime.getManifest ? chrome.runtime.getManifest() : null;
+            var page = m && (m.options_page || (m.options_ui && m.options_ui.page));
+            if (page && chrome.tabs && chrome.tabs.create) chrome.tabs.create({ url: chrome.runtime.getURL(page) });
+          } catch (e) {}
+          return dual(undefined, cb);
+        },
+      });
+    }
   }
 
   // Safari (current WebKit) CRASHES THE WHOLE BROWSER when a declarativeNetRequest
@@ -673,26 +1108,42 @@ export function writeShim(targetDir: string): string {
   return SHIM_FILENAME;
 }
 
+function walkHtmlFiles(dir: string, acc: string[] = []): string[] {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return acc;
+  }
+  for (const entry of entries) {
+    const name = entry.name;
+    if (name === "node_modules" || name === ".git" || name.startsWith("__MACOSX")) continue;
+    const full = join(dir, name);
+    if (entry.isDirectory()) walkHtmlFiles(full, acc);
+    else if (entry.isFile() && name.toLowerCase().endsWith(".html")) acc.push(full);
+  }
+  return acc;
+}
+
 /**
  * Inject the polyfill (optional) + shim as the first <head> scripts of every
- * top-level extension HTML page. Module scripts are deferred, so classic scripts
- * placed in <head> run first — the polyfill defines `browser`, then the shim
- * patches missing chrome / browser namespaces, all before bundle module-eval.
+ * extension HTML page (recursively — options/sidepanel pages often live in
+ * subdirs). The tags use root-absolute src so they resolve from any depth.
+ * Module scripts are deferred, so classic scripts placed in <head> run first —
+ * the polyfill defines `browser`, then the shim patches missing chrome / browser
+ * namespaces, all before bundle module-eval.
  */
 export function injectShimIntoHtmlPages(dir: string, polyfillFile?: string): number {
   const shimTag = `<script src="/${SHIM_FILENAME}"></script>`;
   const polyTag = polyfillFile ? `<script src="/${polyfillFile}"></script>` : "";
-  const block = polyTag ? `${polyTag}\n    ${shimTag}` : shimTag;
   let count = 0;
-  for (const name of readdirSync(dir)) {
-    if (!name.toLowerCase().endsWith(".html")) continue;
-    const file = join(dir, name);
+  for (const file of walkHtmlFiles(dir)) {
     let html = readFileSync(file, "utf-8");
-    // Already fully injected (both tags when a polyfill is in play) → skip.
-    if (html.includes(shimTag) && (!polyTag || html.includes(polyTag))) continue;
-    // Partial prior injection (shim but no polyfill): inject only the missing tag(s).
-    const toInsert = html.includes(shimTag) ? polyTag : block;
-    if (!toInsert) continue;
+    // Insert only the missing tag(s) so a partial prior injection (either tag)
+    // never produces duplicates. Polyfill stays before the shim.
+    const missing = [polyTag, shimTag].filter((t) => t && !html.includes(t));
+    if (missing.length === 0) continue;
+    const toInsert = missing.join("\n    ");
     const headMatch = html.match(/<head[^>]*>/i);
     if (headMatch) {
       const at = headMatch.index! + headMatch[0].length;
@@ -746,11 +1197,12 @@ export function convertServiceWorkerToBackgroundPage(dir: string, manifest: Mani
   const sw = manifest.background?.service_worker;
   if (!sw) return false;
   const polyTag = polyfillFile && existsSync(join(dir, polyfillFile)) ? `<script src="${polyfillFile}"></script>\n` : "";
+  // --no-shim conversions have no shim file; don't reference a missing script.
+  const shimTag = existsSync(join(dir, SHIM_FILENAME)) ? `<script src="${SHIM_FILENAME}"></script>\n` : "";
   const html = `<!DOCTYPE html>
 <meta charset="utf-8">
 <title>${manifest.name ?? "Extension"} background</title>
-${polyTag}<script src="${SHIM_FILENAME}"></script>
-<script type="module" src="${sw}"></script>
+${polyTag}${shimTag}<script type="module" src="${sw}"></script>
 `;
   writeFileSync(join(dir, BACKGROUND_PAGE_FILENAME), html, "utf-8");
   // MV3 (Safari) rejects persistent background: "A manifest_version >= 3 must be non-persistent."
