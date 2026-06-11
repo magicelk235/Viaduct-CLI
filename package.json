@@ -31,12 +31,12 @@
   "author": "magicelk235",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/magicelk235/Chrome-extensions-to-Safari.git"
+    "url": "git+https://github.com/magicelk235/Chrome-extensions-to-Safari-CLI.git"
   },
   "bugs": {
-    "url": "https://github.com/magicelk235/Chrome-extensions-to-Safari/issues"
+    "url": "https://github.com/magicelk235/Chrome-extensions-to-Safari-CLI/issues"
   },
-  "homepage": "https://github.com/magicelk235/Chrome-extensions-to-Safari#readme",
+  "homepage": "https://github.com/magicelk235/Chrome-extensions-to-Safari-CLI#readme",
   "os": [
     "darwin"
   ],
