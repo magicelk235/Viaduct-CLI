@@ -1,7 +1,7 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, existsSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { run, info, ok, warn, moveBundle } from "./util.js";
+import { run, info, ok, warn, fail, moveBundle } from "./util.js";
 import { pluginkitStatus } from "./packager.js";
 
 /** Full path to LaunchServices' lsregister (not on PATH). */
@@ -113,4 +113,48 @@ export function installToSafari(opts: InstallOptions): InstallResult {
   else warn("pluginkit has not listed the extension yet (give Safari a moment, then check Settings → Extensions).");
 
   return result;
+}
+
+/**
+ * Remove a previously installed Safari host app: delete <AppName>.app from the
+ * install dir and unregister it from LaunchServices. Inverse of installToSafari.
+ * Only ever touches a single .app bundle inside the install dir (never recurses
+ * elsewhere); returns true when the bundle was found and removed.
+ */
+export function uninstallFromSafari(appName: string, installDir?: string): boolean {
+  const cleanName = appName.replace(/\.app$/i, "");
+  const targetDir = expandHome(installDir ?? "~/Applications");
+  const dest = join(targetDir, `${cleanName}.app`);
+
+  if (!existsSync(dest)) {
+    fail(`No installed app found at ${dest}.`);
+    return false;
+  }
+  // Guard: refuse anything that isn't an .app bundle directory (never delete a
+  // file or a symlink target outside the install dir).
+  let isDir = false;
+  try {
+    isDir = statSync(dest).isDirectory();
+  } catch {
+    isDir = false;
+  }
+  if (!isDir || !dest.endsWith(".app")) {
+    fail(`Refusing to remove ${dest}: not an .app bundle.`);
+    return false;
+  }
+
+  // Unregister BEFORE deleting so LaunchServices drops the appex record cleanly.
+  const unreg = run(LSREGISTER, ["-u", dest]);
+  if (unreg.code === 0) ok("Unregistered from LaunchServices");
+  else warn(`lsregister -u exit ${unreg.code}; continuing with removal.`);
+
+  try {
+    rmSync(dest, { recursive: true, force: true });
+  } catch (e) {
+    fail(`Could not remove ${dest}: ${(e as Error).message}`);
+    return false;
+  }
+  ok(`Removed ${dest}`);
+  warn("Quit and reopen Safari for it to drop the extension from Settings → Extensions.");
+  return true;
 }

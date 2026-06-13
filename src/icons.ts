@@ -99,6 +99,10 @@ function hslToRgb(h: number, s: number, l: number): [number, number, number] {
  */
 export function synthesizePlaceholderIcons(stageDir: string, manifest: Manifest, appName: string): number[] {
   if (manifest.icons && Object.keys(manifest.icons).length > 0) return [];
+  // MV3 allows icons declared only under action.default_icon — respect those too.
+  const existingAction = (manifest.action ?? manifest.browser_action) as Record<string, unknown> | undefined;
+  const actionIcon = existingAction?.default_icon;
+  if (actionIcon && (typeof actionIcon === "string" || Object.keys(actionIcon).length > 0)) return [];
 
   const [r, g, b] = colorFor(appName);
   const icons: Record<string, string> = {};

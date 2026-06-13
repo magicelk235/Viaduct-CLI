@@ -35,6 +35,7 @@ export interface Manifest {
     matches?: string[];
     run_at?: string;
     all_frames?: boolean;
+    world?: "MAIN" | "ISOLATED";
   }>;
   web_accessible_resources?: unknown;
   commands?: Record<string, unknown>;
@@ -72,6 +73,16 @@ export interface ConvertOptions {
   generateShim: boolean;
   build: boolean;
   force: boolean;
+  /** Treat warnings as blocking (CI gate); --force still overrides. */
+  strict?: boolean;
+  /** Wipe the output dir before staging (drop stale leftovers). */
+  clean?: boolean;
+  /** Also emit a distributable .zip of the staged extension. */
+  zip?: boolean;
+  /** Open the generated .xcodeproj in Xcode when done. */
+  openXcode?: boolean;
+  /** Safari strict_min_version for browser_specific_settings (default 15.4). */
+  minSafariVersion?: string;
   keepModuleBackground: boolean;
   /** Wire the Safari OAuth/externally_connectable bridge (default on). */
   oauthBridge?: boolean;
@@ -92,6 +103,7 @@ export interface ConvertResult {
   manifestVersion: number;
   issues: Issue[];
   stagedPath?: string;
+  zipPath?: string;
   xcodeProject?: string;
   appPath?: string;
   resolvedBundleId?: string;

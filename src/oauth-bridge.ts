@@ -45,7 +45,8 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest): string[]
   injectPolyfillImport(join(stageDir, sw));
 
   // 3. The loader uses ES `import`, so the background MUST stay a module.
-  manifest.background = { ...(manifest.background ?? {}), type: "module" };
+  //    `sw` is truthy here, so `manifest.background` is guaranteed defined.
+  manifest.background = { ...manifest.background, type: "module" };
 
   // 4. Wire the page-side bridge on the externally_connectable origins (that is
   //    exactly the set of pages allowed to message the extension). Without any
@@ -64,7 +65,7 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest): string[]
   manifest.content_scripts = manifest.content_scripts ?? [];
   // MAIN world: fake chrome.runtime in the page. Isolated world: relay to SW.
   manifest.content_scripts.unshift(
-    { js: [BRIDGE_PAGE], matches, run_at: "document_start", all_frames: false, world: "MAIN" } as any,
+    { js: [BRIDGE_PAGE], matches, run_at: "document_start", all_frames: false, world: "MAIN" },
     { js: [BRIDGE_PAGE_CS], matches, run_at: "document_start", all_frames: false }
   );
 

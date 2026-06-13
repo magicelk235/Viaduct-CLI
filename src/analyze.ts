@@ -111,7 +111,10 @@ function scanJsContent(content: string, rel: string, issues: Issue[]): void {
   }
 
   const wr = BLOCKING_WEBREQUEST_RE.exec(content);
-  if (wr && /\bblocking\b/.test(content)) {
+  // Blocking mode is opted into via the literal "blocking" string in the
+  // addListener extraInfoSpec array. Match the quoted token, not the bare word
+  // (which fires on comments, CSS classes, and unrelated identifiers).
+  if (wr && /["']blocking["']/.test(content)) {
     issues.push({
       severity: "error",
       category: "api",
@@ -200,6 +203,19 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
         message: `Declared icon "${p}" is missing from the package; Safari will fail to load the extension.`,
         file: "manifest.json",
         fix: "Add the icon file, or remove the reference from manifest.json.",
+      });
+      continue;
+    }
+    // Safari's extension toolbar/store pipeline only renders PNG icons; an .svg/.webp/.jpg
+    // icon loads in Chrome but shows a blank glyph in Safari (and the App Store rejects it).
+    const ext = p.slice(p.lastIndexOf(".")).toLowerCase();
+    if (ext && ext !== ".png") {
+      issues.push({
+        severity: "warning",
+        category: "icons",
+        message: `Icon "${p}" is ${ext} — Safari only renders PNG icons (Chrome accepts more formats).`,
+        file: "manifest.json",
+        fix: "Convert the icon to PNG and update the manifest path.",
       });
     }
   }

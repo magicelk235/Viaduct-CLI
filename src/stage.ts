@@ -20,12 +20,17 @@ const EXCLUDE_EXACT = new Set([
 ]);
 
 const EXCLUDE_SUFFIX = [".map", ".ts", ".tsx", ".md", ".log"];
-const EXCLUDE_PREFIX = ["README", "CHANGELOG", "LICENSE", ".eslint", ".prettier"];
+// Doc/config files: bare name or name + extension only (e.g. "LICENSE",
+// "LICENSE.txt"), never a prefix match — that would drop legit runtime files
+// like "LICENSE_KEY.js" or "READMExporter.js".
+const EXCLUDE_DOC_RE = /^(README|CHANGELOG|LICENSE)(\.[^.]+)?$/i;
+const EXCLUDE_DOTFILE = [".eslint", ".prettier"];
 
 function shouldExclude(name: string): boolean {
   if (EXCLUDE_EXACT.has(name)) return true;
   if (EXCLUDE_SUFFIX.some((s) => name.endsWith(s))) return true;
-  if (EXCLUDE_PREFIX.some((p) => name.startsWith(p))) return true;
+  if (EXCLUDE_DOC_RE.test(name)) return true;
+  if (EXCLUDE_DOTFILE.some((p) => name.startsWith(p))) return true;
   return false;
 }
 
