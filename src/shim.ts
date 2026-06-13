@@ -66,7 +66,7 @@ export function shimSource(): string {
   // needs "the active tab" then throws "No active tab" and the chat/agent dies.
   // Wrap tabs.query: if an active-tab query comes back empty, retry against the
   // last-focused normal window, then any active tab. Supports callback + promise.
-  function wrapTabsQuery(ns, label) {
+  function wrapTabsQuery(ns) {
     if (!ns || !ns.tabs || typeof ns.tabs.query !== "function" || ns.tabs.__c2sWrapped) return;
     var _query = ns.tabs.query.bind(ns.tabs);
     function runQuery(q) {
@@ -95,11 +95,14 @@ export function shimSource(): string {
     };
     ns.tabs.__c2sWrapped = true;
   }
-  wrapTabsQuery(typeof chrome !== "undefined" ? chrome : null, "chrome");
-  if (typeof browser !== "undefined" && browser !== chrome) wrapTabsQuery(browser, "browser");
+  wrapTabsQuery(typeof chrome !== "undefined" ? chrome : null);
+  if (typeof browser !== "undefined" && browser !== chrome) wrapTabsQuery(browser);
 
   // storage.sync has no iCloud sync in Safari; route it to local so data persists.
-  if (api.storage && api.storage.local) {
+  // Only shim when sync is missing or non-functional — never clobber a browser
+  // that exposes a real, working storage.sync.
+  if (api.storage && api.storage.local &&
+      (!api.storage.sync || typeof api.storage.sync.get !== "function")) {
     var local = api.storage.local;
     api.storage.sync = {
       get: function () { return local.get.apply(local, arguments); },
@@ -110,8 +113,9 @@ export function shimSource(): string {
         return local.getBytesInUse ? local.getBytesInUse.apply(local, arguments) : Promise.resolve(0);
       },
       // Bundles read storage.sync.onChanged.addListener at module-eval; a stub
-      // without it throws and aborts evaluation. Mirror local's event when present.
-      onChanged: local.onChanged || event(),
+      // without it throws and aborts evaluation. storage.onChanged (Chrome's real
+      // location — there is no storage.local.onChanged) fires for local writes too.
+      onChanged: (api.storage.onChanged) || event(),
     };
   }
 
@@ -150,13 +154,17 @@ export function shimSource(): string {
   if (typeof chrome !== "undefined") {
     var n = chrome.notifications || (chrome.notifications = {});
     if (typeof n.create !== "function") n.create = function (id, opts, cb) {
+      // Chrome allows the id to be omitted: create(options, callback). Detect the
+      // shifted form (first arg is the options object) and realign.
+      if (typeof id === "object" && id !== null) { cb = opts; opts = id; id = ""; }
       try {
         if (typeof Notification !== "undefined" && Notification.permission === "granted" && opts) {
           new Notification(opts.title || "", { body: opts.message || "", icon: opts.iconUrl });
         }
       } catch (e) { /* ignore */ }
-      if (typeof cb === "function") cb(typeof id === "string" ? id : "");
-      return Promise.resolve(typeof id === "string" ? id : "");
+      var nid = typeof id === "string" && id ? id : "c2s-" + Date.now();
+      if (typeof cb === "function") cb(nid);
+      return Promise.resolve(nid);
     };
     if (typeof n.clear !== "function") n.clear = function (id, cb) { if (cb) cb(true); return Promise.resolve(true); };
     if (typeof n.update !== "function") n.update = function (id, opts, cb) { if (cb) cb(true); return Promise.resolve(true); };
@@ -1025,7 +1033,7 @@ export function shimSource(): string {
   // rule crashes Safari so we strip it above), but THIS header IS settable from JS,
   // so inject it here. Covers fetch+XHR.
   (function () {
-    var ANTH = /(^|\.)api\.anthropic\.com/i;
+    var ANTH = /(^|[/.])api\.anthropic\.com(?=[/:?]|$)/i;
     var HDR = "anthropic-dangerous-direct-browser-access";
     var g = (typeof self !== "undefined") ? self : (typeof window !== "undefined" ? window : null);
     if (g && typeof g.fetch === "function" && !g.fetch.__c2sPatched) {
