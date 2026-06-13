@@ -36,10 +36,9 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest): string[]
   const sw = manifest.background?.service_worker;
   if (!sw) return notes; // only MV3 service-worker extensions have this handshake
 
-  // 1. Emit bridge assets at the extension root.
-  for (const f of [BRIDGE_POLYFILL, BRIDGE_PAGE, BRIDGE_PAGE_CS]) {
-    copyFileSync(join(TEMPLATE_DIR, f), join(stageDir, f));
-  }
+  // 1. Emit the identity polyfill — it shims chrome.identity in the SW and is
+  //    imported below regardless of whether the page bridge gets wired.
+  copyFileSync(join(TEMPLATE_DIR, BRIDGE_POLYFILL), join(stageDir, BRIDGE_POLYFILL));
 
   // 2. The SW (or its loader) must run the polyfill FIRST so the bridge receiver
   //    and chrome.identity shim install before the bundle evaluates.
@@ -49,12 +48,18 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest): string[]
   manifest.background = { ...(manifest.background ?? {}), type: "module" };
 
   // 4. Wire the page-side bridge on the externally_connectable origins (that is
-  //    exactly the set of pages allowed to message the extension).
+  //    exactly the set of pages allowed to message the extension). Without any
+  //    such origins the page↔SW handshake can never fire, so don't emit the
+  //    page-bridge files — they'd just be dead weight in the package.
   const matches = manifest.externally_connectable?.matches ?? [];
   if (matches.length === 0) {
-    notes.push("OAuth bridge assets emitted, but manifest has no externally_connectable.matches; page bridge not wired.");
+    notes.push("chrome.identity shim emitted; page bridge skipped (no externally_connectable.matches to wire).");
     return notes;
   }
+
+  // Page bridge is actually wired → emit its two assets now.
+  copyFileSync(join(TEMPLATE_DIR, BRIDGE_PAGE), join(stageDir, BRIDGE_PAGE));
+  copyFileSync(join(TEMPLATE_DIR, BRIDGE_PAGE_CS), join(stageDir, BRIDGE_PAGE_CS));
 
   manifest.content_scripts = manifest.content_scripts ?? [];
   // MAIN world: fake chrome.runtime in the page. Isolated world: relay to SW.

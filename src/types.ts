@@ -25,6 +25,7 @@ export interface Manifest {
   };
   action?: Record<string, unknown> & { default_popup?: string };
   browser_action?: Record<string, unknown> & { default_popup?: string };
+  page_action?: Record<string, unknown> & { default_popup?: string };
   permissions?: string[];
   optional_permissions?: string[];
   host_permissions?: string[];
@@ -51,6 +52,9 @@ export interface Manifest {
   incognito?: string;
   chrome_url_overrides?: Record<string, string>;
   devtools_page?: string;
+  options_page?: string;
+  options_ui?: { page?: string };
+  sandbox?: { pages?: string[] };
   [key: string]: unknown;
 }
 

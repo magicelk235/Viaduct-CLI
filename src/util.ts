@@ -23,8 +23,15 @@ export interface RunResult {
   stderr: string;
 }
 
+let verbose = false;
+/** Enable live echo of every subprocess invocation and its output. */
+export function setVerbose(v: boolean): void {
+  verbose = v;
+}
+
 /** Run a command, capturing output. Never throws on non-zero exit. */
 export function run(cmd: string, args: string[], opts: SpawnSyncOptions = {}): RunResult {
+  if (verbose) console.error(color("dim", `$ ${cmd} ${args.join(" ")}`));
   const res = spawnSync(cmd, args, {
     encoding: "utf-8",
     maxBuffer: 64 * 1024 * 1024,
@@ -33,11 +40,13 @@ export function run(cmd: string, args: string[], opts: SpawnSyncOptions = {}): R
   if (res.error && (res.error as NodeJS.ErrnoException).code === "ENOENT") {
     return { code: 127, stdout: "", stderr: `command not found: ${cmd}` };
   }
-  return {
-    code: res.status ?? 1,
-    stdout: (res.stdout as string) ?? "",
-    stderr: (res.stderr as string) ?? "",
-  };
+  const stdout = (res.stdout as string) ?? "";
+  const stderr = (res.stderr as string) ?? "";
+  if (verbose) {
+    if (stdout.trim()) process.stdout.write(stdout);
+    if (stderr.trim()) process.stderr.write(stderr);
+  }
+  return { code: res.status ?? 1, stdout, stderr };
 }
 
 export function commandExists(cmd: string): boolean {
