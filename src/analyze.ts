@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, existsSync, realpathSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import type { Issue, Manifest, Platforms } from "./types.js";
-import { UNSUPPORTED_APIS } from "./manifest.js";
+import { UNSUPPORTED_APIS, parseJsonc } from "./manifest.js";
 
 /**
  * Recursive file finder. Dirent-based so each entry costs no extra stat (only
@@ -86,6 +86,7 @@ const BLOCKING_WEBREQUEST_RE = /chrome\.webRequest\.on\w+/;
 const TIMER_RE = /(setTimeout|setInterval)\s*\(/;
 const BACKGROUND_FILE_RE = /(background|service[-_]?worker)/i;
 const CONNECT_RE = /(tabs\.connect|runtime\.onConnect)/;
+const IMPORT_SCRIPTS_RE = /\bimportScripts\s*\(/;
 
 function scanJsContent(content: string, rel: string, issues: Issue[]): void {
   const lineAt = makeLineResolver(content);
@@ -135,6 +136,23 @@ function scanJsContent(content: string, rel: string, issues: Issue[]): void {
     }
   }
 
+  // chrome2safari converts the MV3 service worker into a module background page
+  // (<script type="module">). importScripts() is a worker-global function absent
+  // in module scope, so the first call throws and the background dies silently.
+  // Flag it anywhere — outside a worker it was already non-functional. (Not gated
+  // on the filename: the SW entry is often named sw.js / index.js, not "background".)
+  const is = IMPORT_SCRIPTS_RE.exec(content);
+  if (is) {
+    issues.push({
+      severity: "error",
+      category: "background",
+      message: "importScripts() is undefined once the service worker is converted to a module background page.",
+      file: rel,
+      line: lineAt(is.index),
+      fix: 'Replace importScripts("a.js","b.js") with static ES imports (import "./a.js";) at the top of the worker.',
+    });
+  }
+
   const cm = CONNECT_RE.exec(content);
   if (cm) {
     issues.push({
@@ -157,6 +175,73 @@ function scanJsContent(content: string, rel: string, issues: Issue[]): void {
 export function scanExtension(extPath: string, manifest: Manifest, platforms: Platforms): Issue[] {
   const issues: Issue[] = [];
 
+  // Declared icon paths that don't exist on disk → Safari fails to load the
+  // extension (and the App Store rejects the upload). Collect every referenced
+  // icon path from manifest.icons and each action's default_icon, then flag the
+  // missing ones. Web-accessible/CSS icons aren't checked — only manifest-declared.
+  const iconPaths = new Set<string>();
+  for (const p of Object.values(manifest.icons ?? {})) {
+    if (typeof p === "string") iconPaths.add(p);
+  }
+  for (const a of [manifest.action, manifest.browser_action, manifest.page_action]) {
+    const di = (a as { default_icon?: unknown } | undefined)?.default_icon;
+    if (typeof di === "string") iconPaths.add(di);
+    else if (di && typeof di === "object") {
+      for (const p of Object.values(di as Record<string, unknown>)) {
+        if (typeof p === "string") iconPaths.add(p);
+      }
+    }
+  }
+  for (const p of iconPaths) {
+    if (!existsSync(join(extPath, p))) {
+      issues.push({
+        severity: "error",
+        category: "icons",
+        message: `Declared icon "${p}" is missing from the package; Safari will fail to load the extension.`,
+        file: "manifest.json",
+        fix: "Add the icon file, or remove the reference from manifest.json.",
+      });
+    }
+  }
+
+  // Manifest-referenced files that don't exist on disk → Safari silently drops the
+  // content script / fails to load the page. Collected as {path → where} so a
+  // missing file is reported once with a useful location. Only author-declared
+  // paths are checked here (analyze runs on the raw manifest, before the converter
+  // injects its own shim/polyfill/bridge scripts — so no false positives on those).
+  const refs = new Map<string, string>();
+  const addRef = (p: unknown, where: string) => {
+    if (typeof p === "string" && p && !refs.has(p)) refs.set(p, where);
+  };
+  const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+  // arr()/typeof guards keep a malformed manifest (non-array js/scripts, etc.) from
+  // crashing the scan — Chrome would reject it, but the converter should report.
+  arr(manifest.content_scripts).forEach((cs: any, i) => {
+    for (const j of arr(cs?.js)) addRef(j, `content_scripts[${i}].js`);
+    for (const c of arr(cs?.css)) addRef(c, `content_scripts[${i}].css`);
+  });
+  for (const b of arr(manifest.background?.scripts)) addRef(b, "background.scripts");
+  addRef(manifest.background?.service_worker, "background.service_worker");
+  addRef(manifest.background?.page, "background.page");
+  for (const a of [manifest.action, manifest.browser_action, manifest.page_action]) {
+    addRef((a as { default_popup?: unknown } | undefined)?.default_popup, "action.default_popup");
+  }
+  addRef(manifest.options_page, "options_page");
+  addRef(manifest.options_ui?.page, "options_ui.page");
+  addRef(manifest.devtools_page, "devtools_page");
+  for (const p of arr(manifest.sandbox?.pages)) addRef(p, "sandbox.pages");
+  for (const [p, where] of refs) {
+    if (!existsSync(join(extPath, p))) {
+      issues.push({
+        severity: "error",
+        category: "manifest",
+        message: `${where} references "${p}", which is missing from the package.`,
+        file: "manifest.json",
+        fix: "Safari silently drops the script/page for a missing file; add it or remove the reference.",
+      });
+    }
+  }
+
   // _locales dir present but no default_locale → Chrome AND Safari reject the load.
   if (existsSync(join(extPath, "_locales")) && !manifest.default_locale) {
     issues.push({
@@ -166,6 +251,33 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
       file: "manifest.json",
       fix: "Add a default_locale key matching one of your _locales subfolders.",
     });
+  }
+
+  // default_locale set → its _locales/<locale>/messages.json must exist and parse,
+  // or the load fails with an opaque error.
+  if (manifest.default_locale) {
+    const msgs = join(extPath, "_locales", manifest.default_locale, "messages.json");
+    if (!existsSync(msgs)) {
+      issues.push({
+        severity: "error",
+        category: "i18n",
+        message: `default_locale "${manifest.default_locale}" has no _locales/${manifest.default_locale}/messages.json.`,
+        file: "manifest.json",
+        fix: "Create the messages.json for the default locale, or change default_locale to an existing one.",
+      });
+    } else {
+      try {
+        parseJsonc(readFileSync(msgs, "utf-8"));
+      } catch {
+        issues.push({
+          severity: "error",
+          category: "i18n",
+          message: `_locales/${manifest.default_locale}/messages.json is not valid JSON; the extension will fail to load.`,
+          file: `_locales/${manifest.default_locale}/messages.json`,
+          fix: "Fix the JSON syntax.",
+        });
+      }
+    }
   }
 
   let faviconNoted = false;
@@ -208,9 +320,11 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
       file: "manifest.json",
       fix: "Add responsive CSS; test in Safari on iOS. Distribution is App Store only (no dev-direct for end users).",
     });
-    const platformGated = ["contextMenus", "notifications", "downloads", "cookies"].filter((p) =>
-      [...(manifest.permissions ?? []), ...(manifest.optional_permissions ?? [])].includes(p)
-    );
+    const allPerms = [
+      ...(Array.isArray(manifest.permissions) ? manifest.permissions : []),
+      ...(Array.isArray(manifest.optional_permissions) ? manifest.optional_permissions : []),
+    ];
+    const platformGated = ["contextMenus", "notifications", "downloads", "cookies"].filter((p) => allPerms.includes(p));
     if (platformGated.length) {
       issues.push({
         severity: "info",

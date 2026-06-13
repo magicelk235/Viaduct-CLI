@@ -5,10 +5,11 @@ import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
 import { extractExtension } from "./extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString } from "./manifest.js";
 import { scanExtension } from "./analyze.js";
-import { stageExtension } from "./stage.js";
+import { stageExtension, stripDanglingSourcemaps } from "./stage.js";
 import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage } from "./shim.js";
 import { applyOAuthBridge } from "./oauth-bridge.js";
 import { applyDnr } from "./dnr.js";
+import { synthesizePlaceholderIcons } from "./icons.js";
 import { writeTempLoadInstructions } from "./tempload.js";
 import { installToSafari } from "./installer.js";
 import {
@@ -20,7 +21,7 @@ import {
   unsignedExtensionsAllowed,
   defaultBundleId,
 } from "./packager.js";
-import { printIssues, countBlocking } from "./report.js";
+import { printIssues, countBlocking, writeReportFile } from "./report.js";
 import { info, ok, warn, fail, color, moveBundle } from "./util.js";
 
 export function convert(opts: ConvertOptions): ConvertResult {
@@ -107,11 +108,24 @@ export function convert(opts: ConvertOptions): ConvertResult {
       ok("Service worker → persistent background page (Safari reachability)");
     }
 
+    const synthIcons = synthesizePlaceholderIcons(stageDir, transformed, appName);
+    if (synthIcons.length > 0) ok(`Synthesized placeholder icons (${synthIcons.join("/")}px) — manifest had none`);
+
+    const strippedMaps = stripDanglingSourcemaps(stageDir);
+    if (strippedMaps > 0) ok(`Stripped dangling sourcemap refs from ${strippedMaps} script(s)`);
+
     writeManifest(stageDir, transformed);
     const popupFile = (transformed.action ?? transformed.browser_action)?.default_popup;
     if (popupFile) injectPopupSizing(stageDir, popupFile);
     result.stagedPath = stageDir;
     ok(`Staged → ${stageDir}`);
+
+    const reportPath = writeReportFile(
+      outputDir,
+      { name: result.extensionName, version: transformed.version, manifestVersion: result.manifestVersion, platforms: opts.platforms },
+      issues
+    );
+    ok(`Report → ${reportPath}`);
 
     if (opts.tempLoadOnly) {
       const notes = writeTempLoadInstructions(stageDir);

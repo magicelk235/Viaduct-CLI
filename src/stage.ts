@@ -1,5 +1,5 @@
-import { cpSync, mkdirSync, rmSync, existsSync } from "node:fs";
-import { basename } from "node:path";
+import { cpSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, join, dirname, resolve } from "node:path";
 import { cleanExtendedAttributes } from "./extract.js";
 
 /** Names/globs excluded from the clean staged extension. */
@@ -44,4 +44,56 @@ export function stageExtension(sourceDir: string, stageDir: string): void {
   });
 
   cleanExtendedAttributes(stageDir);
+}
+
+const SOURCEMAP_RE = /[ \t]*\/\/[#@] sourceMappingURL=(\S+)[ \t]*\r?$/gm;
+
+function walkScripts(dir: string, acc: string[] = []): string[] {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return acc;
+  }
+  for (const entry of entries) {
+    if (entry.name === "node_modules" || entry.name.startsWith("__MACOSX")) continue;
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) walkScripts(full, acc);
+    else if (entry.isFile() && (entry.name.endsWith(".js") || entry.name.endsWith(".mjs"))) acc.push(full);
+  }
+  return acc;
+}
+
+/**
+ * Strip `//# sourceMappingURL=…` comments that point at a .map file no longer
+ * present in the staged extension (stageExtension excludes *.map as dev cruft).
+ * A dangling reference makes Safari's Web Inspector emit a 404 for the missing
+ * map on every load. Only strips refs whose target is gone and is a local path —
+ * data: URIs (inline maps) and existing maps are left untouched. Returns the
+ * number of files modified.
+ */
+export function stripDanglingSourcemaps(stageDir: string): number {
+  let modified = 0;
+  for (const file of walkScripts(stageDir)) {
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    let changed = false;
+    const next = content.replace(SOURCEMAP_RE, (whole, url: string) => {
+      if (url.startsWith("data:")) return whole; // inline map, self-contained
+      // Resolve relative to the script; keep the ref if the map actually shipped.
+      const mapPath = resolve(dirname(file), url);
+      if (existsSync(mapPath)) return whole;
+      changed = true;
+      return "";
+    });
+    if (changed) {
+      writeFileSync(file, next, "utf-8");
+      modified++;
+    }
+  }
+  return modified;
 }

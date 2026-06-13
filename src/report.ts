@@ -1,3 +1,5 @@
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { Issue, Severity } from "./types.js";
 import { color } from "./util.js";
 
@@ -40,4 +42,52 @@ export function printIssues(issues: Issue[]): void {
 
 export function countBlocking(issues: Issue[]): number {
   return issues.filter((i) => i.severity === "error" && !i.autoFixed).length;
+}
+
+const HEADING: Record<Severity, string> = { error: "Errors", warning: "Warnings", info: "Info" };
+
+/**
+ * Write a Markdown summary of the conversion next to the output, so the issue
+ * report survives past the terminal scrollback (useful for CI logs / handoff).
+ * Returns the path written.
+ */
+export function writeReportFile(
+  dir: string,
+  meta: { name: string; version?: string; manifestVersion: number; platforms: string },
+  issues: Issue[]
+): string {
+  const counts: Record<Severity, number> = { error: 0, warning: 0, info: 0 };
+  let autoFixed = 0;
+  for (const i of issues) {
+    counts[i.severity]++;
+    if (i.autoFixed) autoFixed++;
+  }
+
+  const lines: string[] = [
+    `# Conversion report — ${meta.name}`,
+    "",
+    `- Version: ${meta.version ?? "(none)"}`,
+    `- Manifest: MV${meta.manifestVersion}`,
+    `- Platforms: ${meta.platforms}`,
+    `- Issues: ${counts.error} error(s), ${counts.warning} warning(s), ${counts.info} info` +
+      (autoFixed ? ` — ${autoFixed} auto-fixed` : ""),
+    "",
+  ];
+
+  for (const sev of ORDER) {
+    const group = issues.filter((i) => i.severity === sev);
+    if (group.length === 0) continue;
+    lines.push(`## ${HEADING[sev]} (${group.length})`, "");
+    for (const i of group) {
+      const loc = i.file ? ` \`${i.file}${i.line ? `:${i.line}` : ""}\`` : "";
+      const tag = i.autoFixed ? " _(auto-fixed)_" : "";
+      lines.push(`- **[${i.category}]**${loc}${tag} — ${i.message}`);
+      if (i.fix) lines.push(`  - ${i.autoFixed ? "" : "fix: "}${i.fix}`);
+    }
+    lines.push("");
+  }
+
+  const p = join(dir, "CONVERSION_REPORT.md");
+  writeFileSync(p, lines.join("\n"), "utf-8");
+  return p;
 }
