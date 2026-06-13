@@ -8,7 +8,7 @@ import { extractExtension } from "./extract.js";
 import { loadManifest, analyzeManifest, resolveI18nString } from "./manifest.js";
 import { scanExtension } from "./analyze.js";
 import { printIssues } from "./report.js";
-import { run, info, ok, warn, fail, color, commandExists } from "./util.js";
+import { run, info, ok, warn, fail, color, commandExists, setVerbose } from "./util.js";
 import { LSREGISTER } from "./installer.js";
 import { detectXcodeTeam } from "./packager.js";
 import type { Platforms } from "./types.js";
@@ -144,6 +144,7 @@ function main(): void {
   }
 
   const { values, positionals } = parsed;
+  setVerbose(values.verbose);
 
   if (values.help) {
     console.log(HELP);

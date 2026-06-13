@@ -2,10 +2,71 @@ import { readFileSync, existsSync, writeFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Manifest, Issue } from "./types.js";
 
+/**
+ * Parse JSON that may carry // and /* *\/ comments or trailing commas — both are
+ * illegal in strict JSON but common in hand-edited Chrome manifests (Chrome's own
+ * loader tolerates comments). A single character-state scan skips comment runs and
+ * trailing commas WITHOUT touching their look-alikes inside string literals (e.g.
+ * the "//" in an "https://…" URL), then hands clean JSON to JSON.parse.
+ */
+export function parseJsonc<T = unknown>(text: string): T {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    const next = text[i + 1];
+    if (inString) {
+      out += c;
+      if (escaped) escaped = false;
+      else if (c === "\\") escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      out += c;
+      continue;
+    }
+    if (c === "/" && next === "/") {
+      while (i < text.length && text[i] !== "\n") i++;
+      out += "\n"; // preserve line numbering for parse errors
+      continue;
+    }
+    if (c === "/" && next === "*") {
+      i += 2;
+      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i++;
+      i++; // land on the '/', loop's i++ steps past it
+      continue;
+    }
+    if (c === ",") {
+      // Trailing comma? Peek past whitespace AND any comments; drop the comma when
+      // the next significant character closes an object/array. Done in-scanner (not
+      // a post-regex) so a "," inside a string literal is never affected.
+      let j = i + 1;
+      while (j < text.length) {
+        const d = text[j];
+        if (d === " " || d === "\t" || d === "\r" || d === "\n") j++;
+        else if (d === "/" && text[j + 1] === "/") {
+          j += 2;
+          while (j < text.length && text[j] !== "\n") j++;
+        } else if (d === "/" && text[j + 1] === "*") {
+          j += 2;
+          while (j < text.length && !(text[j] === "*" && text[j + 1] === "/")) j++;
+          j += 2;
+        } else break;
+      }
+      if (text[j] === "}" || text[j] === "]") continue; // skip trailing comma
+    }
+    out += c;
+  }
+  return JSON.parse(out) as T;
+}
+
 export function loadManifest(extPath: string): Manifest {
   const p = join(extPath, "manifest.json");
   if (!existsSync(p)) throw new Error(`No manifest.json found in ${extPath}`);
-  return JSON.parse(readFileSync(p, "utf-8")) as Manifest;
+  return parseJsonc<Manifest>(readFileSync(p, "utf-8"));
 }
 
 /**
@@ -37,7 +98,7 @@ export function resolveI18nString(value: string | undefined, extPath: string, de
     const p = join(localesDir, loc, "messages.json");
     if (!existsSync(p)) continue;
     try {
-      const msgs = JSON.parse(readFileSync(p, "utf-8")) as Record<string, { message?: string }>;
+      const msgs = parseJsonc<Record<string, { message?: string }>>(readFileSync(p, "utf-8"));
       for (const k of Object.keys(msgs)) {
         if (k.toLowerCase() === key) {
           const msg = msgs[k]?.message;
@@ -298,10 +359,68 @@ export interface ManifestAnalysis {
   permissionsToRemove: string[];
 }
 
+const MATCH_SCHEMES = new Set(["http", "https", "*", "file", "ftp"]);
+
+/**
+ * Validate a Chrome match pattern (https://developer.chrome.com/docs/extensions/mv3/match_patterns/).
+ * Chrome only warns on a bad pattern, but Safari silently drops the entire
+ * content script that contains it — so a malformed entry must surface as an
+ * error before conversion. Returns null when valid, else a short reason.
+ */
+export function matchPatternError(pattern: string): string | null {
+  if (pattern === "<all_urls>") return null;
+  const m = /^(\*|https?|file|ftp):\/\/(.*)$/.exec(pattern);
+  if (!m) return "missing or unsupported scheme (expected http/https/file/ftp/*://)";
+  const scheme = m[1];
+  if (!MATCH_SCHEMES.has(scheme)) return `unsupported scheme "${scheme}"`;
+  const rest = m[2];
+
+  // file:// has no host: everything after :// is the path.
+  if (scheme === "file") {
+    return rest.startsWith("/") ? null : "file:// pattern path must start with '/'";
+  }
+
+  const slash = rest.indexOf("/");
+  if (slash === -1) return "missing path (a match pattern must end with a path, e.g. '/*')";
+  const host = rest.slice(0, slash);
+  if (host === "") return "empty host";
+  // '*' alone, or '*.' prefix, are the only legal wildcard host forms.
+  if (host !== "*") {
+    const body = host.startsWith("*.") ? host.slice(2) : host;
+    if (body.includes("*")) return `host "${host}" may only use '*' as a full or leftmost-label wildcard`;
+    if (body === "") return "empty host after '*.'";
+  }
+  return null;
+}
+
 export function analyzeManifest(m: Manifest): ManifestAnalysis {
   const issues: Issue[] = [];
   const permissionsToRemove: string[] = [];
-  const allPerms = [...(m.permissions ?? []), ...(m.optional_permissions ?? [])];
+  const allPerms = [
+    ...(Array.isArray(m.permissions) ? m.permissions : []),
+    ...(Array.isArray(m.optional_permissions) ? m.optional_permissions : []),
+  ];
+
+  // Bad match patterns make Safari silently drop the whole content script.
+  // Guard against a malformed manifest where these aren't arrays/strings — Chrome
+  // rejects such a manifest, but the converter must report rather than crash.
+  const contentScripts = Array.isArray(m.content_scripts) ? m.content_scripts : [];
+  contentScripts.forEach((cs, i) => {
+    const matches = Array.isArray(cs?.matches) ? cs.matches : [];
+    for (const pat of matches) {
+      if (typeof pat !== "string") continue;
+      const err = matchPatternError(pat);
+      if (err) {
+        issues.push({
+          severity: "error",
+          category: "content_scripts",
+          message: `Invalid match pattern "${pat}" in content_scripts[${i}]: ${err}.`,
+          file: "manifest.json",
+          fix: "Safari drops the entire content script for one bad pattern; correct or remove it.",
+        });
+      }
+    }
+  });
 
   // Set-dedupe: a permission listed in BOTH permissions and optional_permissions
   // would otherwise produce two identical issues.
@@ -347,10 +466,12 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
     });
   }
 
+  // Each object value is a full policy string; join with ';' (not ' ') so
+  // directive boundaries survive for the per-directive scans below.
   const csp =
     typeof m.content_security_policy === "string"
       ? m.content_security_policy
-      : Object.values(m.content_security_policy ?? {}).join(" ");
+      : Object.values(m.content_security_policy ?? {}).join("; ");
   if (csp.includes("unsafe-eval")) {
     issues.push({
       severity: "warning",
@@ -358,6 +479,29 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
       message: "CSP allows 'unsafe-eval'; Safari rejects eval in extension contexts regardless.",
       file: "manifest.json",
       fix: "Remove eval()/new Function usage; precompile templates or use JSON.parse.",
+    });
+  }
+
+  // A script-src/script-src-elem directive that whitelists a remote origin (a
+  // hosted CDN, etc.) means the extension loads code from the network. Safari
+  // forbids remote script in extension pages and the App Store review rejects it.
+  const scriptSrc = /(?:^|;)\s*script-src(?:-elem)?\s+([^;]+)/gi;
+  const remoteSrc = new Set<string>();
+  for (const dm of csp.matchAll(scriptSrc)) {
+    for (const token of dm[1].trim().split(/\s+/)) {
+      // A bare "*" (or scheme-wildcard like https://*) whitelists the whole network.
+      if (token === "*" || /^(https?:|\/\/|wss?:|\*:)/i.test(token) || /^[a-z0-9.-]+\.[a-z]{2,}(?::\d+)?$/i.test(token)) {
+        remoteSrc.add(token);
+      }
+    }
+  }
+  if (remoteSrc.size > 0) {
+    issues.push({
+      severity: "warning",
+      category: "manifest",
+      message: `CSP script-src allows remote origin(s) (${[...remoteSrc].join(", ")}); Safari blocks remote scripts and the App Store rejects them.`,
+      file: "manifest.json",
+      fix: "Bundle the script into the extension and load it locally; remove remote script-src entries.",
     });
   }
 
@@ -394,7 +538,7 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
     });
   }
 
-  const action = m.action ?? m.browser_action;
+  const action = m.action ?? m.browser_action ?? m.page_action;
   if (!action?.default_popup) {
     issues.push({
       severity: "info",
@@ -467,7 +611,10 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
     });
   }
 
-  const hosts = [...(m.host_permissions ?? []), ...(m.permissions ?? [])];
+  const hosts = [
+    ...(Array.isArray(m.host_permissions) ? m.host_permissions : []),
+    ...(Array.isArray(m.permissions) ? m.permissions : []),
+  ];
   if (hosts.some((h) => h === "<all_urls>" || h === "*://*/*" || h === "http://*/*" || h === "https://*/*")) {
     issues.push({
       severity: "info",
@@ -482,9 +629,10 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
     issues.push({
       severity: "info",
       category: "ui",
-      message: "No icons in the manifest; Safari shows a generic placeholder in the toolbar and Settings.",
+      message: "No icons in the manifest; synthesizing a solid-color placeholder set (48/128/256/512px).",
       file: "manifest.json",
-      fix: "Add at least 48px/96px (and 128px for the App Store) PNG icons under the icons key.",
+      fix: "Replace with real PNG icons for production; the placeholder only avoids a blank toolbar glyph.",
+      autoFixed: true,
     });
   }
 
@@ -521,8 +669,8 @@ export function transformManifest(
   }
 
   const removeSet = new Set(permissionsToRemove);
-  if (out.permissions) out.permissions = out.permissions.filter((p) => !removeSet.has(p));
-  if (out.optional_permissions) {
+  if (Array.isArray(out.permissions)) out.permissions = out.permissions.filter((p) => !removeSet.has(p));
+  if (Array.isArray(out.optional_permissions)) {
     out.optional_permissions = out.optional_permissions.filter((p) => !removeSet.has(p));
     if (out.optional_permissions.length === 0) delete out.optional_permissions;
   }
@@ -533,6 +681,32 @@ export function transformManifest(
   }
   if (mv === 3 && out.background?.type === "module" && !opts.keepModuleBackground) {
     delete out.background.type;
+  }
+
+  // MV2 page_action has no MV3 equivalent; fold it into action so the toolbar
+  // button still works. (MV3 dropped the show-only-on-some-pages distinction —
+  // Safari treats both as a plain action.)
+  if (out.page_action && !out.action && !out.browser_action) {
+    out.action = out.page_action as Manifest["action"];
+    delete out.page_action;
+  }
+
+  // MV3 requires content_security_policy to be an object keyed by context, not the
+  // bare MV2 string. Safari silently ignores a string-form CSP under MV3, so the
+  // extension runs with the default policy instead of the author's. Wrap it.
+  if (mv === 3 && typeof out.content_security_policy === "string") {
+    out.content_security_policy = { extension_pages: out.content_security_policy };
+  }
+
+  // MV3 requires web_accessible_resources to be an array of {resources, matches}
+  // objects. A bare MV2 string[] makes Safari reject the manifest at load. Wrap
+  // the flat list, exposing it to all URLs (the MV2 default visibility).
+  if (mv === 3 && Array.isArray(out.web_accessible_resources)) {
+    const flat = out.web_accessible_resources as unknown[];
+    const isLegacy = flat.every((e) => typeof e === "string");
+    if (isLegacy && flat.length > 0) {
+      out.web_accessible_resources = [{ resources: flat as string[], matches: ["<all_urls>"] }];
+    }
   }
 
   out.browser_specific_settings = {
