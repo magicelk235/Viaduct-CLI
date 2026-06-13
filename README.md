@@ -9,7 +9,9 @@ Apple's `safari-web-extension-packager` and `xcodebuild` to produce a signed app
 ## What it does
 
 - Accepts a `.zip`, `.crx`, or an unpacked extension directory.
-- Detects MV2 vs MV3 and reports incompatibilities before converting.
+- Detects MV2 vs MV3 and reports incompatibilities before converting, with a
+  human report (`CONVERSION_REPORT.md`) and a machine-readable `--analyze --json`
+  feed (counts, per-issue list, removed permissions, resolved bundle id/app name).
 - Rewrites the manifest for Safari:
   - Removes Chrome-only keys (`update_url`, `key`, `minimum_chrome_version`).
   - Strips permissions Safari does not implement (for example `tabGroups`,
@@ -18,8 +20,11 @@ Apple's `safari-web-extension-packager` and `xcodebuild` to produce a signed app
     `persistent: false` on MV2 backgrounds too (Safari rejects a persistent MV3
     background: "a manifest_version >= 3 must be non-persistent"); strips
     `background.type: "module"` (a known cause of silent popup failures).
-  - Injects `browser_specific_settings.safari` with a minimum version and no
-    maximum cap (an `18.*` cap hides the extension on Safari 18+ and Safari 26).
+  - Injects `browser_specific_settings.safari` with a minimum version (default
+    `15.4`, override with `--min-safari`) and no maximum cap (an `18.*` cap hides
+    the extension on Safari 18+ and Safari 26).
+  - Flags icons Safari cannot render (non-PNG), `content_scripts` using
+    `world: "MAIN"` (Safari 18.4+ only), and a missing App Store description.
   - Auto-wires a `default_popup` when the action has none.
 - Generates and injects a compatibility shim into content scripts and every
   extension HTML page (popup, options, side panel). The shim:
@@ -112,22 +117,31 @@ The default (without `--ci`) symlinks resources for live development edits; use
 -o, --output <dir>      Output directory (default: ./<AppName>_Safari)
     --bundle-id <id>    Reverse-DNS bundle id (default: com.chrome2safari.<app>)
     --app-name <name>   Host app name (default: extension name)
+    --min-safari <ver>  Safari strict_min_version (default: 15.4; use 18.4 for world:MAIN)
     --platforms <p>     all | macos | ios            (default: macos)
     --ci                Clean-copy resources (CI/TestFlight-safe)
     --temp-load         Stage only, for Safari 18 "Add Temporary Extension"
+    --zip               Also emit a distributable .zip of the staged extension
+    --clean             Wipe the output directory before staging
     --no-build          Generate the Xcode project but do not run xcodebuild
+    --open-xcode        Open the generated .xcodeproj in Xcode when done
     --install           Install the built app to ~/Applications + register w/ Safari
     --install-dir <dir> Install target directory (default: ~/Applications)
+    --uninstall <name>  Remove the installed <name>.app + unregister it
     --no-safari-restart With --install, don't quit/relaunch Safari or set the toggle
     --team [<id>]       Sign with an Apple Team ID; --team auto (or plain --install)
                         auto-detects it from Xcode. Omit for ad-hoc signing.
     --no-shim           Do not generate/inject the compatibility shim
+    --no-oauth-bridge   Do not wire the Safari OAuth/externally_connectable bridge
     --keep-module       Keep background.type:"module" (default strips it)
     --force             Convert despite blocking errors
+    --strict            Treat warnings as blocking too (CI gate)
     --analyze           Analyze and report only
+    --json              With --analyze, print a machine-readable JSON report
     --doctor            Verify xcrun/packager/xcodebuild availability
 -v, --verbose           Verbose output
 -h, --help              Show this help
+    --version           Print the chrome2safari version and exit
 ```
 
 ## Installing a built app
@@ -141,6 +155,14 @@ chrome2safari ./my-extension.zip --install
 ```
 
 Then enable the extension in Safari, Settings, Extensions.
+
+To remove a previously installed app, unregister it from LaunchServices and
+delete it from the install directory:
+
+```
+chrome2safari --uninstall <AppName>                       # ~/Applications
+chrome2safari --uninstall <AppName> --install-dir <dir>   # custom directory
+```
 
 ### Persisting across Safari restarts (team signing)
 

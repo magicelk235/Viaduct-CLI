@@ -37,6 +37,9 @@ function crxToZip(crxPath: string): Buffer {
   } else {
     throw new Error(`Unsupported CRX version: ${version}`);
   }
+  if (!Number.isFinite(zipStart) || zipStart < 0 || zipStart > buf.length) {
+    throw new Error(`Invalid CRX file (header points past end of file): ${crxPath}`);
+  }
   return buf.subarray(zipStart);
 }
 

@@ -40,8 +40,10 @@ export function printIssues(issues: Issue[]): void {
   console.log(`\n${parts.join(color("dim", " · "))}${autoFixed ? color("green", ` (${autoFixed} auto-fixed)`) : ""}`);
 }
 
-export function countBlocking(issues: Issue[]): number {
-  return issues.filter((i) => i.severity === "error" && !i.autoFixed).length;
+export function countBlocking(issues: Issue[], strict = false): number {
+  return issues.filter(
+    (i) => !i.autoFixed && (i.severity === "error" || (strict && i.severity === "warning"))
+  ).length;
 }
 
 const HEADING: Record<Severity, string> = { error: "Errors", warning: "Warnings", info: "Info" };
@@ -53,7 +55,13 @@ const HEADING: Record<Severity, string> = { error: "Errors", warning: "Warnings"
  */
 export function writeReportFile(
   dir: string,
-  meta: { name: string; version?: string; manifestVersion: number; platforms: string },
+  meta: {
+    name: string;
+    version?: string;
+    manifestVersion: number;
+    platforms: string;
+    removedPermissions?: string[];
+  },
   issues: Issue[]
 ): string {
   const counts: Record<Severity, number> = { error: 0, warning: 0, info: 0 };
@@ -73,6 +81,12 @@ export function writeReportFile(
       (autoFixed ? ` — ${autoFixed} auto-fixed` : ""),
     "",
   ];
+
+  if (meta.removedPermissions && meta.removedPermissions.length > 0) {
+    lines.push(`## Removed permissions (${meta.removedPermissions.length})`, "");
+    for (const p of meta.removedPermissions) lines.push(`- \`${p}\``);
+    lines.push("");
+  }
 
   for (const sev of ORDER) {
     const group = issues.filter((i) => i.severity === sev);

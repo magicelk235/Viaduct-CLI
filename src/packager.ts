@@ -79,9 +79,12 @@ export function patchProjectBundleIds(xcodeproj: string, bundleId: string): void
     /PRODUCT_BUNDLE_IDENTIFIER = "?[\w.\-$()]+\.Extension"?;/g,
     `PRODUCT_BUNDLE_IDENTIFIER = "${extId}";`
   );
-  // Remaining ones are the app target(s).
+  // Remaining ones are the app target(s). The value-scoped negative lookahead
+  // `(?![\w.\-$()]*\.Extension"?;)` only inspects the current identifier, so it
+  // skips lines already rewritten to "<id>.Extension" without scanning the rest
+  // of the file (a `.*` lookahead would match any later .Extension line).
   content = content.replace(
-    /PRODUCT_BUNDLE_IDENTIFIER = "?(?!.*\.Extension")[\w.\-$()]+"?;/g,
+    /PRODUCT_BUNDLE_IDENTIFIER = "?(?![\w.\-$()]*\.Extension"?;)[\w.\-$()]+"?;/g,
     `PRODUCT_BUNDLE_IDENTIFIER = "${bundleId}";`
   );
   writeFileSync(pbxproj, content, "utf-8");

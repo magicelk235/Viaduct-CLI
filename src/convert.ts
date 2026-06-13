@@ -22,7 +22,7 @@ import {
   defaultBundleId,
 } from "./packager.js";
 import { printIssues, countBlocking, writeReportFile } from "./report.js";
-import { info, ok, warn, fail, color, moveBundle } from "./util.js";
+import { info, ok, warn, fail, moveBundle, run } from "./util.js";
 
 export function convert(opts: ConvertOptions): ConvertResult {
   const result: ConvertResult = {
@@ -59,10 +59,11 @@ export function convert(opts: ConvertOptions): ConvertResult {
     const issues: Issue[] = [...manifestIssues, ...scanExtension(extPath, manifest, opts.platforms)];
     result.issues = issues;
 
-    const blocking = countBlocking(issues);
+    const blocking = countBlocking(issues, opts.strict);
     if (blocking > 0 && !opts.force) {
       printIssues(issues);
-      fail(`${blocking} blocking error(s). Re-run with --force to convert anyway.`);
+      const what = opts.strict ? "blocking issue(s) (--strict: warnings count)" : "blocking error(s)";
+      fail(`${blocking} ${what}. Re-run with --force to convert anyway.`);
       return result;
     }
 
@@ -73,6 +74,10 @@ export function convert(opts: ConvertOptions): ConvertResult {
     result.resolvedBundleId = bundleId;
 
     const outputDir = resolve(opts.output ?? join(process.cwd(), `${appName}_Safari`));
+    if (opts.clean && existsSync(outputDir)) {
+      rmSync(outputDir, { recursive: true, force: true });
+      ok(`Cleaned output dir → ${outputDir}`);
+    }
     mkdirSync(outputDir, { recursive: true });
 
     // Persistent staged dir (NOT in scratch) so dev-mode symlinks survive cleanup.
@@ -94,6 +99,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
       keepModuleBackground: opts.keepModuleBackground,
       shimFile,
       polyfillFile,
+      minSafariVersion: opts.minSafariVersion,
     });
 
     const dnrNotes = applyDnr(stageDir, transformed);
@@ -122,10 +128,30 @@ export function convert(opts: ConvertOptions): ConvertResult {
 
     const reportPath = writeReportFile(
       outputDir,
-      { name: result.extensionName, version: transformed.version, manifestVersion: result.manifestVersion, platforms: opts.platforms },
+      {
+        name: result.extensionName,
+        version: transformed.version,
+        manifestVersion: result.manifestVersion,
+        platforms: opts.platforms,
+        removedPermissions: permissionsToRemove,
+      },
       issues
     );
     ok(`Report → ${reportPath}`);
+
+    if (opts.zip) {
+      const zipPath = join(outputDir, `${appName}_SafariExtension.zip`);
+      if (existsSync(zipPath)) rmSync(zipPath, { force: true });
+      // ditto -c -k zips the staged dir's CONTENTS (--keepParent off) so the archive
+      // unpacks straight to manifest.json — the shape Safari's temp-load expects.
+      const z = run("ditto", ["-c", "-k", "--sequesterRsrc", stageDir, zipPath]);
+      if (z.code === 0 && existsSync(zipPath)) {
+        result.zipPath = zipPath;
+        ok(`Zipped staged extension → ${zipPath}`);
+      } else {
+        warn(`Could not create the extension zip (${z.stderr.trim() || "ditto failed"}).`);
+      }
+    }
 
     if (opts.tempLoadOnly) {
       const notes = writeTempLoadInstructions(stageDir);
@@ -154,6 +180,12 @@ export function convert(opts: ConvertOptions): ConvertResult {
 
     info("Patching bundle identifiers …");
     patchProjectBundleIds(xcodeproj, bundleId);
+
+    if (opts.openXcode) {
+      const o = run("/usr/bin/open", ["-a", "Xcode", xcodeproj]);
+      if (o.code === 0) ok("Opened the project in Xcode");
+      else warn(`Could not open Xcode (${o.stderr.trim() || `exit ${o.code}`}).`);
+    }
 
     if (!opts.build) {
       ok("Skipping build (--no-build). Open the project in Xcode to build.");

@@ -420,6 +420,18 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
         });
       }
     }
+    // world:"MAIN" injects into the page's JS context. Safari only added support in
+    // 18.4; on earlier versions the script silently does not run, and it never has
+    // access to chrome.* — a common source of "works in Chrome, dead in Safari".
+    if (cs?.world === "MAIN") {
+      issues.push({
+        severity: "warning",
+        category: "content_scripts",
+        message: `content_scripts[${i}] uses world:"MAIN"; supported only on Safari 18.4+ and has no chrome.* access.`,
+        file: "manifest.json",
+        fix: "Provide an ISOLATED-world fallback, or feature-detect and degrade on older Safari.",
+      });
+    }
   });
 
   // Set-dedupe: a permission listed in BOTH permissions and optional_permissions
@@ -436,6 +448,27 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
       });
       permissionsToRemove.push(perm);
     }
+  }
+
+  if (!m.description || (typeof m.description === "string" && !m.description.trim())) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: "No description in the manifest; the App Store requires one for submission.",
+      file: "manifest.json",
+      fix: "Add a short description; Safari shows it in Settings → Extensions and the App Store needs it.",
+    });
+  }
+
+  if (m.key) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: "key (Chrome CRX packing identity) has no meaning for Safari; removing.",
+      file: "manifest.json",
+      fix: "Safari derives extension identity from the bundle id; the key field is dropped.",
+      autoFixed: true,
+    });
   }
 
   if (m.update_url) {
@@ -654,7 +687,7 @@ export function transformManifest(
   m: Manifest,
   permissionsToRemove: string[],
   extPath: string,
-  opts: { keepModuleBackground: boolean; shimFile?: string; polyfillFile?: string }
+  opts: { keepModuleBackground: boolean; shimFile?: string; polyfillFile?: string; minSafariVersion?: string }
 ): Manifest {
   const out: Manifest = JSON.parse(JSON.stringify(m));
 
@@ -711,7 +744,7 @@ export function transformManifest(
 
   out.browser_specific_settings = {
     ...(out.browser_specific_settings ?? {}),
-    safari: { strict_min_version: "15.4" },
+    safari: { strict_min_version: opts.minSafariVersion ?? "15.4" },
   };
 
   // Ensure the toolbar button does something: wire a popup if one exists.

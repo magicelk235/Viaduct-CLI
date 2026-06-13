@@ -43,7 +43,10 @@ export function applyDnr(stageDir: string, manifest: Manifest): string[] {
       notes.push(`DNR ruleset "${res.id}" (${res.path}) is not valid JSON; Safari will fail to load it.`);
       continue;
     }
-    if (!Array.isArray(rules)) continue;
+    if (!Array.isArray(rules)) {
+      notes.push(`DNR ruleset "${res.id}" (${res.path}) is not a JSON array of rules; Safari will fail to load it.`);
+      continue;
+    }
     const safe = (rules as DnrRule[]).filter((r) => r?.action?.type !== "modifyHeaders");
     if (safe.length !== rules.length) {
       writeFileSync(file, JSON.stringify(safe, null, 2) + "\n", "utf-8");
