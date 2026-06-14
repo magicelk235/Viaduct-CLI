@@ -71,9 +71,15 @@ export function writeReportFile(
     if (i.autoFixed) autoFixed++;
   }
 
+  // Blocking = unresolved errors (auto-fixed ones don't block); same gate the
+  // converter and --analyze use, so the verdict here agrees with the exit code.
+  const blocking = countBlocking(issues);
+  const status = blocking === 0 ? "✅ Convertible — no blocking issues" : `⛔ ${blocking} blocking error(s) — use --force to convert anyway`;
+
   const lines: string[] = [
     `# Conversion report — ${meta.name}`,
     "",
+    `- Status: ${status}`,
     `- Version: ${meta.version ?? "(none)"}`,
     `- Manifest: MV${meta.manifestVersion}`,
     `- Platforms: ${meta.platforms}`,

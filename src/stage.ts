@@ -1,5 +1,5 @@
 import { cpSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, join, dirname, resolve } from "node:path";
+import { basename, join, dirname, resolve, relative, sep } from "node:path";
 import { cleanExtendedAttributes } from "./extract.js";
 
 /** Names/globs excluded from the clean staged extension. */
@@ -38,14 +38,25 @@ function shouldExclude(name: string): boolean {
  * Copy the extension into stageDir, dropping dev cruft and store metadata.
  * The manifest + shim are written separately by the caller afterward.
  * stageDir is recreated fresh each run.
+ *
+ * `keep` is a set of manifest-relative paths (forward-slash) that the manifest
+ * declares as runtime assets; these are copied even if their name matches an
+ * exclusion rule — otherwise a web-accessible LICENSE.txt or a .map served to a
+ * page would be dropped and 404 in Safari.
  */
-export function stageExtension(sourceDir: string, stageDir: string): void {
+export function stageExtension(sourceDir: string, stageDir: string, keep: Set<string> = new Set()): void {
   if (existsSync(stageDir)) rmSync(stageDir, { recursive: true, force: true });
   mkdirSync(stageDir, { recursive: true });
 
+  const root = resolve(sourceDir);
   cpSync(sourceDir, stageDir, {
     recursive: true,
-    filter: (src) => !shouldExclude(basename(src)),
+    filter: (src) => {
+      if (!shouldExclude(basename(src))) return true;
+      // Excluded by name — but keep it if the manifest references this exact path.
+      const rel = relative(root, resolve(src)).split(sep).join("/");
+      return keep.has(rel);
+    },
   });
 
   cleanExtendedAttributes(stageDir);
