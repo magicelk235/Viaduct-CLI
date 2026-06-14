@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, existsSync, realpathSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import type { Issue, Manifest, Platforms } from "./types.js";
-import { UNSUPPORTED_APIS, parseJsonc } from "./manifest.js";
+import { UNSUPPORTED_APIS, parseJsonc, resolveI18nString } from "./manifest.js";
 
 /**
  * Recursive file finder. Dirent-based so each entry costs no extra stat (only
@@ -82,6 +82,11 @@ const API_PATTERNS = Object.entries(UNSUPPORTED_APIS).map(([api, info]) => {
   return { name, literal: api, re: null as RegExp | null, info };
 });
 const FAVICON_RE = /chrome:\/\/favicon|[/'"]_favicon\//;
+// A hardcoded chrome-extension://<32-char-id>/ URL. Chrome's id is stable; Safari
+// assigns a different random extension origin per install, so any such literal
+// breaks (wrong origin → resource 404 / blocked). Match the 32-char a–p id form
+// precisely to avoid flagging chrome-extension:// joined with a variable.
+const HARDCODED_EXT_URL_RE = /chrome-extension:\/\/[a-p]{32}\b/;
 const BLOCKING_WEBREQUEST_RE = /chrome\.webRequest\.on\w+/;
 const TIMER_RE = /(setTimeout|setInterval)\s*\(/;
 const BACKGROUND_FILE_RE = /(background|service[-_]?worker)/i;
@@ -296,11 +301,35 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
     }
   }
 
+  // __MSG_key__ placeholders in name/description must resolve to a real message,
+  // or Chrome AND Safari display the literal "__MSG_appName__" as the extension
+  // name (and the App Store rejects a placeholder name). resolveI18nString returns
+  // undefined when the key is missing from every locale's messages.json.
+  for (const [field, raw] of [
+    ["name", manifest.name],
+    ["description", manifest.description],
+  ] as const) {
+    if (typeof raw === "string" && /^__MSG_.+__$/.test(raw)) {
+      const resolved = resolveI18nString(raw, extPath, manifest.default_locale);
+      if (resolved === undefined || resolved === raw) {
+        issues.push({
+          severity: "error",
+          category: "i18n",
+          message: `manifest.${field} uses "${raw}" but no matching message exists in _locales; Safari shows the literal placeholder.`,
+          file: "manifest.json",
+          fix: `Add the "${raw.slice(6, -2)}" key to _locales/<default_locale>/messages.json, or use a plain string.`,
+        });
+      }
+    }
+  }
+
   let faviconNoted = false;
+  let extUrlNoted = false;
   for (const file of walkFiles(extPath, [".js", ".mjs", ".html", ".css"])) {
     const isJs = file.endsWith(".js") || file.endsWith(".mjs");
-    // html/css files are only read for the (once-per-extension) favicon check.
-    if (!isJs && faviconNoted) continue;
+    // html/css files are only read for the once-per-extension favicon and
+    // hardcoded-extension-URL checks; skip them once both have been satisfied.
+    if (!isJs && faviconNoted && extUrlNoted) continue;
     let content: string;
     try {
       content = readFileSync(file, "utf-8");
@@ -321,6 +350,23 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
           file: rel,
           line: makeLineResolver(content)(m.index),
           fix: "Fetch favicons directly (e.g. <link> from the page) or drop the favicon UI.",
+        });
+      }
+    }
+
+    // A hardcoded chrome-extension://<id>/ URL breaks under Safari's per-install
+    // random origin. One note is enough to surface the whole class.
+    if (!extUrlNoted) {
+      const m = HARDCODED_EXT_URL_RE.exec(content);
+      if (m) {
+        extUrlNoted = true;
+        issues.push({
+          severity: "warning",
+          category: "api",
+          message: "Hardcoded chrome-extension://<id> URL found; Safari uses a different per-install origin, so it will not resolve.",
+          file: rel,
+          line: makeLineResolver(content)(m.index),
+          fix: "Build extension URLs with chrome.runtime.getURL(path) instead of hardcoding the id.",
         });
       }
     }
