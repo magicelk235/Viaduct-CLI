@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join, resolve, basename } from "node:path";
 import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
 import { extractExtension } from "./extract.js";
-import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString } from "./manifest.js";
+import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths } from "./manifest.js";
 import { scanExtension } from "./analyze.js";
 import { stageExtension, stripDanglingSourcemaps } from "./stage.js";
 import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage } from "./shim.js";
@@ -83,7 +83,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
     // Persistent staged dir (NOT in scratch) so dev-mode symlinks survive cleanup.
     const stageDir = join(outputDir, "staged_extension");
     info("Staging clean extension assets …");
-    stageExtension(extPath, stageDir);
+    stageExtension(extPath, stageDir, collectReferencedPaths(manifest));
 
     let shimFile: string | undefined;
     let polyfillFile: string | undefined;

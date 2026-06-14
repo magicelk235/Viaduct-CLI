@@ -2,16 +2,17 @@
 import { parseArgs } from "node:util";
 import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve, dirname } from "node:path";
+import { join, resolve, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { convert } from "./convert.js";
 import { extractExtension } from "./extract.js";
 import { loadManifest, analyzeManifest, resolveI18nString } from "./manifest.js";
 import { scanExtension } from "./analyze.js";
-import { printIssues } from "./report.js";
+import { printIssues, countBlocking } from "./report.js";
 import { run, info, ok, warn, fail, color, commandExists, setVerbose } from "./util.js";
 import { LSREGISTER, uninstallFromSafari } from "./installer.js";
 import { detectXcodeTeam, defaultBundleId } from "./packager.js";
+import { isUrl, downloadExtension } from "./download.js";
 import type { Platforms } from "./types.js";
 
 function pkgVersion(): string {
@@ -41,7 +42,9 @@ USAGE
   chrome2safari --uninstall <AppName>     # remove a previously installed app
 
 INPUT
-  A .zip, .crx, or an unpacked extension directory.
+  A .zip, .crx, .xpi, an unpacked extension directory, or a URL (type detected by magic bytes).
+  URLs may be a Chrome Web Store link (https://chromewebstore.google.com/detail/<name>/<id>)
+  or a direct .crx / .zip download link; the source is fetched automatically.
 
 OPTIONS
   -o, --output <dir>        Output directory (default: ./<AppName>_Safari)
@@ -107,15 +110,34 @@ function doctor(): number {
 function analyzeOnly(input: string, platforms: Platforms, json: boolean, strict: boolean): number {
   const scratch = mkdtempSync(join(tmpdir(), "chrome2safari-"));
   try {
-    const extPath = extractExtension(resolve(input), scratch);
-    const manifest = loadManifest(extPath);
+    let extPath: string;
+    let manifest;
+    try {
+      extPath = extractExtension(resolve(input), scratch);
+      manifest = loadManifest(extPath);
+    } catch (e) {
+      const msg = (e as Error).message;
+      // In JSON mode always emit parseable output so a CI consumer never gets a
+      // bare stack trace on a corrupt archive / missing manifest.
+      if (json) console.log(JSON.stringify({ error: msg, convertible: false }, null, 2));
+      else fail(msg);
+      return 1;
+    }
     const name = resolveI18nString(manifest.name, extPath, manifest.default_locale) ?? manifest.name ?? "Unknown";
     if (!json) info(`${name} (MV${manifest.manifest_version ?? 3})`);
     const { issues: mIssues, permissionsToRemove } = analyzeManifest(manifest);
     const issues = [...mIssues, ...scanExtension(extPath, manifest, platforms)];
+    // Mirror the real conversion gate: an auto-fixed issue (e.g. the MV2 persistent
+    // background that transformManifest rewrites) is NOT blocking, so --analyze and
+    // an actual convert agree on the exit code.
+    const blockingCount = countBlocking(issues, strict);
     if (json) {
       const counts = { error: 0, warning: 0, info: 0 };
-      for (const i of issues) counts[i.severity]++;
+      let autoFixed = 0;
+      for (const i of issues) {
+        counts[i.severity]++;
+        if (i.autoFixed) autoFixed++;
+      }
       const appName = name.replace(/[\s/\\:]+/g, "") || "Extension";
       console.log(
         JSON.stringify(
@@ -127,6 +149,9 @@ function analyzeOnly(input: string, platforms: Platforms, json: boolean, strict:
             manifestVersion: manifest.manifest_version ?? 3,
             platforms,
             counts,
+            autoFixed,
+            blocking: blockingCount,
+            convertible: blockingCount === 0,
             removedPermissions: permissionsToRemove,
             issues,
           },
@@ -137,16 +162,13 @@ function analyzeOnly(input: string, platforms: Platforms, json: boolean, strict:
     } else {
       printIssues(issues);
     }
-    const blocking = strict
-      ? issues.some((i) => i.severity === "error" || i.severity === "warning")
-      : issues.some((i) => i.severity === "error");
-    return blocking ? 1 : 0;
+    return blockingCount > 0 ? 1 : 0;
   } finally {
     if (existsSync(scratch)) rmSync(scratch, { recursive: true, force: true });
   }
 }
 
-function main(): void {
+async function main(): Promise<void> {
   let parsed;
   try {
     parsed = parseArgs({
@@ -205,11 +227,11 @@ function main(): void {
 
   const input = positionals[0];
   if (!input) {
-    fail("Missing <input> (a .zip, .crx, or extension directory).");
+    fail("Missing <input> (a .zip, .crx, extension directory, or URL).");
     console.log(HELP);
     process.exit(2);
   }
-  if (!existsSync(input)) {
+  if (!isUrl(input) && !existsSync(input)) {
     fail(`Input not found: ${input}`);
     process.exit(1);
   }
@@ -235,7 +257,21 @@ function main(): void {
     process.exit(2);
   }
 
-  if (values.analyze) process.exit(analyzeOnly(input, platforms, values.json, values.strict));
+  let localInput = input;
+  if (isUrl(input)) {
+    info(`Downloading extension from ${input} …`);
+    const dlScratch = mkdtempSync(join(tmpdir(), "c2s-dl-"));
+    try {
+      localInput = await downloadExtension(input, dlScratch);
+    } catch (e) {
+      rmSync(dlScratch, { recursive: true, force: true });
+      fail((e as Error).message);
+      process.exit(1);
+    }
+    ok(`Downloaded → ${basename(localInput)}`);
+  }
+
+  if (values.analyze) process.exit(analyzeOnly(localInput, platforms, values.json, values.strict));
   if (values.json) {
     fail("--json is only valid with --analyze.");
     process.exit(2);
@@ -256,7 +292,7 @@ function main(): void {
   let result;
   try {
     result = convert({
-      input,
+      input: localInput,
       output: values.output,
       bundleId: values["bundle-id"],
       appName: values["app-name"],
@@ -313,4 +349,7 @@ function main(): void {
   }
 }
 
-main();
+main().catch((e) => {
+  fail((e as Error).message);
+  process.exit(1);
+});
