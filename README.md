@@ -8,10 +8,14 @@ Apple's `safari-web-extension-packager` and `xcodebuild` to produce a signed app
 
 ## What it does
 
-- Accepts a `.zip`, `.crx`, or an unpacked extension directory.
+- Accepts a `.zip`, `.crx`, `.xpi`, an unpacked extension directory, or a URL — a
+  Chrome Web Store link or a direct `.crx`/`.zip` download link (fetched
+  automatically). Archive type is detected by magic bytes, so a mislabeled file
+  (e.g. a CRX renamed to `.zip`) is still handled correctly.
 - Detects MV2 vs MV3 and reports incompatibilities before converting, with a
   human report (`CONVERSION_REPORT.md`) and a machine-readable `--analyze --json`
-  feed (counts, per-issue list, removed permissions, resolved bundle id/app name).
+  feed (counts, `autoFixed`/`blocking` totals, a `convertible` verdict matching
+  the real conversion gate, per-issue list, removed permissions, bundle id/name).
 - Rewrites the manifest for Safari:
   - Removes Chrome-only keys (`update_url`, `key`, `minimum_chrome_version`).
   - Strips permissions Safari does not implement (for example `tabGroups`,
@@ -25,14 +29,36 @@ Apple's `safari-web-extension-packager` and `xcodebuild` to produce a signed app
     the extension on Safari 18+ and Safari 26).
   - Flags icons Safari cannot render (non-PNG), `content_scripts` using
     `world: "MAIN"` (Safari 18.4+ only), and a missing App Store description.
+  - Flags hardcoded `chrome-extension://<id>/` URLs in JS/CSS/HTML (Safari uses a
+    different per-install origin); suggests `chrome.runtime.getURL()` instead.
+  - Validates `commands` keyboard shortcuts: flags chords with no primary
+    modifier (Safari silently drops them) and ChromeOS-only modifiers like
+    `Search` that have no Safari equivalent.
+  - Validates `_locales` and `__MSG_*__` placeholders: flags an unresolvable
+    `name`/`description` reference that would show as a literal placeholder.
+  - Flags URL match patterns left in `permissions` under MV3 (a common migration
+    mistake): Safari ignores them there, so they belong in `host_permissions`.
+  - Validates the `version` string: flags a missing, non-numeric, or out-of-range
+    version that Apple's `CFBundleShortVersionString` rejects (the build fails).
   - Auto-wires a `default_popup` when the action has none.
 - Generates and injects a compatibility shim into content scripts and every
   extension HTML page (popup, options, side panel). The shim:
   - Routes `storage.sync` to `storage.local` (Safari has no iCloud sync).
   - Stubs `sidePanel`, `identity`, `notifications`, `tabGroups`, `debugger`,
-    and `offscreen` so module evaluation does not throw and blank the page.
+    and `offscreen` so module evaluation does not throw and blank the page. The
+    `sidePanel` fallback opens the panel page the extension actually configured
+    (manifest `side_panel.default_path` or a `setOptions({path})` call), not a
+    hardcoded guess.
+  - Completes `chrome.i18n` (backfills `detectLanguage`/`getUILanguage`/
+    `getAcceptLanguages` without clobbering Safari's native `getMessage`), so
+    code that calls the Safari-missing `detectLanguage` degrades to `und`
+    instead of throwing.
 - Auto-sizes side-panel pages wired as the action popup so the popup is not a
   collapsed, tiny window.
+- Stages a clean copy that drops dev cruft (`*.map`, `*.ts`, `README`, lockfiles,
+  store metadata) while preserving any file the manifest declares as a runtime
+  asset — so a web-accessible `LICENSE.txt` or served `.map` is never dropped
+  and 404'd in Safari.
 - Packages the extension into an Xcode project, patches bundle identifiers, and
   optionally builds an ad-hoc or team-signed app.
 - Verifies the bundle identifier of the COMPILED `.appex`, not just the project
@@ -78,6 +104,18 @@ chrome2safari <input> [options]
 ```
 
 ## Usage
+
+Convert straight from a Chrome Web Store link (the CRX is downloaded for you):
+
+```
+chrome2safari "https://chromewebstore.google.com/detail/ublock-origin/cjpalhdlnbpafiamejdnhcphjbkeiagm"
+```
+
+A direct `.crx` or `.zip` download URL works too:
+
+```
+chrome2safari "https://example.com/my-extension.crx"
+```
 
 Analyze an extension and report issues without converting:
 
@@ -216,4 +254,6 @@ open "~/Applications/<AppName>.app"
   WebKit rule loader, so the tool strips them (both static rulesets and dynamic
   `updateSessionRules`/`updateDynamicRules` calls). Header-rewriting use cases —
   for example a CORS bypass — are not converted; use a native-messaging proxy
-  instead.
+  instead. The tool also warns when static rulesets use `regexFilter` (Safari
+  supports a limited regex subset and silently drops rules it cannot compile) or
+  when enabled rules exceed the count Safari honors (the overflow is ignored).
