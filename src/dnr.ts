@@ -9,7 +9,14 @@ export function needsAnthropicCorsBypass(manifest: Manifest): boolean {
 
 interface DnrRule {
   action?: { type?: string };
+  condition?: { regexFilter?: unknown };
 }
+
+// Safari guarantees far fewer enabled static DNR rules than Chrome. Chrome's
+// guaranteed minimum is 30,000; Safari's is much lower in practice — rules past
+// the cap are silently dropped at load. Warn (not strip) past this conservative
+// threshold so the author can split/trim rather than ship a half-applied ruleset.
+const SAFARI_STATIC_RULE_GUIDELINE = 30000;
 
 /**
  * Sanitize declarativeNetRequest for Safari and report anything dropped.
@@ -29,6 +36,7 @@ interface DnrRule {
  */
 export function applyDnr(stageDir: string, manifest: Manifest): string[] {
   const notes: string[] = [];
+  let enabledRuleCount = 0;
 
   for (const res of manifest.declarative_net_request?.rule_resources ?? []) {
     const file = join(stageDir, res.path);
@@ -55,6 +63,23 @@ export function applyDnr(stageDir: string, manifest: Manifest): string[] {
           "modifyHeaders crashes Safari's DNR rule store; other rules kept."
       );
     }
+
+    enabledRuleCount += res.enabled === false ? 0 : safe.length;
+
+    const regexRules = safe.filter((r) => r?.condition?.regexFilter != null).length;
+    if (regexRules > 0) {
+      notes.push(
+        `DNR ruleset "${res.id}" has ${regexRules} regexFilter rule(s); Safari supports a limited regex ` +
+          "subset and silently drops rules it cannot compile. Prefer urlFilter where possible and test each rule."
+      );
+    }
+  }
+
+  if (enabledRuleCount > SAFARI_STATIC_RULE_GUIDELINE) {
+    notes.push(
+      `Enabled static DNR rules (${enabledRuleCount}) exceed the ~${SAFARI_STATIC_RULE_GUIDELINE} Safari honors; ` +
+        "rules past the cap load in Chrome but are silently ignored in Safari. Trim or split the rulesets."
+    );
   }
 
   if (needsAnthropicCorsBypass(manifest)) {
