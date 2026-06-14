@@ -206,6 +206,16 @@ export const UNSUPPORTED_APIS: Record<string, { severity: Issue["severity"]; mes
     message: "runtime.setUninstallURL is unsupported.",
     fix: "Remove or guard behind feature detection.",
   },
+  "runtime.connectNative": {
+    severity: "warning",
+    message: "connectNative has no Chrome-style native host in Safari; messages route to the containing app.",
+    fix: "Handle the message in the macOS app's SafariWebExtensionHandler (beginRequest); there is no native-messaging-hosts manifest.",
+  },
+  "runtime.sendNativeMessage": {
+    severity: "warning",
+    message: "sendNativeMessage has no Chrome-style native host in Safari; messages route to the containing app.",
+    fix: "Respond from the macOS app's SafariWebExtensionHandler (beginRequest) instead of a registered host binary.",
+  },
   "tabs.move": { severity: "warning", message: "tabs.move is unsupported.", fix: "Remove or rework UX." },
   "tabs.highlighted": {
     severity: "warning",
@@ -702,6 +712,18 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
       message: "storage.sync does NOT sync across iCloud devices in Safari (maps to local).",
       file: "manifest.json",
       fix: "Shim routes sync→local; implement custom cloud sync if cross-device is required.",
+    });
+  }
+
+  // Surfaced from the permission too (not just JS) because native-messaging calls
+  // are often in minified bundles the source scanner attributes imprecisely.
+  if (allPerms.includes("nativeMessaging")) {
+    issues.push({
+      severity: "warning",
+      category: "permission",
+      message: "nativeMessaging works differently in Safari: there is no native-messaging-hosts manifest or host binary.",
+      file: "manifest.json",
+      fix: "Route messages to the containing macOS app's SafariWebExtensionHandler (beginRequest); the permission stays but the host model changes.",
     });
   }
 

@@ -250,6 +250,10 @@ open "~/Applications/<AppName>.app"
   cannot be fixed by conversion alone.
 - `storage.sync` is mapped to `storage.local`; data persists but does not sync
   across devices.
+- Native messaging (`connectNative`/`sendNativeMessage`) has no Chrome-style host
+  manifest or host binary in Safari — messages route to the containing macOS app.
+  The analyzer flags it; you implement the response in the app's
+  `SafariWebExtensionHandler` (`beginRequest`).
 - `declarativeNetRequest` rules with a `modifyHeaders` action crash Safari's
   WebKit rule loader, so the tool strips them (both static rulesets and dynamic
   `updateSessionRules`/`updateDynamicRules` calls). Header-rewriting use cases —
