@@ -352,6 +352,11 @@ export const UNSUPPORTED_APIS: Record<string, { severity: Issue["severity"]; mes
     message: "chrome.downloads is only partially supported in Safari.",
     fix: "Test the flow; fall back to an <a download> link if unavailable.",
   },
+  "chrome.i18n.detectLanguage": {
+    severity: "info",
+    message: "chrome.i18n.detectLanguage has no Safari engine; the shim returns 'und' (undetermined).",
+    fix: "Don't branch on detected language in Safari; detect server-side or skip the feature.",
+  },
 };
 
 export interface ManifestAnalysis {
@@ -391,6 +396,57 @@ export function matchPatternError(pattern: string): string | null {
     if (body === "") return "empty host after '*.'";
   }
   return null;
+}
+
+/**
+ * Validate manifest `commands` for Safari. Chrome and Safari both expect each
+ * suggested_key chord to be `Modifier+[Modifier+]Key`, but Safari is stricter:
+ * - A chord with NO modifier (or only Shift) is rejected — Chrome allows a few
+ *   media keys bare, Safari does not register them and the command silently has
+ *   no shortcut.
+ * - Safari recognizes Ctrl/Command/Alt(Option)/MacCtrl/Shift; Chrome's "Search"
+ *   modifier (ChromeOS) has no Safari equivalent.
+ * Reserved commands (_execute_action etc.) are allowed and skipped.
+ */
+const COMMAND_MODIFIERS = new Set(["Ctrl", "Command", "Alt", "Option", "MacCtrl", "Shift"]);
+
+export function analyzeCommands(commands: Record<string, unknown>): Issue[] {
+  const issues: Issue[] = [];
+  for (const [name, def] of Object.entries(commands)) {
+    const suggested = (def as { suggested_key?: unknown } | undefined)?.suggested_key;
+    if (suggested === undefined) continue; // user can still bind it manually in Safari
+    // suggested_key is either a string (all platforms) or a per-platform map.
+    const chords =
+      typeof suggested === "string"
+        ? [suggested]
+        : Object.values(suggested as Record<string, unknown>).filter((v): v is string => typeof v === "string");
+    for (const chord of chords) {
+      const parts = chord.split("+").map((p) => p.trim());
+      const key = parts.pop();
+      const mods = parts;
+      const hasPrimaryModifier = mods.some((mo) => mo === "Ctrl" || mo === "Command" || mo === "Alt" || mo === "Option" || mo === "MacCtrl");
+      if (!key || !hasPrimaryModifier) {
+        issues.push({
+          severity: "warning",
+          category: "ui",
+          message: `commands.${name} shortcut "${chord}" lacks a Ctrl/Command/Alt modifier; Safari ignores it and the command gets no shortcut.`,
+          file: "manifest.json",
+          fix: "Use a chord like Command+Shift+Y; Safari requires a primary modifier (Shift-only is not enough).",
+        });
+      }
+      const unknownMod = mods.find((mo) => !COMMAND_MODIFIERS.has(mo));
+      if (unknownMod) {
+        issues.push({
+          severity: "warning",
+          category: "ui",
+          message: `commands.${name} uses modifier "${unknownMod}" which Safari does not support.`,
+          file: "manifest.json",
+          fix: "Use Ctrl/Command/Alt/Option/MacCtrl/Shift; ChromeOS-only modifiers (e.g. Search) have no Safari equivalent.",
+        });
+      }
+    }
+  }
+  return issues;
 }
 
 export function analyzeManifest(m: Manifest): ManifestAnalysis {
@@ -450,6 +506,28 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
     }
   }
 
+  // Under MV3, URL match patterns belong in host_permissions, not permissions.
+  // A pattern left in permissions is legal MV2 but SILENTLY IGNORED under MV3 —
+  // Safari (and Chrome MV3) grant no host access, so the extension "works in the
+  // old build, breaks after migration". Flag each misplaced entry; it's a likely
+  // bug the converter won't auto-move (intent is ambiguous).
+  if ((m.manifest_version ?? 2) === 3) {
+    const declaredPermissions = Array.isArray(m.permissions) ? m.permissions : [];
+    for (const perm of declaredPermissions) {
+      if (typeof perm !== "string") continue;
+      const looksLikeHost = perm === "<all_urls>" || perm.includes("://");
+      if (looksLikeHost && !(perm in UNSUPPORTED_PERMISSIONS)) {
+        issues.push({
+          severity: "warning",
+          category: "permission",
+          message: `"${perm}" is a host match pattern in "permissions"; under MV3 it is ignored and grants no host access.`,
+          file: "manifest.json",
+          fix: 'Move it into "host_permissions" (MV3 requires URL patterns there, not in "permissions").',
+        });
+      }
+    }
+  }
+
   if (!m.description || (typeof m.description === "string" && !m.description.trim())) {
     issues.push({
       severity: "info",
@@ -480,14 +558,38 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
       autoFixed: true,
     });
   }
-  if (m.version && m.version.split(".").length > 3) {
+  if (!m.version || (typeof m.version === "string" && !m.version.trim())) {
     issues.push({
-      severity: "info",
+      severity: "warning",
       category: "manifest",
-      message: `4-part version "${m.version}" exceeds Apple's 3-part CFBundleShortVersionString; truncating.`,
+      message: "No version in the manifest; Apple requires a CFBundleShortVersionString and the build will fail.",
       file: "manifest.json",
-      autoFixed: true,
+      fix: 'Add a numeric "version" (e.g. "1.0.0") to the manifest.',
     });
+  } else if (typeof m.version === "string") {
+    // Apple's CFBundleShortVersionString (like Chrome) needs dot-separated
+    // non-negative integers, each 0–65535. A part like "beta" or "1-rc1" loads
+    // in Chrome from an unpacked dir but fails the Xcode build with an opaque
+    // error, so surface it up front.
+    const parts = m.version.split(".");
+    const badPart = parts.find((p) => !/^\d+$/.test(p) || Number(p) > 65535);
+    if (badPart !== undefined) {
+      issues.push({
+        severity: "warning",
+        category: "manifest",
+        message: `version "${m.version}" has a non-numeric/out-of-range part ("${badPart}"); Apple requires integer parts (0–65535) and the build will fail.`,
+        file: "manifest.json",
+        fix: 'Use a numeric dotted version like "1.2.3" (no suffixes such as -rc1 or +build).',
+      });
+    } else if (parts.length > 3) {
+      issues.push({
+        severity: "info",
+        category: "manifest",
+        message: `4-part version "${m.version}" exceeds Apple's 3-part CFBundleShortVersionString; truncating.`,
+        file: "manifest.json",
+        autoFixed: true,
+      });
+    }
   }
   if (m.version_name) {
     issues.push({
@@ -611,6 +713,7 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
       file: "manifest.json",
       fix: "Verify each shortcut in Safari → Settings → Extensions; provide an in-UI fallback.",
     });
+    for (const issue of analyzeCommands(m.commands)) issues.push(issue);
   }
 
   if (m.chrome_url_overrides?.newtab) {
@@ -680,6 +783,52 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
   }
 
   return { issues, permissionsToRemove };
+}
+
+/**
+ * Collect every concrete file path the manifest references as a runtime asset
+ * (scripts, pages, css, icons, web_accessible_resources, DNR rulesets, …),
+ * normalized to forward-slash relative paths. Glob/wildcard resource entries
+ * (containing '*') are skipped — only literal paths are returned. Used by the
+ * stager so a declared resource is never dropped as "dev cruft" (e.g. a
+ * web-accessible LICENSE.txt or a .map served to a page), which would 404 at
+ * runtime in Safari.
+ */
+export function collectReferencedPaths(m: Manifest): Set<string> {
+  const paths = new Set<string>();
+  const add = (p: unknown) => {
+    if (typeof p === "string" && p && !p.includes("*")) {
+      paths.add(p.replace(/^\.?\//, "").replace(/\\/g, "/"));
+    }
+  };
+  const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+
+  for (const cs of arr(m.content_scripts) as Array<{ js?: unknown; css?: unknown }>) {
+    for (const j of arr(cs?.js)) add(j);
+    for (const c of arr(cs?.css)) add(c);
+  }
+  for (const b of arr(m.background?.scripts)) add(b);
+  add(m.background?.service_worker);
+  add(m.background?.page);
+  for (const a of [m.action, m.browser_action, m.page_action]) {
+    add((a as { default_popup?: unknown } | undefined)?.default_popup);
+    const di = (a as { default_icon?: unknown } | undefined)?.default_icon;
+    if (typeof di === "string") add(di);
+    else if (di && typeof di === "object") for (const p of Object.values(di)) add(p);
+  }
+  for (const p of Object.values(m.icons ?? {})) add(p);
+  add(m.options_page);
+  add(m.options_ui?.page);
+  add(m.devtools_page);
+  for (const p of arr(m.sandbox?.pages)) add(p);
+  for (const r of m.declarative_net_request?.rule_resources ?? []) add(r?.path);
+
+  // web_accessible_resources: MV2 string[] or MV3 [{resources: string[]}].
+  for (const entry of arr(m.web_accessible_resources)) {
+    if (typeof entry === "string") add(entry);
+    else for (const r of arr((entry as { resources?: unknown })?.resources)) add(r);
+  }
+  return paths;
 }
 
 /** Produce the Safari-ready manifest. Pure: does not write to disk. */
