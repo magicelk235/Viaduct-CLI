@@ -1,7 +1,12 @@
 import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
-/** Write Safari 18+ "Add Temporary Extension…" instructions into the staged dir. */
+/**
+ * Write Safari 18+ "Add Temporary Extension…" instructions NEXT TO the staged
+ * dir (in its parent output dir), not inside it — the staged dir is the exact
+ * folder Safari loads (and `--zip` archives), so a stray doc file would pollute
+ * the distributable extension package.
+ */
 export function writeTempLoadInstructions(stagedDir: string): string {
   const body = `# Load this extension in Safari 18+ without Xcode
 
@@ -19,7 +24,7 @@ Notes:
 - Temporary extensions must be re-added after each Safari restart.
 - No code signing or Xcode build required — ideal for rapid iteration.
 `;
-  const p = join(stagedDir, "SAFARI_LOAD_INSTRUCTIONS.md");
+  const p = join(dirname(stagedDir), "SAFARI_LOAD_INSTRUCTIONS.md");
   writeFileSync(p, body, "utf-8");
   return p;
 }

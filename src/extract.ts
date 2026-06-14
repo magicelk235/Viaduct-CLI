@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, openSync, readSync, closeSync } from "node:fs";
 import { join, extname } from "node:path";
 import { run } from "./util.js";
 
@@ -25,13 +25,19 @@ function crxToZip(crxPath: string): Buffer {
   if (buf.subarray(0, 4).toString("ascii") !== "Cr24") {
     throw new Error(`Invalid CRX file (bad magic): ${crxPath}`);
   }
+  // Magic (4) + version (4) = 8 bytes minimum before we can read the version.
+  if (buf.length < 8) throw new Error(`Invalid CRX file (truncated header): ${crxPath}`);
   const version = buf.readUInt32LE(4);
   let zipStart: number;
   if (version === 2) {
+    // v2 header: magic(4) version(4) pubKeyLen(4) sigLen(4) = 16 bytes min.
+    if (buf.length < 16) throw new Error(`Invalid CRX file (truncated v2 header): ${crxPath}`);
     const pubKeyLen = buf.readUInt32LE(8);
     const sigLen = buf.readUInt32LE(12);
     zipStart = 16 + pubKeyLen + sigLen;
   } else if (version === 3) {
+    // v3 header: magic(4) version(4) headerLen(4) = 12 bytes min.
+    if (buf.length < 12) throw new Error(`Invalid CRX file (truncated v3 header): ${crxPath}`);
     const headerLen = buf.readUInt32LE(8);
     zipStart = 12 + headerLen;
   } else {
@@ -64,6 +70,28 @@ function resolveExtensionRoot(dir: string): string {
 }
 
 /**
+ * Sniff the archive kind from MAGIC BYTES, not the file extension. Users often
+ * download a CRX renamed to .zip (or a zip-based .xpi), so trust the content:
+ * "Cr24" → crx, "PK\x03\x04" → zip. Returns null when neither magic matches.
+ */
+function sniffArchiveKind(path: string): "crx" | "zip" | null {
+  const head = Buffer.alloc(4);
+  try {
+    const fd = openSync(path, "r");
+    try {
+      readSync(fd, head, 0, 4, 0);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+  if (head.toString("ascii") === "Cr24") return "crx";
+  if (head[0] === 0x50 && head[1] === 0x4b && head[2] === 0x03 && head[3] === 0x04) return "zip";
+  return null;
+}
+
+/**
  * Extract a .zip / .crx archive (or pass through a directory) into scratchDir.
  * Returns the path to the extension root (the folder holding manifest.json).
  */
@@ -75,19 +103,23 @@ export function extractExtension(inputPath: string, scratchDir: string): string 
     return root;
   }
 
-  const suffix = extname(inputPath).toLowerCase();
   const destDir = join(scratchDir, "extension");
   mkdirSync(destDir, { recursive: true });
 
-  if (suffix === ".crx") {
+  // Prefer magic bytes (authoritative) over the extension (a renamed CRX/.xpi is
+  // common); fall back to the suffix only when the bytes are inconclusive.
+  const suffix = extname(inputPath).toLowerCase();
+  const kind = sniffArchiveKind(inputPath) ?? (suffix === ".crx" ? "crx" : suffix === ".zip" || suffix === ".xpi" ? "zip" : null);
+
+  if (kind === "crx") {
     const zipBytes = crxToZip(inputPath);
     const tmpZip = join(scratchDir, "payload.zip");
     writeFileSync(tmpZip, zipBytes);
     unzipTo(tmpZip, destDir);
-  } else if (suffix === ".zip") {
+  } else if (kind === "zip") {
     unzipTo(inputPath, destDir);
   } else {
-    throw new Error(`Unsupported input type "${suffix}". Use a .zip, .crx, or a directory.`);
+    throw new Error(`Unsupported input "${inputPath}": not a CRX or ZIP archive (or a directory).`);
   }
 
   const root = resolveExtensionRoot(destDir);
