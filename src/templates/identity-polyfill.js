@@ -11,8 +11,12 @@
           : (typeof chrome !== "undefined" ? chrome : null);
   if (!api) { DBGW("[idpoly] no chrome api"); return; }
 
-  var CHROME_EXT_ID = "dihbgbndebgnbjfmelmegjepbnkhlgni";
-  var REDIRECT_BASE = "https://" + CHROME_EXT_ID + ".chromiumapp.org/";
+  // Chrome's chrome.identity.getRedirectURL() bases the redirect on the
+  // extension's OWN id. Derive it from the live runtime so this works for ANY
+  // converted extension instead of a single hardcoded id. Fall back to the
+  // build-time placeholder only if runtime.id is somehow unavailable.
+  var EXT_ID = (api.runtime && api.runtime.id) || "__C2S_EXTENSION_ID__";
+  var REDIRECT_BASE = "https://" + EXT_ID + ".chromiumapp.org/";
   DBG("[idpoly] loaded. native identity?", !!api.identity,
               "tabs?", !!api.tabs, "webNavigation?", !!api.webNavigation,
               "REDIRECT_BASE", REDIRECT_BASE);
@@ -133,7 +137,7 @@
 
   // --- page<->extension bridge (SW side) ---------------------------------
   // Safari requires the page to pass the (Safari) extension id to message the
-  // SW, but claude.ai hardcodes the Chrome id, so page->ext messaging fails
+  // SW, but pages typically hardcode the Chrome id, so page->ext messaging fails
   // ("Chrome extension API not available"). A content script relays page
   // messages to the SW as internal messages tagged {__bridge:true}. Here we
   // capture the extension's onMessageExternal listeners and re-dispatch those
