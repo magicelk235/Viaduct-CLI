@@ -213,7 +213,8 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
     }
     // Safari's extension toolbar/store pipeline only renders PNG icons; an .svg/.webp/.jpg
     // icon loads in Chrome but shows a blank glyph in Safari (and the App Store rejects it).
-    const ext = p.slice(p.lastIndexOf(".")).toLowerCase();
+    const dot = p.lastIndexOf(".");
+    const ext = dot >= 0 ? p.slice(dot).toLowerCase() : "";
     if (ext && ext !== ".png") {
       issues.push({
         severity: "warning",

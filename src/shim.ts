@@ -662,7 +662,7 @@ export function shimSource(): string {
       chrome.storage.session = {
         get: function (keys, cb) { if (typeof keys === "function") { cb = keys; keys = null; } return dual(sessGet(keys), cb); },
         set: function (items, cb) { for (var k in items) sessMem[k] = items[k]; return dual(undefined, cb); },
-        remove: function (keys, cb) { if (typeof keys === "string") keys = [keys]; for (var i = 0; i < keys.length; i++) delete sessMem[keys[i]]; return dual(undefined, cb); },
+        remove: function (keys, cb) { if (typeof keys === "string") keys = [keys]; if (Array.isArray(keys)) { for (var i = 0; i < keys.length; i++) delete sessMem[keys[i]]; } return dual(undefined, cb); },
         clear: function (cb) { sessMem = Object.create(null); return dual(undefined, cb); },
         getBytesInUse: function (k, cb) { if (typeof k === "function") { cb = k; } return dual(0, cb); },
         setAccessLevel: function (o, cb) { return dual(undefined, cb); },

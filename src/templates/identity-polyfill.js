@@ -74,7 +74,13 @@
         }, 120000);
 
         function captured(url) {
-          return typeof url === "string" && url.indexOf(redirectTarget) === 0;
+          if (typeof url !== "string" || url.indexOf(redirectTarget) !== 0) return false;
+          // Require a clean boundary after the redirect target so a longer host/path
+          // that merely STARTS with it (e.g. ".../cb.html.evil/") is not mistaken for
+          // the trusted callback. Chrome matches the redirect URL, not an arbitrary
+          // prefix. End-of-string, "/", "?" or "#" are the only valid continuations.
+          var next = url.charAt(redirectTarget.length);
+          return next === "" || next === "/" || next === "?" || next === "#";
         }
         function onNav(d) {
           if (d.tabId !== tabId) return;
@@ -131,7 +137,19 @@
   identity.getRedirectURL = getRedirectURL;
   identity.launchWebAuthFlow = launchWebAuthFlow;
   if (!identity.removeCachedAuthToken) identity.removeCachedAuthToken = function (d, cb) { if (cb) cb(); return Promise.resolve(); };
-  if (!identity.getAuthToken) identity.getAuthToken = function () { return Promise.reject(new Error("getAuthToken unsupported")); };
+  if (!identity.getAuthToken) identity.getAuthToken = function () {
+    // getAuthToken(details, cb) is callback-based in Chrome. Honor a trailing
+    // callback (invoking it with undefined + a lastError-style note) so callers
+    // don't hang on an ignored callback or an unhandled promise rejection.
+    var cb = arguments.length && typeof arguments[arguments.length - 1] === "function"
+           ? arguments[arguments.length - 1] : null;
+    if (cb) {
+      try { if (api.runtime) api.runtime.lastError = { message: "getAuthToken unsupported" }; } catch (e) {}
+      try { cb(undefined); } catch (e) {}
+      return;
+    }
+    return Promise.reject(new Error("getAuthToken unsupported"));
+  };
   api.identity = identity;
   DBG("[idpoly] identity patched");
 
