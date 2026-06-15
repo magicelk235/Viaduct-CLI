@@ -345,9 +345,11 @@ export function shimSource(): string {
       return false;
     };
 
-    var inject = function (tabId, fn, args) {
+    var inject = function (tabId, fn, args, world) {
       if (!chrome.scripting || !chrome.scripting.executeScript || tabId == null) return Promise.resolve(undefined);
-      return chrome.scripting.executeScript({ target: { tabId: tabId }, func: fn, args: args }).then(
+      var opts = { target: { tabId: tabId }, func: fn, args: args };
+      if (world) opts.world = world;
+      return chrome.scripting.executeScript(opts).then(
         function (r) { return (r && r[0]) ? r[0].result : undefined; },
         function () { return undefined; }
       );
@@ -380,10 +382,13 @@ export function shimSource(): string {
 
     var evaluate = function (tabId, params) {
       params = params || {};
+      // CDP Runtime.evaluate runs in the page's MAIN world; inject there so the
+      // expression sees the page's JS globals (the isolated world shares the DOM
+      // but not page window properties, which would silently yield undefined).
       return inject(tabId, function (code) {
         try { return { ok: true, value: (0, eval)(code) }; }
         catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
-      }, [params.expression || ""]).then(function (res) {
+      }, [params.expression || ""], "MAIN").then(function (res) {
         if (res && res.ok) return { result: { type: typeof res.value, value: res.value } };
         return { result: { type: "undefined" }, exceptionDetails: { text: (res && res.error) || "evaluate failed" } };
       });

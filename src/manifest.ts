@@ -522,18 +522,24 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
   // old build, breaks after migration". Flag each misplaced entry; it's a likely
   // bug the converter won't auto-move (intent is ambiguous).
   if ((m.manifest_version ?? 2) === 3) {
-    const declaredPermissions = Array.isArray(m.permissions) ? m.permissions : [];
-    for (const perm of declaredPermissions) {
-      if (typeof perm !== "string") continue;
-      const looksLikeHost = perm === "<all_urls>" || perm.includes("://");
-      if (looksLikeHost && !(perm in UNSUPPORTED_PERMISSIONS)) {
-        issues.push({
-          severity: "warning",
-          category: "permission",
-          message: `"${perm}" is a host match pattern in "permissions"; under MV3 it is ignored and grants no host access.`,
-          file: "manifest.json",
-          fix: 'Move it into "host_permissions" (MV3 requires URL patterns there, not in "permissions").',
-        });
+    const fields: Array<["permissions" | "optional_permissions", "host_permissions" | "optional_host_permissions"]> = [
+      ["permissions", "host_permissions"],
+      ["optional_permissions", "optional_host_permissions"],
+    ];
+    for (const [src, dest] of fields) {
+      const declared = Array.isArray(m[src]) ? (m[src] as unknown[]) : [];
+      for (const perm of declared) {
+        if (typeof perm !== "string") continue;
+        const looksLikeHost = perm === "<all_urls>" || perm.includes("://");
+        if (looksLikeHost && !(perm in UNSUPPORTED_PERMISSIONS)) {
+          issues.push({
+            severity: "warning",
+            category: "permission",
+            message: `"${perm}" is a host match pattern in "${src}"; under MV3 it is ignored and grants no host access.`,
+            file: "manifest.json",
+            fix: `Move it into "${dest}" (MV3 requires URL patterns there, not in "${src}").`,
+          });
+        }
       }
     }
   }
@@ -611,12 +617,15 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
     });
   }
 
-  // Each object value is a full policy string; join with ';' (not ' ') so
-  // directive boundaries survive for the per-directive scans below.
+  // Only the extension_pages policy governs the extension's own pages/SW; the
+  // sandbox policy intentionally relaxes rules for sandboxed iframes, so scanning
+  // it for "remote script-src" would false-flag legitimate sandbox allowances.
+  // A bare string is the MV2 form, which maps to extension_pages.
+  const cspObj = m.content_security_policy;
   const csp =
-    typeof m.content_security_policy === "string"
-      ? m.content_security_policy
-      : Object.values(m.content_security_policy ?? {}).join("; ");
+    typeof cspObj === "string"
+      ? cspObj
+      : (cspObj?.extension_pages ?? "");
   if (csp.includes("unsafe-eval")) {
     issues.push({
       severity: "warning",
