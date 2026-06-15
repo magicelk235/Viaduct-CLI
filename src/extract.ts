@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, openSync, readSync, closeSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, lstatSync, writeFileSync, mkdirSync, openSync, readSync, closeSync, realpathSync, rmSync } from "node:fs";
 import { join, extname, resolve, sep } from "node:path";
 import { run } from "./util.js";
 
@@ -30,6 +30,13 @@ function assertNoPathEscape(destDir: string): void {
   const walk = (dir: string): void => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const full = join(dir, entry.name);
+      // Reject symlinks outright. realpathSync below resolves them, so a symlink
+      // whose target is INSIDE the tree would pass the location check yet still
+      // let later cpSync staging follow the link out of the package.
+      if (entry.isSymbolicLink() || lstatSync(full).isSymbolicLink()) {
+        rmSync(destDir, { recursive: true, force: true });
+        throw new Error(`Refusing archive: contains a symlink (zip-slip risk): ${entry.name}`);
+      }
       let real: string;
       try {
         real = realpathSync(full);

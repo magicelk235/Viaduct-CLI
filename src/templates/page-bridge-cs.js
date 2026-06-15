@@ -14,6 +14,7 @@
   // script only relays page<->SW messages.
   window.addEventListener("message", function (ev) {
     if (ev.source !== window) return;
+    if (ev.origin !== window.location.origin) return;
     var d = ev.data;
     if (!d || d.__claudeBridge !== "page") return;
     var mtype = d.msg && d.msg.type ? d.msg.type : "(no type)";
