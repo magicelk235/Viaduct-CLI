@@ -274,10 +274,13 @@ async function main(): Promise<void> {
   if (isUrl(input)) {
     info(`Downloading extension from ${input} …`);
     const dlScratch = mkdtempSync(join(tmpdir(), "c2s-dl-"));
+    // Clean the download scratch on ANY exit (success or failure). The pipeline
+    // exits via process.exit on multiple paths, so a finally won't always run;
+    // an exit handler fires regardless and prevents leaking the downloaded archive.
+    process.on("exit", () => rmSync(dlScratch, { recursive: true, force: true }));
     try {
       localInput = await downloadExtension(input, dlScratch);
     } catch (e) {
-      rmSync(dlScratch, { recursive: true, force: true });
       fail((e as Error).message);
       process.exit(1);
     }

@@ -53,6 +53,11 @@ interface HttpResult {
 
 function httpGet(url: string, redirectsLeft = MAX_REDIRECTS): Promise<HttpResult> {
   return new Promise((resolve, reject) => {
+    // Guard against resolve/reject racing each other: a size-cap reject and a
+    // buffered `end` (which would resolve with the truncated buffer) can both
+    // fire, and whichever lands second is a silent no-op. Settle exactly once.
+    let settled = false;
+    const done = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
     const req = get(url, (res) => {
       const status = res.statusCode ?? 0;
 
@@ -60,49 +65,57 @@ function httpGet(url: string, redirectsLeft = MAX_REDIRECTS): Promise<HttpResult
         const location = res.headers.location;
         res.resume(); // drain
         if (!location) {
-          reject(new Error(`Redirect (${status}) with no Location header: ${url}`));
+          done(() => reject(new Error(`Redirect (${status}) with no Location header: ${url}`)));
           return;
         }
         if (redirectsLeft <= 0) {
-          reject(new Error(`Too many redirects fetching ${url}`));
+          done(() => reject(new Error(`Too many redirects fetching ${url}`)));
           return;
         }
-        const next = new URL(location, url).toString();
-        resolve(httpGet(next, redirectsLeft - 1));
+        const next = new URL(location, url);
+        // Only follow https redirects; an untrusted endpoint must not be able to
+        // redirect the fetch to http:// (or another scheme) and reach an internal host.
+        if (next.protocol !== "https:") {
+          done(() => reject(new Error(`Refusing non-https redirect to ${next.protocol}// from ${url}`)));
+          return;
+        }
+        done(() => resolve(httpGet(next.toString(), redirectsLeft - 1)));
         return;
       }
 
       if (status < 200 || status >= 300) {
         res.resume();
-        reject(new Error(`HTTP ${status} fetching ${url}`));
+        done(() => reject(new Error(`HTTP ${status} fetching ${url}`)));
         return;
       }
 
       const chunks: Buffer[] = [];
       let total = 0;
       res.on("data", (chunk: Buffer) => {
+        if (settled) return;
         total += chunk.length;
         if (total > MAX_BYTES) {
+          res.destroy();
           req.destroy();
-          reject(new Error(`Download exceeds ${MAX_BYTES} bytes: ${url}`));
+          done(() => reject(new Error(`Download exceeds ${MAX_BYTES} bytes: ${url}`)));
           return;
         }
         chunks.push(chunk);
       });
       res.on("end", () => {
-        resolve({
+        done(() => resolve({
           buffer: Buffer.concat(chunks),
           finalUrl: url,
           contentType: String(res.headers["content-type"] ?? ""),
-        });
+        }));
       });
-      res.on("error", reject);
+      res.on("error", (e) => done(() => reject(e)));
     });
 
     req.setTimeout(TIMEOUT_MS, () => {
       req.destroy(new Error(`Timed out after ${TIMEOUT_MS}ms fetching ${url}`));
     });
-    req.on("error", reject);
+    req.on("error", (e) => done(() => reject(e)));
   });
 }
 

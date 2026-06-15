@@ -271,6 +271,9 @@ export function detectXcodeTeam(): string | null {
 }
 
 export function defaultBundleId(appName: string): string {
-  const slug = appName.replace(/[^A-Za-z0-9]/g, "");
+  // Strip non-alphanumerics, then drop any leading digits: a CFBundleIdentifier
+  // segment that starts with a digit (e.g. "123App") is rejected by parts of
+  // Apple's toolchain. Fall back to "extension" when nothing usable remains.
+  const slug = appName.replace(/[^A-Za-z0-9]/g, "").replace(/^[0-9]+/, "");
   return `com.chrome2safari.${slug || "extension"}`;
 }

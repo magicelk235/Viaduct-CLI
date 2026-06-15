@@ -27,6 +27,7 @@
 
   window.addEventListener("message", function (ev) {
     if (ev.source !== window) return;
+    if (ev.origin !== window.location.origin) return;
     var d = ev.data;
     if (!d || d.__claudeBridge !== "cs") return;
     var cb = pending[d.reqId];

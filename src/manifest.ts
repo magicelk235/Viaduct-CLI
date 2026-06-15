@@ -845,6 +845,11 @@ export function collectReferencedPaths(m: Manifest): Set<string> {
   for (const p of Object.values(m.chrome_url_overrides ?? {})) add(p);
   for (const p of arr(m.sandbox?.pages)) add(p);
   for (const r of m.declarative_net_request?.rule_resources ?? []) add(r?.path);
+  // side_panel.default_path: the shim opens this page at runtime (see shim.ts),
+  // so a miss here drops the panel HTML and open() 404s in Safari.
+  add((m as { side_panel?: { default_path?: unknown } }).side_panel?.default_path);
+  add((m as { sidebar_action?: { default_panel?: unknown } }).sidebar_action?.default_panel);
+  add((m as { storage?: { managed_schema?: unknown } }).storage?.managed_schema);
 
   // web_accessible_resources: MV2 string[] or MV3 [{resources: string[]}].
   for (const entry of arr(m.web_accessible_resources)) {
@@ -934,8 +939,11 @@ export function transformManifest(
     safari: { strict_min_version: opts.minSafariVersion ?? "15.4" },
   };
 
-  // Ensure the toolbar button does something: wire a popup if one exists.
-  const actionKey = out.action ? "action" : out.browser_action ? "browser_action" : "action";
+  // Ensure the toolbar button does something: wire a popup if one exists. Pick the
+  // key valid for this manifest version — MV2 has no `action` (only browser_action),
+  // so injecting `action` there produces a manifest Safari rejects at load.
+  const defaultActionKey = mv === 3 ? "action" : "browser_action";
+  const actionKey = out.action ? "action" : out.browser_action ? "browser_action" : defaultActionKey;
   const action = (out[actionKey] as Manifest["action"]) ?? {};
   if (!action.default_popup) {
     for (const candidate of ["popup.html", "sidepanel.html", "panel.html", "index.html"]) {

@@ -37,9 +37,14 @@ export function expandHome(p: string): string {
   return p;
 }
 
-/** True when pluginkit's output lists the extension's bundle id. */
+/**
+ * True when pluginkit's output lists the EXTENSION (appex) bundle id. Callers
+ * pass the app's bundleId; the registered appex is "<bundleId>.Extension". A bare
+ * `includes(bundleId)` would also report true when only the app (not the appex)
+ * appears, so match the appex id explicitly.
+ */
 export function bundleRegistered(pluginkitOutput: string, bundleId: string): boolean {
-  return pluginkitOutput.includes(bundleId);
+  return pluginkitOutput.includes(`${bundleId}.Extension`);
 }
 
 function safariRunning(): boolean {
