@@ -52,10 +52,22 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
   cpSync(sourceDir, stageDir, {
     recursive: true,
     filter: (src) => {
-      if (!shouldExclude(basename(src))) return true;
-      // Excluded by name — but keep it if the manifest references this exact path.
       const rel = relative(root, resolve(src)).split(sep).join("/");
-      return keep.has(rel);
+      if (rel === "") return true; // the stage root itself
+      // A manifest-referenced path is always kept, even under an excluded ancestor.
+      if (keep.has(rel)) return true;
+      // Excluded if its own name OR any ancestor segment is excluded — this stops a
+      // file like _metadata/junk.js (parent excluded) from riding in just because
+      // its own basename is clean.
+      const segments = rel.split("/");
+      if (segments.some(shouldExclude)) {
+        // Still allow an excluded directory to be entered when a kept path lives
+        // inside it; cpSync won't recurse otherwise and the kept child is lost.
+        const asDir = rel + "/";
+        for (const k of keep) if (k.startsWith(asDir)) return true;
+        return false;
+      }
+      return true;
     },
   });
 

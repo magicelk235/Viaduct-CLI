@@ -6,6 +6,11 @@
 (function () {
   if (window.__claudeBridgeInstalled) return;
   window.__claudeBridgeInstalled = true;
+  // Verbose logging OFF by default (runs in the page's MAIN world). Set
+  // window.__C2S_DEBUG = true to re-enable diagnostic logs.
+  var DEBUG = !!window.__C2S_DEBUG;
+  var DBG = function () { if (DEBUG) try { console.log.apply(console, arguments); } catch (e) {} };
+  var DBGW = function () { if (DEBUG) try { console.warn.apply(console, arguments); } catch (e) {} };
   var CHROME_ID = "dihbgbndebgnbjfmelmegjepbnkhlgni";
   var pending = Object.create(null);
   var seq = 0;
@@ -30,11 +35,11 @@
     }
     var reqId = "r" + (++seq);
     var mtype = msg && msg.type ? msg.type : "(no type)";
-    console.log("[bridge] page->SW send", mtype, "reqId", reqId);
+    DBG("[bridge] page->SW send", mtype, "reqId", reqId);
     var p = new Promise(function (resolve, reject) {
       pending[reqId] = function (resp, err) {
         if (err) { console.error("[bridge] SW->page ERROR", mtype, reqId, err); reject(new Error(err)); }
-        else { console.log("[bridge] SW->page resp", mtype, reqId, resp); resolve(resp); }
+        else { DBG("[bridge] SW->page resp", mtype, reqId, resp ? "(ok)" : resp); resolve(resp); }
       };
     });
     window.postMessage({ __claudeBridge: "page", reqId: reqId, msg: msg }, window.location.origin);
@@ -48,7 +53,7 @@
     id: CHROME_ID,
     sendMessage: sendMessage,
     connect: function () {
-      console.warn("[bridge] runtime.connect called — returning inert port (not supported via Safari bridge)");
+      DBGW("[bridge] runtime.connect called — returning inert port (not supported via Safari bridge)");
       return { name: "", postMessage: noop, disconnect: noop,
                onMessage: emptyEvent, onDisconnect: emptyEvent };
     },
@@ -62,5 +67,5 @@
   if (!ns.runtime) ns.runtime = runtime;
   else { ns.runtime.sendMessage = sendMessage; if (!ns.runtime.id) ns.runtime.id = CHROME_ID; }
   window.chrome = ns;
-  console.log("[bridge] page chrome.runtime installed");
+  DBG("[bridge] page chrome.runtime installed");
 })();

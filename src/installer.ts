@@ -104,9 +104,15 @@ export function installToSafari(opts: InstallOptions): InstallResult {
   }
 
   info("Launching host app to register the extension …");
-  run("/usr/bin/open", [dest]);
+  const launch = run("/usr/bin/open", [dest]);
+  if (launch.code !== 0) {
+    warn(`Could not launch the host app (open exit ${launch.code}); the extension may not register. Open ${dest} manually.`);
+  }
 
-  if (applyUnsigned) run("/usr/bin/open", ["-a", "Safari"]);
+  if (applyUnsigned) {
+    const reopen = run("/usr/bin/open", ["-a", "Safari"]);
+    if (reopen.code !== 0) warn(`Could not relaunch Safari (open exit ${reopen.code}); reopen it manually.`);
+  }
 
   result.registered = bundleRegistered(pluginkitStatus(), opts.bundleId);
   if (result.registered) ok("pluginkit lists the extension as registered.");

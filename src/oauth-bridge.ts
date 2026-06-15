@@ -38,6 +38,12 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest): string[]
 
   // 1. Emit the identity polyfill — it shims chrome.identity in the SW and is
   //    imported below regardless of whether the page bridge gets wired.
+  for (const tmpl of [BRIDGE_POLYFILL, BRIDGE_PAGE, BRIDGE_PAGE_CS]) {
+    if (!existsSync(join(TEMPLATE_DIR, tmpl))) {
+      notes.push(`OAuth bridge template "${tmpl}" is missing from the install; skipping chrome.identity bridge.`);
+      return notes;
+    }
+  }
   copyFileSync(join(TEMPLATE_DIR, BRIDGE_POLYFILL), join(stageDir, BRIDGE_POLYFILL));
 
   // 2. The SW (or its loader) must run the polyfill FIRST so the bridge receiver
@@ -81,7 +87,9 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest): string[]
 function injectPolyfillImport(swPath: string): void {
   if (!existsSync(swPath)) return;
   const src = readFileSync(swPath, "utf-8");
-  if (src.includes(BRIDGE_POLYFILL)) return;
+  // Match the actual import, not a bare filename mention (a comment or URL referencing
+  // identity-polyfill.js would otherwise suppress the required import).
+  if (src.includes(`"./${BRIDGE_POLYFILL}"`)) return;
   writeFileSync(swPath, `import "./${BRIDGE_POLYFILL}";\n` + src, "utf-8");
 }
 

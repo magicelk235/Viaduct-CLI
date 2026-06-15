@@ -1,6 +1,6 @@
 import { readdirSync, existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { run, info, ok, warn } from "./util.js";
 import type { Platforms } from "./types.js";
 
@@ -59,8 +59,10 @@ export function runPackager(opts: PackageOptions): string | null {
     return null;
   }
 
-  const projects = findFiles(opts.outputDir, (n) => n.endsWith(".xcodeproj"), 2);
-  return projects[0] ?? null;
+  const projects = findFiles(opts.outputDir, (n) => n.endsWith(".xcodeproj"), 4);
+  // Prefer the project we just generated; a stale .xcodeproj from a prior run in a
+  // reused outputDir can otherwise be picked (readdir order is not guaranteed).
+  return projects.find((p) => basename(p) === `${opts.appName}.xcodeproj`) ?? projects[0] ?? null;
 }
 
 /**
@@ -185,7 +187,10 @@ export function buildXcodeProject(
     return null;
   }
   const productsDir = join(derived, "Build", "Products", "Release");
-  const built = findFiles(productsDir, (n) => n.endsWith(".app"), 1)[0];
+  const apps = findFiles(productsDir, (n) => n.endsWith(".app"), 4);
+  // Match the app we built by name; a multi-platform Release dir can hold several .app
+  // bundles, and readdir order is not guaranteed, so [0] could be the wrong one.
+  const built = apps.find((p) => basename(p) === `${appName}.app`) ?? apps[0];
   if (!built) {
     rmSync(derived, { recursive: true, force: true });
     return null;
