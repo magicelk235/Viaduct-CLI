@@ -7,7 +7,7 @@ import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolv
 import { scanExtension } from "./analyze.js";
 import { stageExtension, stripDanglingSourcemaps } from "./stage.js";
 import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage } from "./shim.js";
-import { applyOAuthBridge } from "./oauth-bridge.js";
+import { applyOAuthBridge, deriveChromeId } from "./oauth-bridge.js";
 import { applyDnr } from "./dnr.js";
 import { synthesizePlaceholderIcons } from "./icons.js";
 import { writeTempLoadInstructions } from "./tempload.js";
@@ -54,6 +54,11 @@ export function convert(opts: ConvertOptions): ConvertResult {
     result.extensionName = resolveI18nString(manifest.name, extPath, manifest.default_locale) ?? manifest.name ?? "Unknown";
     result.manifestVersion = manifest.manifest_version ?? 3;
     ok(`Loaded "${result.extensionName}" (MV${result.manifestVersion})`);
+
+    // Compute the real Chrome id NOW, before transformManifest strips the `key`.
+    // Used to bake the original id into the OAuth bridge templates so pages that
+    // check chrome.runtime.id keep working after conversion.
+    const chromeId = deriveChromeId(manifest);
 
     const { issues: manifestIssues, permissionsToRemove } = analyzeManifest(manifest);
     const issues: Issue[] = [...manifestIssues, ...scanExtension(extPath, manifest, opts.platforms)];
@@ -106,7 +111,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
     for (const n of dnrNotes) warn(n);
 
     if (opts.oauthBridge !== false) {
-      const bridgeNotes = applyOAuthBridge(stageDir, transformed);
+      const bridgeNotes = applyOAuthBridge(stageDir, transformed, chromeId);
       for (const n of bridgeNotes) ok(n);
     }
 
