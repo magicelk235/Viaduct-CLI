@@ -181,13 +181,15 @@ export function shimSource(): string {
         }
       } catch (e) { /* ignore */ }
       var nid = typeof id === "string" && id ? id : "c2s-" + Date.now();
-      if (typeof cb === "function") cb(nid);
+      // Chrome completes via the callback OR the promise, never both. Match that:
+      // return early once the callback path is taken.
+      if (typeof cb === "function") { cb(nid); return; }
       return Promise.resolve(nid);
     };
-    if (typeof n.clear !== "function") n.clear = function (id, cb) { if (cb) cb(true); return Promise.resolve(true); };
-    if (typeof n.update !== "function") n.update = function (id, opts, cb) { if (cb) cb(true); return Promise.resolve(true); };
-    if (typeof n.getAll !== "function") n.getAll = function (cb) { if (cb) cb({}); return Promise.resolve({}); };
-    if (typeof n.getPermissionLevel !== "function") n.getPermissionLevel = function (cb) { if (cb) cb("granted"); return Promise.resolve("granted"); };
+    if (typeof n.clear !== "function") n.clear = function (id, cb) { if (cb) { cb(true); return; } return Promise.resolve(true); };
+    if (typeof n.update !== "function") n.update = function (id, opts, cb) { if (cb) { cb(true); return; } return Promise.resolve(true); };
+    if (typeof n.getAll !== "function") n.getAll = function (cb) { if (cb) { cb({}); return; } return Promise.resolve({}); };
+    if (typeof n.getPermissionLevel !== "function") n.getPermissionLevel = function (cb) { if (cb) { cb("granted"); return; } return Promise.resolve("granted"); };
     if (!n.onClicked) n.onClicked = event();
     if (!n.onClosed) n.onClosed = event();
     if (!n.onButtonClicked) n.onButtonClicked = event();

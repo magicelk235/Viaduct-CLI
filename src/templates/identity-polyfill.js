@@ -1,13 +1,19 @@
-// identity-polyfill.js — Safari chrome.identity shim for OAuth (DEBUG build).
+// identity-polyfill.js — Safari chrome.identity shim for OAuth.
+// Verbose logging is OFF by default (it can leak OAuth tokens into the console).
+// Set self.__C2S_DEBUG = true before this loads to re-enable diagnostic logs.
 (function () {
   "use strict";
+  var DEBUG = (typeof self !== "undefined" && self.__C2S_DEBUG) ||
+              (typeof globalThis !== "undefined" && globalThis.__C2S_DEBUG) || false;
+  var DBG = function () { if (DEBUG) try { console.log.apply(console, arguments); } catch (e) {} };
+  var DBGW = function () { if (DEBUG) try { console.warn.apply(console, arguments); } catch (e) {} };
   var api = typeof self !== "undefined" && self.chrome ? self.chrome
           : (typeof chrome !== "undefined" ? chrome : null);
-  if (!api) { console.warn("[idpoly] no chrome api"); return; }
+  if (!api) { DBGW("[idpoly] no chrome api"); return; }
 
   var CHROME_EXT_ID = "dihbgbndebgnbjfmelmegjepbnkhlgni";
   var REDIRECT_BASE = "https://" + CHROME_EXT_ID + ".chromiumapp.org/";
-  console.log("[idpoly] loaded. native identity?", !!api.identity,
+  DBG("[idpoly] loaded. native identity?", !!api.identity,
               "tabs?", !!api.tabs, "webNavigation?", !!api.webNavigation,
               "REDIRECT_BASE", REDIRECT_BASE);
 
@@ -27,12 +33,12 @@
 
   function getRedirectURL(path) {
     var u = !path ? REDIRECT_BASE : REDIRECT_BASE + String(path).replace(/^\//, "");
-    console.log("[idpoly] getRedirectURL ->", u);
+    DBG("[idpoly] getRedirectURL ->", u);
     return u;
   }
 
   function launchWebAuthFlow(details, callback) {
-    console.log("[idpoly] launchWebAuthFlow", JSON.stringify(details));
+    DBG("[idpoly] launchWebAuthFlow", JSON.stringify(details));
     var p = new Promise(function (resolve, reject) {
       var authUrl = details && details.url;
       if (!authUrl) { reject(new Error("launchWebAuthFlow: missing url")); return; }
@@ -46,7 +52,7 @@
         var ru = new URL(authUrl).searchParams.get("redirect_uri");
         if (ru) redirectTarget = ru;
       } catch (e) { /* keep default */ }
-      console.log("[idpoly] redirectTarget", redirectTarget);
+      DBG("[idpoly] redirectTarget", redirectTarget);
 
       // DEBUG: always visible so you can see the authorize result.
       api.tabs.create({ url: authUrl, active: true }, function (tab) {
@@ -57,9 +63,9 @@
         }
         var tabId = tab.id;
         var settled = false;
-        console.log("[idpoly] auth tab", tabId, "url", authUrl);
+        DBG("[idpoly] auth tab", tabId, "url", authUrl);
         var timer = setTimeout(function () {
-          console.warn("[idpoly] TIMEOUT (tab left open for inspection)", tabId);
+          DBGW("[idpoly] TIMEOUT (tab left open for inspection)", tabId);
           if (!settled) { settled = true; cleanup(); reject(new Error("launchWebAuthFlow timeout")); }
         }, 120000);
 
@@ -68,16 +74,16 @@
         }
         function onNav(d) {
           if (d.tabId !== tabId) return;
-          console.log("[idpoly] nav", d.url);
+          DBG("[idpoly] nav", d.url);
           if (captured(d.url)) finish(resolve, d.url);
         }
         function onErr(d) {
           if (d.tabId !== tabId) return;
-          console.log("[idpoly] navERR", d.url, d.error);
+          DBG("[idpoly] navERR", d.url, d.error);
           if (captured(d.url)) finish(resolve, d.url);
         }
         function onRemoved(id) {
-          if (id === tabId) { console.warn("[idpoly] tab removed"); finish(reject, new Error("auth tab closed")); }
+          if (id === tabId) { DBGW("[idpoly] tab removed"); finish(reject, new Error("auth tab closed")); }
         }
         function cleanup() {
           clearTimeout(timer);
@@ -91,7 +97,13 @@
           if (settled) return;
           settled = true;
           cleanup();
-          console.log("[idpoly] finish ->", (fn === resolve ? "RESOLVE " + arg : "reject " + arg));
+          // Redact the OAuth token/code: the redirect URL carries it in the query/
+          // fragment, so log only origin+path, never the full URL.
+          var redacted = arg;
+          if (fn === resolve && typeof arg === "string") {
+            try { var ru = new URL(arg); redacted = ru.origin + ru.pathname + " (params redacted)"; } catch (e) { redacted = "(redirect url redacted)"; }
+          }
+          DBG("[idpoly] finish ->", (fn === resolve ? "RESOLVE " + redacted : "reject " + arg));
           try { api.tabs.remove(tabId, function () { void api.runtime.lastError; }); } catch (e) {}
           fn(arg);
         }
@@ -117,7 +129,7 @@
   if (!identity.removeCachedAuthToken) identity.removeCachedAuthToken = function (d, cb) { if (cb) cb(); return Promise.resolve(); };
   if (!identity.getAuthToken) identity.getAuthToken = function () { return Promise.reject(new Error("getAuthToken unsupported")); };
   api.identity = identity;
-  console.log("[idpoly] identity patched");
+  DBG("[idpoly] identity patched");
 
   // --- page<->extension bridge (SW side) ---------------------------------
   // Safari requires the page to pass the (Safari) extension id to message the
@@ -136,11 +148,11 @@
   // progressive fallbacks, so addListener is always captured here.
   (function () {
     var rt = api.runtime;
-    if (!rt) { console.warn("[idpoly] no runtime for onMessageExternal capture"); return; }
+    if (!rt) { DBGW("[idpoly] no runtime for onMessageExternal capture"); return; }
     var nativeExt = rt.onMessageExternal;
     var nativeAdd = (nativeExt && typeof nativeExt.addListener === "function")
                   ? nativeExt.addListener.bind(nativeExt) : null;
-    console.log("[idpoly] native onMessageExternal?", !!nativeExt, "nativeAdd?", !!nativeAdd);
+    DBG("[idpoly] native onMessageExternal?", !!nativeExt, "nativeAdd?", !!nativeAdd);
     // Single capture sink. Whether the SW bundle calls addListener on our
     // defineProperty shadow OR on the original native event object, the listener
     // must land here — else extListeners stays empty and bridged page messages
@@ -150,7 +162,7 @@
       if (typeof l !== "function") return;
       if (extListeners.indexOf(l) < 0) {
         extListeners.push(l);
-        console.log("[idpoly] captured onMessageExternal listener; total", extListeners.length);
+        DBG("[idpoly] captured onMessageExternal listener; total", extListeners.length);
       }
       if (nativeAdd) { try { nativeAdd(l); } catch (e) { /* native may reject */ } }
     }
@@ -162,10 +174,10 @@
     // (1) Replace the event object so `rt.onMessageExternal.addListener` hits us.
     try {
       Object.defineProperty(rt, "onMessageExternal", { value: controlled, configurable: true, writable: true });
-      console.log("[idpoly] onMessageExternal replaced via defineProperty");
+      DBG("[idpoly] onMessageExternal replaced via defineProperty");
     } catch (e1) {
-      try { rt.onMessageExternal = controlled; console.log("[idpoly] onMessageExternal replaced via assignment"); }
-      catch (e2) { console.warn("[idpoly] could not replace onMessageExternal object", e2); }
+      try { rt.onMessageExternal = controlled; DBG("[idpoly] onMessageExternal replaced via assignment"); }
+      catch (e2) { DBGW("[idpoly] could not replace onMessageExternal object", e2); }
     }
     // (2) ALSO patch addListener on the ORIGINAL native object in place, in case
     // the bundle reaches the native event reference directly (Safari may hand out
@@ -173,10 +185,10 @@
     if (nativeExt && nativeExt !== controlled) {
       try {
         Object.defineProperty(nativeExt, "addListener", { value: capture, configurable: true, writable: true });
-        console.log("[idpoly] native onMessageExternal.addListener wrapped");
+        DBG("[idpoly] native onMessageExternal.addListener wrapped");
       } catch (e3) {
-        try { nativeExt.addListener = capture; console.log("[idpoly] native onMessageExternal.addListener wrapped (assign)"); }
-        catch (e4) { console.warn("[idpoly] could not wrap native onMessageExternal.addListener", e4); }
+        try { nativeExt.addListener = capture; DBG("[idpoly] native onMessageExternal.addListener wrapped (assign)"); }
+        catch (e4) { DBGW("[idpoly] could not wrap native onMessageExternal.addListener", e4); }
       }
     }
   })();
@@ -186,7 +198,7 @@
       var origin = sender.origin || safeOrigin(sender.url) ||
                    (sender.tab && sender.tab.url ? safeOrigin(sender.tab.url) : undefined);
       var fixed = Object.assign({}, sender, { origin: origin });
-      console.log("[idpoly] bridge msg", JSON.stringify(msg.payload), "origin", origin,
+      DBG("[idpoly] bridge msg", JSON.stringify(msg.payload), "origin", origin,
                   "listeners", extListeners.length);
       // Return a Promise so Safari/Firefox deliver the async response. Safari
       // IGNORES `return true`, so a `return true` + async sendResponse drops the
@@ -196,7 +208,7 @@
         var settled = false;
         var resp = function (r) {
           if (settled) return; settled = true;
-          console.log("[idpoly] bridge resp ->", JSON.stringify(r));
+          DBG("[idpoly] bridge resp ->", (r && r.success === false) ? JSON.stringify(r) : "(ok, payload redacted)");
           try { sendResponse(r); } catch (e) {}
           resolve(r);
         };

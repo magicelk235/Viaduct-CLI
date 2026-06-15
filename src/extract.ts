@@ -1,5 +1,5 @@
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, openSync, readSync, closeSync } from "node:fs";
-import { join, extname } from "node:path";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, openSync, readSync, closeSync, realpathSync, rmSync } from "node:fs";
+import { join, extname, resolve, sep } from "node:path";
 import { run } from "./util.js";
 
 /** Strip macOS extended attributes that break code signing. */
@@ -17,6 +17,33 @@ function unzipTo(zipPath: string, destDir: string): void {
       throw new Error(`Failed to unzip ${zipPath}: ${r.stderr || u.stderr}`);
     }
   }
+  assertNoPathEscape(destDir);
+}
+
+/**
+ * Guard against zip-slip: ensure every extracted entry resolves inside destDir.
+ * ditto does not sanitize `../` entries, so a crafted archive could write outside.
+ */
+function assertNoPathEscape(destDir: string): void {
+  const root = realpathSync(resolve(destDir));
+  const prefix = root.endsWith(sep) ? root : root + sep;
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      let real: string;
+      try {
+        real = realpathSync(full);
+      } catch {
+        continue;
+      }
+      if (real !== root && !real.startsWith(prefix)) {
+        rmSync(destDir, { recursive: true, force: true });
+        throw new Error(`Refusing archive: entry escapes extraction directory (zip-slip): ${entry.name}`);
+      }
+      if (entry.isDirectory()) walk(full);
+    }
+  };
+  walk(root);
 }
 
 /** Parse a .crx (Chrome) container, returning the embedded ZIP bytes. */
