@@ -1,5 +1,5 @@
-// page-bridge.js — injected into the claude.ai MAIN world.
-// claude.ai probes window.chrome.runtime to talk to the extension. Safari does
+// page-bridge.js — injected into the MAIN world of externally_connectable pages.
+// Such pages probe window.chrome.runtime to talk to the extension. Safari does
 // not give web pages a `chrome` namespace (only `browser`, and that needs the
 // Safari extension id which the page can't know). Define a `chrome.runtime`
 // whose sendMessage relays over window.postMessage to the content script.
@@ -11,7 +11,17 @@
   var DEBUG = !!window.__C2S_DEBUG;
   var DBG = function () { if (DEBUG) try { console.log.apply(console, arguments); } catch (e) {} };
   var DBGW = function () { if (DEBUG) try { console.warn.apply(console, arguments); } catch (e) {} };
-  var CHROME_ID = "dihbgbndebgnbjfmelmegjepbnkhlgni";
+  // The page reads chrome.runtime.id. For a faithful conversion this should be
+  // the extension's original Chrome id; the converter substitutes it at build
+  // time when known (CRX/store download). If left unsubstituted, fall back to
+  // the live Safari runtime id so messaging still works for ANY extension.
+  var CHROME_ID = "__C2S_EXTENSION_ID__";
+  if (CHROME_ID === "__C2S_" + "EXTENSION_ID__") {
+    try {
+      var liveApi = window.browser || window.chrome;
+      CHROME_ID = (liveApi && liveApi.runtime && liveApi.runtime.id) || "";
+    } catch (e) { CHROME_ID = ""; }
+  }
   var pending = Object.create(null);
   var seq = 0;
 

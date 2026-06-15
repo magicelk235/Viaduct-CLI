@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Manifest } from "./types.js";
@@ -8,6 +9,42 @@ const TEMPLATE_DIR = join(dirname(fileURLToPath(import.meta.url)), "templates");
 export const BRIDGE_POLYFILL = "identity-polyfill.js";
 export const BRIDGE_PAGE = "page-bridge.js";
 export const BRIDGE_PAGE_CS = "page-bridge-cs.js";
+
+/** Placeholder the bridge templates carry; replaced with the real Chrome id when derivable. */
+const EXT_ID_PLACEHOLDER = "__C2S_EXTENSION_ID__";
+
+/**
+ * Derive an extension's Chrome id from its manifest `key` (base64 DER public key).
+ * Chrome's rule: SHA-256 the decoded key, take the first 16 bytes, and map each
+ * nibble 0–15 to a–p. Returns undefined for an unpacked extension (no key) or a
+ * malformed key, in which case the templates fall back to the live runtime id.
+ */
+export function deriveChromeId(manifest: Manifest): string | undefined {
+  const key = manifest.key;
+  if (typeof key !== "string" || key.length === 0) return undefined;
+  let der: Buffer;
+  try {
+    der = Buffer.from(key, "base64");
+  } catch {
+    return undefined;
+  }
+  if (der.length === 0) return undefined;
+  const digest = createHash("sha256").update(der).digest();
+  let id = "";
+  for (let i = 0; i < 16; i++) {
+    id += String.fromCharCode(97 + (digest[i] >> 4));
+    id += String.fromCharCode(97 + (digest[i] & 0x0f));
+  }
+  return id;
+}
+
+/** Replace the build-time extension-id placeholder in a staged template file. */
+function substituteExtId(filePath: string, chromeId: string | undefined): void {
+  if (!chromeId || !existsSync(filePath)) return;
+  const src = readFileSync(filePath, "utf-8");
+  if (!src.includes(EXT_ID_PLACEHOLDER)) return;
+  writeFileSync(filePath, src.split(EXT_ID_PLACEHOLDER).join(chromeId), "utf-8");
+}
 
 interface WarEntry {
   resources: string[];
@@ -31,7 +68,7 @@ interface WarEntry {
  *
  * No-op unless the extension has a background service worker. Mutates `manifest`.
  */
-export function applyOAuthBridge(stageDir: string, manifest: Manifest): string[] {
+export function applyOAuthBridge(stageDir: string, manifest: Manifest, chromeId?: string): string[] {
   const notes: string[] = [];
   const sw = manifest.background?.service_worker;
   if (!sw) return notes; // only MV3 service-worker extensions have this handshake
@@ -44,7 +81,12 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest): string[]
       return notes;
     }
   }
+  // The bridge templates carry a placeholder Chrome id. When the caller passes the
+  // extension's real Chrome id (derived from the source manifest `key`) we bake it
+  // in; otherwise the placeholder stays and the templates fall back to the live
+  // runtime id at execution time. Either way the bridge works for ANY extension.
   copyFileSync(join(TEMPLATE_DIR, BRIDGE_POLYFILL), join(stageDir, BRIDGE_POLYFILL));
+  substituteExtId(join(stageDir, BRIDGE_POLYFILL), chromeId);
 
   // 2. The SW (or its loader) must run the polyfill FIRST so the bridge receiver
   //    and chrome.identity shim install before the bundle evaluates.
@@ -66,6 +108,7 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest): string[]
 
   // Page bridge is actually wired → emit its two assets now.
   copyFileSync(join(TEMPLATE_DIR, BRIDGE_PAGE), join(stageDir, BRIDGE_PAGE));
+  substituteExtId(join(stageDir, BRIDGE_PAGE), chromeId);
   copyFileSync(join(TEMPLATE_DIR, BRIDGE_PAGE_CS), join(stageDir, BRIDGE_PAGE_CS));
 
   manifest.content_scripts = manifest.content_scripts ?? [];
