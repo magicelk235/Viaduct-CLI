@@ -842,6 +842,7 @@ export function collectReferencedPaths(m: Manifest): Set<string> {
   add(m.options_page);
   add(m.options_ui?.page);
   add(m.devtools_page);
+  for (const p of Object.values(m.chrome_url_overrides ?? {})) add(p);
   for (const p of arr(m.sandbox?.pages)) add(p);
   for (const r of m.declarative_net_request?.rule_resources ?? []) add(r?.path);
 
@@ -868,8 +869,16 @@ export function transformManifest(
   delete out.version_name;
 
   if (out.version) {
-    const parts = out.version.split(".");
-    if (parts.length > 3) out.version = parts.slice(0, 3).join(".");
+    // Safari/Xcode require dot-separated integers (max 3 components, each ≤ 65535).
+    // Keep leading numeric parts and stop at the first non-numeric one; if nothing
+    // usable remains, fall back to 1.0.0 rather than writing a manifest that fails the build.
+    const numeric: string[] = [];
+    for (const p of out.version.split(".")) {
+      if (!/^\d+$/.test(p)) break;
+      numeric.push(String(Math.min(Number(p), 65535)));
+      if (numeric.length === 3) break;
+    }
+    out.version = numeric.length ? numeric.join(".") : "1.0.0";
   }
 
   const removeSet = new Set(permissionsToRemove);
@@ -907,9 +916,16 @@ export function transformManifest(
   // the flat list, exposing it to all URLs (the MV2 default visibility).
   if (mv === 3 && Array.isArray(out.web_accessible_resources)) {
     const flat = out.web_accessible_resources as unknown[];
-    const isLegacy = flat.every((e) => typeof e === "string");
-    if (isLegacy && flat.length > 0) {
-      out.web_accessible_resources = [{ resources: flat as string[], matches: ["<all_urls>"] }];
+    // Handle mixed arrays per-entry: a bare string[] is MV2-style, but hand-edited
+    // manifests sometimes mix loose strings with MV3 objects. Wrap only the loose
+    // strings and pass the already-valid objects through untouched.
+    const looseStrings = flat.filter((e): e is string => typeof e === "string");
+    const objects = flat.filter((e) => typeof e === "object" && e !== null);
+    if (looseStrings.length > 0) {
+      out.web_accessible_resources = [
+        { resources: looseStrings, matches: ["<all_urls>"] },
+        ...objects,
+      ] as Manifest["web_accessible_resources"];
     }
   }
 

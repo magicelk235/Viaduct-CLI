@@ -5,6 +5,9 @@
 (function () {
   var api = typeof browser !== "undefined" ? browser : (typeof chrome !== "undefined" ? chrome : null);
   if (!api) return;
+  // Verbose logging OFF by default. Set window.__C2S_DEBUG = true to re-enable.
+  var DEBUG = (typeof window !== "undefined" && window.__C2S_DEBUG) || false;
+  var DBG = function () { if (DEBUG) try { console.log.apply(console, arguments); } catch (e) {} };
 
   // page-bridge.js is loaded into the MAIN world via a separate content_scripts
   // entry (world:"MAIN") to bypass claude.ai's page CSP. This isolated-world
@@ -14,12 +17,12 @@
     var d = ev.data;
     if (!d || d.__claudeBridge !== "page") return;
     var mtype = d.msg && d.msg.type ? d.msg.type : "(no type)";
-    console.log("[bridge-cs] relay page->SW", mtype, "reqId", d.reqId);
+    DBG("[bridge-cs] relay page->SW", mtype, "reqId", d.reqId);
     var done = false;
     function back(response, err) {
       if (done) return; done = true;
       clearTimeout(t);
-      console.log("[bridge-cs] SW resp", mtype, d.reqId, err ? ("ERR " + err) : response);
+      DBG("[bridge-cs] SW resp", mtype, d.reqId, err ? ("ERR " + err) : (response ? "(ok)" : response));
       window.postMessage({ __claudeBridge: "cs", reqId: d.reqId, response: response, error: err }, window.location.origin);
     }
     // If the SW never answers (e.g. not running / unreachable), surface a clear
@@ -43,7 +46,7 @@
       back(undefined, String(e));
     }
   });
-  console.log("[bridge-cs] installed v3 — probing background…");
+  DBG("[bridge-cs] installed v3 — probing background…");
 
   // Auto-probe on load: ping the background directly (no login needed) so we know
   // immediately whether the background context is running and reachable.
@@ -55,7 +58,7 @@
     }, 5000);
     function got(label, val) {
       if (settled) return; settled = true; clearTimeout(t);
-      console.log("[bridge-cs] PROBE", label, val);
+      DBG("[bridge-cs] PROBE", label, val);
     }
     try {
       var ret = api.runtime.sendMessage({ __bridge: true, payload: { type: "ping" } }, function (resp) {

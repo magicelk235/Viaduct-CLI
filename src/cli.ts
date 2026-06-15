@@ -33,6 +33,9 @@ const BUNDLE_ID_RE = /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/;
 // Apple version strings are 1–3 dot-separated non-negative integers.
 const SAFARI_VERSION_RE = /^\d+(\.\d+){0,2}$/;
 
+// Apple Developer Team IDs are exactly 10 uppercase alphanumeric characters.
+const TEAM_ID_RE = /^[A-Z0-9]{10}$/;
+
 const HELP = `chrome2safari — convert a Chrome extension to a Safari Web Extension
 
 USAGE
@@ -257,6 +260,16 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
+  if (values.team !== undefined && values.team !== "auto" && !TEAM_ID_RE.test(values.team)) {
+    fail(`Invalid --team "${values.team}". Use a 10-character Apple Team ID (e.g. A1B2C3D4E5) or "auto".`);
+    process.exit(2);
+  }
+
+  if (values.json && !values.analyze) {
+    fail("--json is only valid with --analyze.");
+    process.exit(2);
+  }
+
   let localInput = input;
   if (isUrl(input)) {
     info(`Downloading extension from ${input} …`);
@@ -272,10 +285,6 @@ async function main(): Promise<void> {
   }
 
   if (values.analyze) process.exit(analyzeOnly(localInput, platforms, values.json, values.strict));
-  if (values.json) {
-    fail("--json is only valid with --analyze.");
-    process.exit(2);
-  }
 
   let team = values.team;
   if (team === "auto" || (team === undefined && values.install)) {

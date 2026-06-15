@@ -39,6 +39,10 @@ export function applyDnr(stageDir: string, manifest: Manifest): string[] {
   let enabledRuleCount = 0;
 
   for (const res of manifest.declarative_net_request?.rule_resources ?? []) {
+    if (!res || typeof res.path !== "string") {
+      notes.push("DNR rule_resources entry is missing a valid 'path'; Safari will fail to load it.");
+      continue;
+    }
     const file = join(stageDir, res.path);
     if (!existsSync(file)) {
       notes.push(`DNR ruleset "${res.id}" points to missing file ${res.path}; Safari will fail to load it.`);
