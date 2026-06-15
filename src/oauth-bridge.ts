@@ -112,11 +112,19 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest, chromeId?
   copyFileSync(join(TEMPLATE_DIR, BRIDGE_PAGE_CS), join(stageDir, BRIDGE_PAGE_CS));
 
   manifest.content_scripts = manifest.content_scripts ?? [];
-  // MAIN world: fake chrome.runtime in the page. Isolated world: relay to SW.
-  manifest.content_scripts.unshift(
-    { js: [BRIDGE_PAGE], matches, run_at: "document_start", all_frames: false, world: "MAIN" },
-    { js: [BRIDGE_PAGE_CS], matches, run_at: "document_start", all_frames: false }
+  // Idempotent: don't append a second pair of bridge entries if this manifest was
+  // already bridged (re-convert / retry / incremental build), which would inject
+  // the MAIN-world bridge twice.
+  const alreadyBridged = manifest.content_scripts.some(
+    (cs) => Array.isArray(cs.js) && cs.js.includes(BRIDGE_PAGE)
   );
+  if (!alreadyBridged) {
+    // MAIN world: fake chrome.runtime in the page. Isolated world: relay to SW.
+    manifest.content_scripts.unshift(
+      { js: [BRIDGE_PAGE], matches, run_at: "document_start", all_frames: false, world: "MAIN" },
+      { js: [BRIDGE_PAGE_CS], matches, run_at: "document_start", all_frames: false }
+    );
+  }
 
   // 5. page-bridge.js must be web-accessible so a getURL/script-tag fallback works
   //    on Safari versions that ignore world:"MAIN" content scripts.
