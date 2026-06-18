@@ -6,7 +6,7 @@ import { extractExtension } from "./extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths } from "./manifest.js";
 import { scanExtension } from "./analyze.js";
 import { stageExtension, stripDanglingSourcemaps } from "./stage.js";
-import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage } from "./shim.js";
+import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, deriveProxyHosts } from "./shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./oauth-bridge.js";
 import { applyDnr } from "./dnr.js";
 import { synthesizePlaceholderIcons } from "./icons.js";
@@ -15,6 +15,7 @@ import { installToSafari } from "./installer.js";
 import {
   runPackager,
   patchProjectBundleIds,
+  writeNativeProxyHandler,
   buildXcodeProject,
   verifyBuiltBundleId,
   pluginkitStatus,
@@ -95,7 +96,10 @@ export function convert(opts: ConvertOptions): ConvertResult {
     if (opts.generateShim) {
       polyfillFile = writePolyfill(stageDir);
       if (polyfillFile) ok("Bundled webextension-polyfill (browser.* promises on all browsers)");
-      shimFile = writeShim(stageDir);
+      shimFile = writeShim(stageDir, {
+        chromeOrigin: chromeId ? `chrome-extension://${chromeId}` : "",
+        proxyHosts: deriveProxyHosts(manifest),
+      });
       const n = injectShimIntoHtmlPages(stageDir, polyfillFile);
       if (n > 0) ok(`Shim${polyfillFile ? " + polyfill" : ""} injected into ${n} HTML page(s)`);
     }
@@ -185,6 +189,15 @@ export function convert(opts: ConvertOptions): ConvertResult {
 
     info("Patching bundle identifiers …");
     patchProjectBundleIds(xcodeproj, bundleId);
+
+    // Install the native HTTP proxy handler so requests to the extension's own
+    // backends can be sent with the Chrome origin (the in-browser shim can't set
+    // it). Generic: hosts/origin derived from the manifest, no-op if none.
+    const proxyHosts = deriveProxyHosts(manifest);
+    if (proxyHosts.length > 0) {
+      writeNativeProxyHandler(xcodeproj, chromeId ? `chrome-extension://${chromeId}` : "", proxyHosts);
+      ok(`Native proxy handler wired for ${proxyHosts.length} backend host(s)`);
+    }
 
     if (opts.openXcode) {
       const o = run("/usr/bin/open", ["-a", "Xcode", xcodeproj]);
