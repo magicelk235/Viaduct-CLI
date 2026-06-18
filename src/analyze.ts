@@ -253,7 +253,11 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
   addRef(manifest.devtools_page, "devtools_page");
   for (const p of arr(manifest.sandbox?.pages)) addRef(p, "sandbox.pages");
   for (const [p, where] of refs) {
-    if (!existsSync(join(extPath, p))) {
+    // HTML page references may carry a #fragment or ?query (e.g.
+    // "devpanel.html#popup"); the browser resolves those at load, so strip them
+    // before checking the file on disk or a valid page reads as "missing".
+    const filePart = p.split(/[#?]/)[0];
+    if (!existsSync(join(extPath, filePart))) {
       issues.push({
         severity: "error",
         category: "manifest",

@@ -14,6 +14,9 @@
     "build": "tsc && node -e \"require('node:fs').cpSync('src/templates','dist/templates',{recursive:true})\" && node -e \"require('node:fs').chmodSync('dist/cli.js',0o755)\"",
     "dev": "tsc --watch",
     "start": "node dist/cli.js",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test \"test/**/*.test.js\"",
+    "corpus": "npm run build && node scripts/corpus.mjs",
     "prepare": "npm run build",
     "prepublishOnly": "npm run build"
   },

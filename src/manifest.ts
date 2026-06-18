@@ -829,7 +829,10 @@ export function collectReferencedPaths(m: Manifest): Set<string> {
   const paths = new Set<string>();
   const add = (p: unknown) => {
     if (typeof p === "string" && p && !p.includes("*")) {
-      paths.add(p.replace(/^\.?\//, "").replace(/\\/g, "/"));
+      // Drop any #fragment/?query (e.g. "devpanel.html#popup") so the concrete
+      // file on disk is preserved during staging, not a phantom "…#popup" name.
+      const filePart = p.split(/[#?]/)[0];
+      if (filePart) paths.add(filePart.replace(/^\.?\//, "").replace(/\\/g, "/"));
     }
   };
   const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
