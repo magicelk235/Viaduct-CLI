@@ -150,6 +150,22 @@ export async function downloadExtension(url: string, scratchDir: string): Promis
   }
 
   const { buffer } = await httpGet(fetchUrl);
+  // Google's CRX endpoint answers 204/empty for extensions it won't serve on
+  // demand (often the largest or policy-gated ones). httpGet treats that as a
+  // successful empty body; without this guard inferKind falls back to the URL
+  // suffix, an empty file is written, and the user hits a baffling "bad magic"
+  // error deep in the extractor. Fail here with an actionable message instead.
+  // A real CRX/ZIP is always larger than its magic header.
+  if (buffer.length < 4) {
+    if (storeId) {
+      throw new Error(
+        `The Chrome Web Store returned no downloadable package for extension ${storeId} ` +
+          `(the on-demand CRX endpoint declined it — common for very large or policy-gated extensions).\n` +
+          `Download the .crx manually and pass the local file path instead.`,
+      );
+    }
+    throw new Error(`Downloaded an empty response from ${url} (no extension package returned).`);
+  }
   const kind = inferKind(buffer, storeId ? "store.crx" : url);
   const dest = join(scratchDir, `download.${kind}`);
   writeFileSync(dest, buffer);

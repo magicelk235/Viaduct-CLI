@@ -53,14 +53,17 @@ export function commandExists(cmd: string): boolean {
   return run("/usr/bin/which", [cmd]).code === 0;
 }
 
+// Diagnostics go to stderr so stdout carries only real output (e.g. the
+// --analyze --json payload). A consumer piping stdout must get clean JSON, not
+// interleaved progress lines.
 export function info(msg: string): void {
-  console.log(`${color("blue", "›")} ${msg}`);
+  console.error(`${color("blue", "›")} ${msg}`);
 }
 export function ok(msg: string): void {
-  console.log(`${color("green", "✓")} ${msg}`);
+  console.error(`${color("green", "✓")} ${msg}`);
 }
 export function warn(msg: string): void {
-  console.log(`${color("yellow", "!")} ${msg}`);
+  console.error(`${color("yellow", "!")} ${msg}`);
 }
 export function fail(msg: string): void {
   console.error(`${color("red", "✗")} ${msg}`);
