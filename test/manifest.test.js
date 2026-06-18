@@ -37,6 +37,8 @@ test("matchPatternError accepts valid patterns", () => {
   assert.equal(matchPatternError("https://*.example.com/*"), null);
   assert.equal(matchPatternError("*://*/*"), null);
   assert.equal(matchPatternError("file:///Users/*"), null);
+  assert.equal(matchPatternError("file://*/*"), null, "wildcard-host file pattern");
+  assert.equal(matchPatternError("file://*/*.png"), null, "wildcard-host file pattern with ext");
 });
 
 test("matchPatternError rejects malformed patterns", () => {

@@ -88,8 +88,10 @@ export function applyDnr(stageDir: string, manifest: Manifest): string[] {
 
   if (needsAnthropicCorsBypass(manifest)) {
     notes.push(
-      "api.anthropic.com calls hit an org CORS gate that cannot be bypassed in-browser; " +
-        "no DNR ruleset shipped (a modifyHeaders rule crashes Safari). Use a native-messaging proxy."
+      "api.anthropic.com calls hit an org CORS gate that cannot be bypassed in-browser " +
+        "(no DNR modifyHeaders — it crashes Safari). The shim now retries blocked backend " +
+        "requests through the native host (SafariWebExtensionHandler), which sets the Chrome " +
+        "Origin server-side. Requires the nativeMessaging permission (present here)."
     );
   }
   return notes;

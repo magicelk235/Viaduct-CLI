@@ -117,7 +117,7 @@ export const UNSUPPORTED_PERMISSIONS: Record<string, string> = {
   identity: "Safari lacks chrome.identity; use a hosted web OAuth2 flow + window.postMessage.",
   debugger: "chrome.debugger (CDP) is unsupported; build a Web Inspector Extension (devtools_page).",
   sidePanel: "Safari has no sidePanel API; falling back to an action popup.",
-  tabGroups: "Safari has no tabGroups API.",
+  tabGroups: "Safari has no native tabGroups API; the shim emulates it in memory (no tab-bar coloring).",
   offscreen: "Safari has no offscreen documents API; use the service worker or web workers.",
   webRequestBlocking: "Blocking webRequest is unsupported; use declarativeNetRequest.",
   gcm: "chrome.gcm is Chrome-only; relay via APNs in the host app or poll with chrome.alarms.",
@@ -390,9 +390,12 @@ export function matchPatternError(pattern: string): string | null {
   if (!MATCH_SCHEMES.has(scheme)) return `unsupported scheme "${scheme}"`;
   const rest = m[2];
 
-  // file:// has no host: everything after :// is the path.
+  // file:// is host-less, but Chrome accepts an optional "*" host placeholder
+  // before the path (e.g. "file://*/*" is extremely common). Strip a leading
+  // "*" so both "file:///path" (empty host) and "file://*/path" validate.
   if (scheme === "file") {
-    return rest.startsWith("/") ? null : "file:// pattern path must start with '/'";
+    const path = rest.startsWith("*") ? rest.slice(1) : rest;
+    return path.startsWith("/") ? null : "file:// pattern path must start with '/'";
   }
 
   const slash = rest.indexOf("/");
