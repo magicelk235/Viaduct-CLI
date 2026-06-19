@@ -1,0 +1,60 @@
+name: Converted but broken
+description: The extension converted successfully but doesn't work as expected in Safari
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The extension converted without errors but behaves incorrectly in Safari. Describe what should happen and what actually happens.
+
+  - type: input
+    id: extension
+    attributes:
+      label: Extension
+      description: Chrome Web Store URL or name + version
+      placeholder: "e.g. uBlock Origin 1.59.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should the extension do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What does it do instead? Include Safari console errors if any.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Convert the extension with `viaduct ...`
+        2. Load in Safari
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: viaduct-version
+    attributes:
+      label: Viaduct version
+      placeholder: "viaduct --version"
+    validations:
+      required: true
+
+  - type: input
+    id: safari-version
+    attributes:
+      label: Safari & macOS version
+      placeholder: "e.g. Safari 18.2, macOS 15.2"
+    validations:
+      required: true

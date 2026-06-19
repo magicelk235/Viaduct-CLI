@@ -1,0 +1,42 @@
+name: Conversion Failure
+description: The extension failed to convert
+labels: ["conversion-failure"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please attach or link to the Chrome extension (`.zip` or Chrome Web Store URL) and paste the full error output below.
+
+  - type: input
+    id: extension
+    attributes:
+      label: Extension
+      description: Chrome Web Store URL or name + version (attach the .zip if possible)
+      placeholder: "e.g. uBlock Origin 1.59.0 / https://chromewebstore.google.com/..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: Error output
+      description: Paste the full terminal output including the error message
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: viaduct-version
+    attributes:
+      label: Viaduct version
+      placeholder: "viaduct --version"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS & Xcode version
+      placeholder: "e.g. macOS 15.2, Xcode 16.2"
+    validations:
+      required: true
