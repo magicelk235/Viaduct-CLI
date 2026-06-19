@@ -1,27 +1,25 @@
 name: Publish to npm
 
-# Publishes when you cut a GitHub Release. Tag the release vX.Y.Z to match
-# package.json's version — the build runs via the "prepare" script on npm publish.
+# Publishes when you cut a GitHub Release. Tag vX.Y.Z to match package.json.
+# Auth is npm Trusted Publishing (OIDC) — no NPM_TOKEN secret. The trust is
+# configured on npmjs.com for magicelk235/Viaduct-CLI + this workflow file.
 on:
   release:
     types: [published]
 
+permissions:
+  id-token: write # required for OIDC
+  contents: read
+
 jobs:
   publish:
-    runs-on: macos-latest # package declares os:darwin; npm ci rejects linux
-    permissions:
-      contents: read
-      id-token: write # npm provenance
+    runs-on: macos-latest # package is os:darwin; npm ci rejects linux
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-      # No registry-url: that makes setup-node write an .npmrc wired for token
-      # auth (NODE_AUTH_TOKEN), which shadows OIDC and 404s. Trusted Publishing
-      # needs pure OIDC — just id-token:write above + npm >= 11.5.1.
-      - run: npm install -g npm@latest
-      - run: npm --version
+          node-version: 24 # OIDC needs >= 22.14; npm bundled here is >= 11.5.1
+          registry-url: https://registry.npmjs.org
       - run: npm ci
       - run: npm test
       - run: npm publish --provenance --access public
