@@ -56,6 +56,18 @@ test("scanExtension errors when _locales exists but default_locale is absent", (
   assert.ok(has(issues, /_locales\/ is present but default_locale is missing/));
 });
 
+test("scanExtension flags a hardcoded chrome://extensions/shortcuts link", () => {
+  const dir = fixture({ "opt.js": 'a.href = "chrome://extensions/shortcuts";' });
+  const issues = scanExtension(dir, { manifest_version: 3 }, "macos");
+  assert.ok(has(issues, /has no Safari equivalent.*chrome/i));
+});
+
+test("scanExtension does not flag chrome.action / chrome.runtime as a chrome:// link", () => {
+  const dir = fixture({ "bg.js": "chrome.action.setBadgeText({}); chrome.runtime.getURL('x');" });
+  const issues = scanExtension(dir, { manifest_version: 3 }, "macos");
+  assert.equal(issues.filter((i) => /no Safari equivalent.*chrome:\/\//.test(i.message)).length, 0);
+});
+
 test("scanExtension stays quiet on a clean extension (no false positives)", () => {
   const dir = fixture({
     "icon.png": "PNG",
