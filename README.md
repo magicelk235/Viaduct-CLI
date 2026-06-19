@@ -1,4 +1,17 @@
+<div align="center">
+
+<img src="icon.png" alt="Viaduct" width="160">
+
+```
+  __    __    __
+ /  \  /  \  /  \
+ |  |  |  |  |  |
+ |  |  |  |  |  |
+```
+
 # Viaduct
+
+</div>
 
 A command-line tool that converts a Google Chrome extension into a Safari Web
 Extension ready for local development, ad-hoc testing, or an Xcode/TestFlight
