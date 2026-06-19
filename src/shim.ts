@@ -1611,7 +1611,7 @@ export function injectShimIntoHtmlPages(dir: string, polyfillFile?: string): num
  * window because they carry no intrinsic size. Inject a sizing style so the popup
  * opens at usable dimensions. style-src allows 'unsafe-inline' in typical MV3 CSPs.
  */
-export function injectPopupSizing(dir: string, popupFile: string, fullPage = false): void {
+export function injectPopupSizing(dir: string, popupFile: string): void {
   const file = join(dir, popupFile);
   let html: string;
   try {
@@ -1624,29 +1624,22 @@ export function injectPopupSizing(dir: string, popupFile: string, fullPage = fal
   // color-scheme lets Safari paint the popup canvas in the OS theme *before* the
   // app's CSS/JS boots — without it the popover flashes light even in dark mode.
   //
-  // Sizing must survive the app's OWN stylesheet, which loads AFTER this <style>
-  // and often sets html/body rules (e.g. Tampermonkey's `body{margin:auto}` would
-  // otherwise win the cascade and offset the popover). So:
-  //  - !important on the structural props so a later equal-specificity app rule
-  //    can't override them (margin:auto offset, a stray width/height, etc.).
-  //  - Don't hard-pin height. A fixed 600px gives a huge half-empty popover for a
-  //    short command menu, and a popup whose body is empty at load and grown by JS
-  //    (Tampermonkey's action menu) gets clipped inside a fixed box. Instead let
-  //    height fit content (min-height floor for the empty-at-load case, max-height
-  //    cap so it never exceeds Safari's popover ceiling and scrolls past it).
-  //  - Width keeps a min floor (empty-at-load popups have no intrinsic width) but
-  //    grows to content up to a cap, so wide menus aren't squeezed to 400px.
-  //  - fullPage: the popup is a full app UI (a page wired as BOTH action popup AND
-  //    side_panel — Claude's sidepanel.html). Fit-content caps would CLIP it, so it
-  //    must FILL the popover at a generous fixed size and manage its own scrolling.
-  const sizeRules = fullPage
-    ? `html,body{margin:0!important;width:780px!important;height:600px!important;` +
-      `min-width:780px!important;min-height:600px!important;box-sizing:border-box!important;overflow:auto!important;}`
-    : `html{margin:0!important;}` +
-      `body{margin:0!important;min-width:360px!important;width:max-content!important;max-width:780px!important;` +
-      `min-height:200px!important;max-height:600px!important;height:auto!important;` +
-      `box-sizing:border-box!important;overflow:auto!important;}`;
-  const style = `<style id="${marker}">:root{color-scheme:light dark;}${sizeRules}</style>`;
+  // The ONLY job here is to stop a popover collapsing to nothing when the page
+  // carries no intrinsic size (empty <body> filled by JS) — NOT to dictate size.
+  // An extension knows its own dimensions; overriding them with !important fixed
+  // sizes makes correctly-sized popups too big/small (Urban VPN's app forced to
+  // 780x600). So:
+  //  - margin:0 !important — the one override worth forcing: a stray app
+  //    `body{margin:auto}` (Tampermonkey) offsets the popover otherwise.
+  //  - min-width/min-height as a FLOOR only, NO !important — a non-important rule
+  //    that loses to any size the app's own CSS sets, so it only takes effect when
+  //    the app declares nothing (the empty-at-load case). No fixed width/height,
+  //    no max caps: the popover follows the content/app, Safari clamps the ceiling.
+  // ponytail: floor-only; if some app still opens too small add a per-extension
+  // size override, don't reintroduce a global fixed size.
+  const style = `<style id="${marker}">:root{color-scheme:light dark;}` +
+    `html,body{margin:0!important;}` +
+    `body{min-width:320px;min-height:160px;}</style>`;
   const headMatch = html.match(/<head[^>]*>/i);
   if (headMatch) {
     const at = headMatch.index! + headMatch[0].length;
