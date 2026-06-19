@@ -8,7 +8,7 @@ on:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest # package declares os:darwin; npm ci rejects linux
     permissions:
       contents: read
       id-token: write # npm provenance
