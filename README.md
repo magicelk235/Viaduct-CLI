@@ -75,6 +75,12 @@ Apple's `safari-web-extension-packager` and `xcodebuild` to produce a signed app
     `getAcceptLanguages` without clobbering Safari's native `getMessage`), so
     code that calls the Safari-missing `detectLanguage` degrades to `und`
     instead of throwing.
+  - Makes keyboard-shortcut management work without `chrome://extensions/
+    shortcuts` (which Safari lacks): `chrome.commands.getAll()` is rebuilt from
+    the manifest so an extension's own shortcut UI is populated, and a navigation
+    to `chrome://extensions/shortcuts` (or `chrome://settings`) is swallowed
+    instead of opening a broken tab. Shortcuts are edited in Safari → Settings →
+    Extensions; the analyzer warns when source hardcodes such a link.
 - Auto-sizes side-panel pages wired as the action popup so the popup is not a
   collapsed, tiny window.
 - Stages a clean copy that drops dev cruft (`*.map`, `*.ts`, `README`, lockfiles,
