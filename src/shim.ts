@@ -1623,7 +1623,24 @@ export function injectPopupSizing(dir: string, popupFile: string): void {
   if (html.includes(marker)) return;
   // color-scheme lets Safari paint the popup canvas in the OS theme *before* the
   // app's CSS/JS boots — without it the popover flashes light even in dark mode.
-  const style = `<style id="${marker}">:root{color-scheme:light dark;}html,body{min-width:400px;width:400px;min-height:600px;height:600px;margin:0;overflow:auto;}</style>`;
+  //
+  // Sizing must survive the app's OWN stylesheet, which loads AFTER this <style>
+  // and often sets html/body rules (e.g. Tampermonkey's `body{margin:auto}` would
+  // otherwise win the cascade and offset the popover). So:
+  //  - !important on the structural props so a later equal-specificity app rule
+  //    can't override them (margin:auto offset, a stray width/height, etc.).
+  //  - Don't hard-pin height. A fixed 600px gives a huge half-empty popover for a
+  //    short command menu, and a popup whose body is empty at load and grown by JS
+  //    (Tampermonkey's action menu) gets clipped inside a fixed box. Instead let
+  //    height fit content (min-height floor for the empty-at-load case, max-height
+  //    cap so it never exceeds Safari's popover ceiling and scrolls past it).
+  //  - Width keeps a min floor (empty-at-load popups have no intrinsic width) but
+  //    grows to content up to a cap, so wide menus aren't squeezed to 400px.
+  const style = `<style id="${marker}">:root{color-scheme:light dark;}` +
+    `html{margin:0!important;}` +
+    `body{margin:0!important;min-width:360px!important;width:max-content!important;max-width:780px!important;` +
+    `min-height:200px!important;max-height:600px!important;height:auto!important;` +
+    `box-sizing:border-box!important;overflow:auto!important;}</style>`;
   const headMatch = html.match(/<head[^>]*>/i);
   if (headMatch) {
     const at = headMatch.index! + headMatch[0].length;
