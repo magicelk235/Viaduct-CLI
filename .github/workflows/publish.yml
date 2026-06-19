@@ -18,8 +18,10 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
+      # Trusted Publishing (OIDC): no NPM_TOKEN. npm authenticates via the
+      # id-token below, granted to the configured GitHub repo+workflow on npmjs.com.
+      # Requires npm CLI >= 11.5.1.
+      - run: npm install -g npm@latest
       - run: npm ci
       - run: npm test
       - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
