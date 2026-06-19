@@ -64,6 +64,17 @@ var __C2S_PROXY_CONFIG__ = ${proxyCfg};
     return { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } };
   }
 
+  // importScripts() in the SW bundle is handled at STAGING time (the imported
+  // files are hoisted into background.html as classic <script> tags before the SW
+  // module, and the calls are neutralized) — see convertServiceWorkerToBackgroundPage.
+  // A runtime polyfill can't help: the default extension CSP is script-src 'self',
+  // which forbids eval(), so a fetch+eval importScripts throws EvalError and the SW
+  // still aborts before its onConnect listeners register. Defining a no-op here as a
+  // belt-and-suspenders guard for any call the staging rewrite missed.
+  if (typeof self !== "undefined" && typeof self.importScripts !== "function") {
+    try { self.importScripts = function () {}; } catch (e) {}
+  }
+
   // Chrome exposes runtime lifecycle event objects that Safari omits. The SW
   // bundle reads chrome.runtime.<event>.addListener at module-eval; a missing one
   // throws a TypeError that aborts module evaluation BEFORE onMessageExternal is
@@ -1639,13 +1650,74 @@ export function convertServiceWorkerToBackgroundPage(dir: string, manifest: Mani
   const polyTag = polyfillFile && existsSync(join(dir, polyfillFile)) ? `<script src="${polyfillFile}"></script>\n` : "";
   // --no-shim conversions have no shim file; don't reference a missing script.
   const shimTag = existsSync(join(dir, SHIM_FILENAME)) ? `<script src="${SHIM_FILENAME}"></script>\n` : "";
+
+  // importScripts() is undefined in a module background page, so the first call
+  // throws and aborts SW evaluation BEFORE its onConnect/onMessage listeners
+  // register (→ popup's runtime.connect() gets "No onConnect listeners found").
+  // The default extension CSP is script-src 'self' (no eval), so a runtime
+  // fetch+eval polyfill can't substitute. Instead hoist each importScripts target
+  // into background.html as a classic <script> BEFORE the SW module (the imported
+  // files are self-contained IIFEs that just need to run in global scope first —
+  // exactly what a prior <script> tag gives), then neutralize the calls in the SW
+  // so the now-undefined global is never invoked. CSP-safe and generic.
+  const importTags = hoistImportScripts(dir, sw);
+
   const html = `<!DOCTYPE html>
 <meta charset="utf-8">
 <title>${manifest.name ?? "Extension"} background</title>
-${polyTag}${shimTag}<script type="module" src="${sw}"></script>
+${polyTag}${shimTag}${importTags}<script type="module" src="${sw}"></script>
 `;
   writeFileSync(join(dir, BACKGROUND_PAGE_FILENAME), html, "utf-8");
   // MV3 (Safari) rejects persistent background: "A manifest_version >= 3 must be non-persistent."
   manifest.background = { page: BACKGROUND_PAGE_FILENAME, persistent: false };
   return true;
+}
+
+/**
+ * Find importScripts("a.js", "b.js") calls in the SW bundle, resolve each path
+ * relative to the SW file, and return <script src="..."> tags for the ones that
+ * exist on disk (root-relative so they resolve from background.html). The calls
+ * themselves are replaced in the SW source with a void 0 no-op so the undefined
+ * worker global is never invoked. Paths are resolved against the SW's directory;
+ * the emitted src is relative to the extension root (where background.html lives).
+ * Returns "" when there are no resolvable importScripts calls.
+ */
+function hoistImportScripts(dir: string, swPath: string): string {
+  const swFile = join(dir, swPath);
+  let src: string;
+  try {
+    src = readFileSync(swFile, "utf-8");
+  } catch {
+    return "";
+  }
+  if (!/\bimportScripts\s*\(/.test(src)) return "";
+
+  const swDir = dirname(swPath); // e.g. "service-worker"
+  const tags: string[] = [];
+  const seen = new Set<string>();
+  // Match importScripts( "..."/'...' [, "..."]* ) — string-literal args only
+  // (dynamic args can't be statically hoisted; the no-op below still prevents the
+  // throw). Each whole call is replaced once neutralized.
+  const callRe = /\bimportScripts\s*\(([^)]*)\)/g;
+  let neutralized = 0;
+  src = src.replace(callRe, (_full, argList: string) => {
+    neutralized++;
+    const argRe = /["']([^"']+)["']/g;
+    let m: RegExpExecArray | null;
+    while ((m = argRe.exec(argList))) {
+      const rawPath = m[1];
+      // Resolve relative to the SW dir → a path from the extension root.
+      const fromRoot = join(swDir, rawPath).split("\\").join("/");
+      if (seen.has(fromRoot)) continue;
+      if (!existsSync(join(dir, fromRoot))) continue; // unresolved → skip the tag; no-op still applies
+      seen.add(fromRoot);
+      tags.push(`<script src="${fromRoot}"></script>`);
+    }
+    return "void 0 /* importScripts hoisted to background.html */";
+  });
+
+  // Write whenever ANY call was neutralized — even an unresolved target must be
+  // de-fanged (it would throw on the undefined global), not just hoisted ones.
+  if (neutralized > 0) writeFileSync(swFile, src, "utf-8");
+  return tags.length ? tags.join("\n") + "\n" : "";
 }
