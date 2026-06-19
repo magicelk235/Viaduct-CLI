@@ -17,11 +17,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
-      # Trusted Publishing (OIDC): no NPM_TOKEN. npm authenticates via the
-      # id-token below, granted to the configured GitHub repo+workflow on npmjs.com.
-      # OIDC token exchange requires npm CLI >= 11.5.1, newer than what ships
-      # with node 22 — upgrade first, then publish with the upgraded binary.
+      # No registry-url: that makes setup-node write an .npmrc wired for token
+      # auth (NODE_AUTH_TOKEN), which shadows OIDC and 404s. Trusted Publishing
+      # needs pure OIDC — just id-token:write above + npm >= 11.5.1.
       - run: npm install -g npm@latest
       - run: npm --version
       - run: npm ci
