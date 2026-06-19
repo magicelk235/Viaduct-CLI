@@ -20,6 +20,15 @@ jobs:
         with:
           node-version: 24 # OIDC needs >= 22.14; npm bundled here is >= 11.5.1
           registry-url: https://registry.npmjs.org
+      # setup-node writes an .npmrc with `_authToken=${NODE_AUTH_TOKEN}`. With no
+      # token secret that line resolves empty and overrides OIDC at PUT time → 404.
+      # Strip auth lines so npm uses the OIDC credential it gets for provenance.
+      - name: Strip token auth from generated .npmrc (use OIDC, not token)
+        run: |
+          for f in "$NPM_CONFIG_USERCONFIG" "$HOME/.npmrc" "$RUNNER_TEMP/.npmrc"; do
+            [ -f "$f" ] && grep -v -e '_authToken' -e 'always-auth' "$f" > "$f.tmp" && mv "$f.tmp" "$f" && echo "cleaned $f"
+          done
+          true
       - run: npm ci
       - run: npm test
       - run: npm publish --provenance --access public
