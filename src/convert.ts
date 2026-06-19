@@ -131,7 +131,20 @@ export function convert(opts: ConvertOptions): ConvertResult {
 
     writeManifest(stageDir, transformed);
     const popupFile = (transformed.action ?? transformed.browser_action)?.default_popup;
-    if (popupFile) injectPopupSizing(stageDir, popupFile);
+    if (popupFile) {
+      // A full app UI wired as the action popup (vs. a small menu) must FILL the
+      // popover, not fit-content with caps that clip it (Claude's sidepanel.html
+      // was getting cut off). Two signals mark a full page: it's also the
+      // side_panel page, OR its filename is a panel/sidepanel/index page (which is
+      // exactly what the manifest converter auto-wires when no popup exists).
+      const panelPath = transformed.side_panel?.default_path;
+      const stripFrag = (p?: string) => (typeof p === "string" ? p.split(/[#?]/)[0].replace(/^\//, "") : p);
+      const base = stripFrag(popupFile) ?? "";
+      const isFullPage =
+        (!!panelPath && stripFrag(panelPath) === base) ||
+        /(^|\/)(side[_-]?panel|sidepanel|panel|index)\.html$/i.test(base);
+      injectPopupSizing(stageDir, popupFile, isFullPage);
+    }
     result.stagedPath = stageDir;
     ok(`Staged → ${stageDir}`);
 

@@ -1611,7 +1611,7 @@ export function injectShimIntoHtmlPages(dir: string, polyfillFile?: string): num
  * window because they carry no intrinsic size. Inject a sizing style so the popup
  * opens at usable dimensions. style-src allows 'unsafe-inline' in typical MV3 CSPs.
  */
-export function injectPopupSizing(dir: string, popupFile: string): void {
+export function injectPopupSizing(dir: string, popupFile: string, fullPage = false): void {
   const file = join(dir, popupFile);
   let html: string;
   try {
@@ -1636,11 +1636,17 @@ export function injectPopupSizing(dir: string, popupFile: string): void {
   //    cap so it never exceeds Safari's popover ceiling and scrolls past it).
   //  - Width keeps a min floor (empty-at-load popups have no intrinsic width) but
   //    grows to content up to a cap, so wide menus aren't squeezed to 400px.
-  const style = `<style id="${marker}">:root{color-scheme:light dark;}` +
-    `html{margin:0!important;}` +
-    `body{margin:0!important;min-width:360px!important;width:max-content!important;max-width:780px!important;` +
-    `min-height:200px!important;max-height:600px!important;height:auto!important;` +
-    `box-sizing:border-box!important;overflow:auto!important;}</style>`;
+  //  - fullPage: the popup is a full app UI (a page wired as BOTH action popup AND
+  //    side_panel — Claude's sidepanel.html). Fit-content caps would CLIP it, so it
+  //    must FILL the popover at a generous fixed size and manage its own scrolling.
+  const sizeRules = fullPage
+    ? `html,body{margin:0!important;width:780px!important;height:600px!important;` +
+      `min-width:780px!important;min-height:600px!important;box-sizing:border-box!important;overflow:auto!important;}`
+    : `html{margin:0!important;}` +
+      `body{margin:0!important;min-width:360px!important;width:max-content!important;max-width:780px!important;` +
+      `min-height:200px!important;max-height:600px!important;height:auto!important;` +
+      `box-sizing:border-box!important;overflow:auto!important;}`;
+  const style = `<style id="${marker}">:root{color-scheme:light dark;}${sizeRules}</style>`;
   const headMatch = html.match(/<head[^>]*>/i);
   if (headMatch) {
     const at = headMatch.index! + headMatch[0].length;
