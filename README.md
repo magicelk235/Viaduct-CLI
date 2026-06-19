@@ -1,4 +1,4 @@
-# chrome2safari
+# Viaduct
 
 A command-line tool that converts a Google Chrome extension into a Safari Web
 Extension ready for local development, ad-hoc testing, or an Xcode/TestFlight
@@ -78,7 +78,7 @@ Apple's `safari-web-extension-packager` and `xcodebuild` to produce a signed app
 Run the built-in toolchain check at any time:
 
 ```
-chrome2safari --doctor
+viaduct --doctor
 ```
 
 ## Install and build
@@ -100,7 +100,7 @@ Or link it as a global command:
 
 ```
 npm link
-chrome2safari <input> [options]
+viaduct <input> [options]
 ```
 
 ## Usage
@@ -108,25 +108,25 @@ chrome2safari <input> [options]
 Convert straight from a Chrome Web Store link (the CRX is downloaded for you):
 
 ```
-chrome2safari "https://chromewebstore.google.com/detail/ublock-origin/cjpalhdlnbpafiamejdnhcphjbkeiagm"
+viaduct "https://chromewebstore.google.com/detail/ublock-origin/cjpalhdlnbpafiamejdnhcphjbkeiagm"
 ```
 
 A direct `.crx` or `.zip` download URL works too:
 
 ```
-chrome2safari "https://example.com/my-extension.crx"
+viaduct "https://example.com/my-extension.crx"
 ```
 
 Analyze an extension and report issues without converting:
 
 ```
-chrome2safari ./my-extension.zip --analyze
+viaduct ./my-extension.zip --analyze
 ```
 
 Stage for Safari 18+ "Add Temporary Extension" (no Xcode, fastest iteration):
 
 ```
-chrome2safari ./my-extension.zip --temp-load
+viaduct ./my-extension.zip --temp-load
 ```
 
 Then in Safari: Settings, Advanced, enable "Show features for web developers";
@@ -137,13 +137,13 @@ re-added after each Safari restart.
 Generate an Xcode project without building:
 
 ```
-chrome2safari ./my-extension.zip --no-build
+viaduct ./my-extension.zip --no-build
 ```
 
 Full conversion and ad-hoc build (CI/TestFlight-safe clean copy):
 
 ```
-chrome2safari ./my-extension.zip --ci
+viaduct ./my-extension.zip --ci
 ```
 
 The default (without `--ci`) symlinks resources for live development edits; use
@@ -153,7 +153,7 @@ The default (without `--ci`) symlinks resources for live development edits; use
 
 ```
 -o, --output <dir>      Output directory (default: ./<AppName>_Safari)
-    --bundle-id <id>    Reverse-DNS bundle id (default: com.chrome2safari.<app>)
+    --bundle-id <id>    Reverse-DNS bundle id (default: com.viaduct.<app>)
     --app-name <name>   Host app name (default: extension name)
     --min-safari <ver>  Safari strict_min_version (default: 15.4; use 18.4 for world:MAIN)
     --platforms <p>     all | macos | ios            (default: macos)
@@ -179,7 +179,7 @@ The default (without `--ci`) symlinks resources for live development edits; use
     --doctor            Verify xcrun/packager/xcodebuild availability
 -v, --verbose           Verbose output
 -h, --help              Show this help
-    --version           Print the chrome2safari version and exit
+    --version           Print the viaduct version and exit
 ```
 
 ## Installing a built app
@@ -189,7 +189,7 @@ duplicate copy left behind), registers it with LaunchServices, and launches it
 once so Safari registers the extension:
 
 ```
-chrome2safari ./my-extension.zip --install
+viaduct ./my-extension.zip --install
 ```
 
 Then enable the extension in Safari, Settings, Extensions.
@@ -198,8 +198,8 @@ To remove a previously installed app, unregister it from LaunchServices and
 delete it from the install directory:
 
 ```
-chrome2safari --uninstall <AppName>                       # ~/Applications
-chrome2safari --uninstall <AppName> --install-dir <dir>   # custom directory
+viaduct --uninstall <AppName>                       # ~/Applications
+viaduct --uninstall <AppName> --install-dir <dir>   # custom directory
 ```
 
 ### Persisting across Safari restarts (team signing)
@@ -217,9 +217,9 @@ How the extension persists depends on how it was signed:
 do not need to know or type it:
 
 ```
-chrome2safari ./my-extension.zip --install            # auto-detects the team
-chrome2safari ./my-extension.zip --install --team auto # same, explicit
-chrome2safari ./my-extension.zip --install --team V8K8L3ZSD5  # exact id
+viaduct ./my-extension.zip --install            # auto-detects the team
+viaduct ./my-extension.zip --install --team auto # same, explicit
+viaduct ./my-extension.zip --install --team V8K8L3ZSD5  # exact id
 ```
 
 Auto-detection reads the team cached by Xcode (`IDEProvisioningTeamByIdentifier`
