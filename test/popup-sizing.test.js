@@ -1,6 +1,7 @@
-// injectPopupSizing must produce a style that survives the app's OWN stylesheet
-// (which loads after it) — the Tampermonkey case where body{margin:auto} and an
-// empty-at-load body gave a tiny/offset popover.
+// injectPopupSizing provides a size FLOOR only — it must not dictate the popup's
+// size (the app knows its own). It forces only margin:0 (Tampermonkey's
+// body{margin:auto} would otherwise offset the popover) and a non-important
+// min-width/min-height so an empty-at-load body doesn't collapse.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
@@ -8,40 +9,32 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { injectPopupSizing } from "../dist/shim.js";
 
-function size(html, fullPage = false) {
+function size(html) {
   const dir = mkdtempSync(join(tmpdir(), "c2s-popup-"));
   writeFileSync(join(dir, "action.html"), html);
-  injectPopupSizing(dir, "action.html", fullPage);
+  injectPopupSizing(dir, "action.html");
   const out = readFileSync(join(dir, "action.html"), "utf-8");
   rmSync(dir, { recursive: true, force: true });
   return out;
 }
 
-test("popup sizing: structural props are !important so app CSS can't override", () => {
-  // Mirrors Tampermonkey: empty body, app stylesheet loaded after, sets body margin.
+test("popup sizing: margin reset is !important, size floor is NOT", () => {
   const out = size('<!doctype html><html><head><link href="style.css" rel="stylesheet"></head><body></body></html>');
   const style = out.match(/<style id="c2s-popup-size">([^<]*)<\/style>/)[1];
-  // margin reset wins over a later author rule only if it is !important.
+  // margin:0 must win over a later app body{margin:auto}.
   assert.match(style, /margin:0!important/);
-  // height fits content (not a hard 600px box that clips JS-grown menus).
-  assert.match(style, /height:auto!important/);
-  assert.match(style, /max-height:\d+px!important/);
-  // width has a floor (empty-at-load) but grows to content.
-  assert.match(style, /min-width:\d+px!important/);
-  assert.match(style, /width:max-content!important/);
-  // injected BEFORE the app stylesheet so later !important-free rules still lose.
-  assert.ok(out.indexOf("c2s-popup-size") < out.indexOf("style.css"));
-});
-
-test("popup sizing: fullPage fills the popover instead of fitting content", () => {
-  // Claude's sidepanel.html wired as the action popup — must fill, not clip.
-  const out = size('<head><link href="app.css" rel="stylesheet"></head><body></body>', true);
-  const style = out.match(/<style id="c2s-popup-size">([^<]*)<\/style>/)[1];
-  assert.match(style, /width:780px!important/);
-  assert.match(style, /height:600px!important/);
-  // fit-content tokens must NOT appear in full-page mode (they were clipping it).
+  // a min floor exists so an empty body doesn't collapse,
+  assert.match(style, /min-width:\d+px/);
+  assert.match(style, /min-height:\d+px/);
+  // but the floor must NOT be !important — the app's own size must win.
+  assert.doesNotMatch(style, /min-width:\d+px!important/);
+  // and we must NOT pin a fixed width/height that overrides the app.
+  assert.doesNotMatch(style, /[^-]width:\d+px/); // no `width:NNNpx` (min-width is fine)
+  assert.doesNotMatch(style, /[^-]height:\d+px/);
+  assert.doesNotMatch(style, /max-width/);
   assert.doesNotMatch(style, /max-content/);
-  assert.doesNotMatch(style, /height:auto/);
+  // injected BEFORE the app stylesheet.
+  assert.ok(out.indexOf("c2s-popup-size") < out.indexOf("style.css"));
 });
 
 test("popup sizing: idempotent (no double inject)", () => {
