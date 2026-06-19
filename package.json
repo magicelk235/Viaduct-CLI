@@ -1,6 +1,9 @@
 {
-  "name": "viaduct",
+  "name": "@magicelk235/viaduct",
   "version": "1.2.6",
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Convert a Chrome extension into a Safari Web Extension (macOS/iOS) ready for local dev or CI/CD.",
   "type": "module",
   "bin": {
