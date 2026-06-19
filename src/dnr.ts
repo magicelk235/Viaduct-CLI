@@ -43,27 +43,28 @@ export function applyDnr(stageDir: string, manifest: Manifest): string[] {
       notes.push("DNR rule_resources entry is missing a valid 'path'; Safari will fail to load it.");
       continue;
     }
+    const id = res.id ?? res.path;
     const file = join(stageDir, res.path);
     if (!existsSync(file)) {
-      notes.push(`DNR ruleset "${res.id}" points to missing file ${res.path}; Safari will fail to load it.`);
+      notes.push(`DNR ruleset "${id}" points to missing file ${res.path}; Safari will fail to load it.`);
       continue;
     }
     let rules: unknown;
     try {
       rules = JSON.parse(readFileSync(file, "utf-8"));
     } catch {
-      notes.push(`DNR ruleset "${res.id}" (${res.path}) is not valid JSON; Safari will fail to load it.`);
+      notes.push(`DNR ruleset "${id}" (${res.path}) is not valid JSON; Safari will fail to load it.`);
       continue;
     }
     if (!Array.isArray(rules)) {
-      notes.push(`DNR ruleset "${res.id}" (${res.path}) is not a JSON array of rules; Safari will fail to load it.`);
+      notes.push(`DNR ruleset "${id}" (${res.path}) is not a JSON array of rules; Safari will fail to load it.`);
       continue;
     }
     const safe = (rules as DnrRule[]).filter((r) => r?.action?.type !== "modifyHeaders");
     if (safe.length !== rules.length) {
       writeFileSync(file, JSON.stringify(safe, null, 2) + "\n", "utf-8");
       notes.push(
-        `Stripped ${rules.length - safe.length} modifyHeaders rule(s) from DNR ruleset "${res.id}" — ` +
+        `Stripped ${rules.length - safe.length} modifyHeaders rule(s) from DNR ruleset "${id}" — ` +
           "modifyHeaders crashes Safari's DNR rule store; other rules kept."
       );
     }
@@ -73,7 +74,7 @@ export function applyDnr(stageDir: string, manifest: Manifest): string[] {
     const regexRules = safe.filter((r) => r?.condition?.regexFilter != null).length;
     if (regexRules > 0) {
       notes.push(
-        `DNR ruleset "${res.id}" has ${regexRules} regexFilter rule(s); Safari supports a limited regex ` +
+        `DNR ruleset "${id}" has ${regexRules} regexFilter rule(s); Safari supports a limited regex ` +
           "subset and silently drops rules it cannot compile. Prefer urlFilter where possible and test each rule."
       );
     }
