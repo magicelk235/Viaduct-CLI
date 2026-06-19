@@ -87,6 +87,11 @@ const FAVICON_RE = /chrome:\/\/favicon|[/'"]_favicon\//;
 // breaks (wrong origin → resource 404 / blocked). Match the 32-char a–p id form
 // precisely to avoid flagging chrome-extension:// joined with a variable.
 const HARDCODED_EXT_URL_RE = /chrome-extension:\/\/[a-p]{32}\b/;
+// A hardcoded chrome://extensions/shortcuts (or chrome://settings) link. Extensions
+// open these to let users rebind keys / change settings, but neither page exists in
+// Safari — the navigation just errors. The shim swallows it at runtime, but the
+// author still needs to add their own "edit in Safari → Settings → Extensions" UI.
+const CHROME_SETTINGS_URL_RE = /chrome:\/\/(extensions|settings)\b/;
 const BLOCKING_WEBREQUEST_RE = /chrome\.webRequest\.on\w+/;
 const TIMER_RE = /(setTimeout|setInterval)\s*\(/;
 const BACKGROUND_FILE_RE = /(background|service[-_]?worker)/i;
@@ -330,11 +335,13 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
 
   let faviconNoted = false;
   let extUrlNoted = false;
+  let chromeSettingsNoted = false;
   for (const file of walkFiles(extPath, [".js", ".mjs", ".html", ".css"])) {
     const isJs = file.endsWith(".js") || file.endsWith(".mjs");
-    // html/css files are only read for the once-per-extension favicon and
-    // hardcoded-extension-URL checks; skip them once both have been satisfied.
-    if (!isJs && faviconNoted && extUrlNoted) continue;
+    // html/css files are only read for the once-per-extension favicon,
+    // hardcoded-extension-URL, and chrome://settings checks; skip them once all
+    // three have been satisfied.
+    if (!isJs && faviconNoted && extUrlNoted && chromeSettingsNoted) continue;
     let content: string;
     try {
       content = readFileSync(file, "utf-8");
@@ -372,6 +379,24 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
           file: rel,
           line: makeLineResolver(content)(m.index),
           fix: "Build extension URLs with chrome.runtime.getURL(path) instead of hardcoding the id.",
+        });
+      }
+    }
+
+    // A link to chrome://extensions/shortcuts or chrome://settings — no such page
+    // in Safari. The shim swallows the navigation, but flag it so the author wires
+    // their own shortcut/settings affordance. One note covers the class.
+    if (!chromeSettingsNoted) {
+      const m = CHROME_SETTINGS_URL_RE.exec(content);
+      if (m) {
+        chromeSettingsNoted = true;
+        issues.push({
+          severity: "warning",
+          category: "api",
+          message: `Link to "${m[0]}" has no Safari equivalent (no chrome://extensions/shortcuts or settings page).`,
+          file: rel,
+          line: makeLineResolver(content)(m.index),
+          fix: "Shortcuts are edited in Safari → Settings → Extensions; show that hint instead of linking the chrome:// page (the shim swallows the dead navigation).",
         });
       }
     }
