@@ -1,10 +1,10 @@
 {
-  "name": "chrome2safari",
+  "name": "viaduct",
   "version": "1.2.6",
   "description": "Convert a Chrome extension into a Safari Web Extension (macOS/iOS) ready for local dev or CI/CD.",
   "type": "module",
   "bin": {
-    "chrome2safari": "dist/cli.js"
+    "viaduct": "dist/cli.js"
   },
   "files": [
     "dist",
@@ -34,12 +34,12 @@
   "author": "magicelk235",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/magicelk235/Chrome-extensions-to-Safari-CLI.git"
+    "url": "git+https://github.com/magicelk235/Viaduct-CLI.git"
   },
   "bugs": {
-    "url": "https://github.com/magicelk235/Chrome-extensions-to-Safari-CLI/issues"
+    "url": "https://github.com/magicelk235/Viaduct-CLI/issues"
   },
-  "homepage": "https://github.com/magicelk235/Chrome-extensions-to-Safari-CLI#readme",
+  "homepage": "https://github.com/magicelk235/Viaduct-CLI#readme",
   "os": [
     "darwin"
   ],

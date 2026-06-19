@@ -33,7 +33,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
     issues: [],
   };
 
-  const scratch = mkdtempSync(join(tmpdir(), "chrome2safari-"));
+  const scratch = mkdtempSync(join(tmpdir(), "viaduct-"));
   // Throwaway DerivedData from buildXcodeProject; removed once the built app is moved out.
   let derivedDir: string | undefined;
   const cleanup = () => {
