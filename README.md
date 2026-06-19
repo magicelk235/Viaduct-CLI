@@ -81,7 +81,16 @@ Run the built-in toolchain check at any time:
 viaduct --doctor
 ```
 
-## Install and build
+## Install
+
+```
+npm install -g @magicelk235/viaduct
+viaduct <input> [options]
+```
+
+The command is `viaduct`. macOS only (needs Xcode — see Requirements).
+
+## Build from source
 
 ```
 npm install
