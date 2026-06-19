@@ -20,16 +20,6 @@ jobs:
         with:
           node-version: 24 # OIDC needs >= 22.14; npm bundled here is >= 11.5.1
           registry-url: https://registry.npmjs.org
-      # Diagnostic: show what setup-node wrote and how npm resolves auth, so we
-      # can see whether OIDC or a stray empty token is being used.
-      - name: Inspect npm auth config
-        run: |
-          echo "--- USERCONFIG path: $NPM_CONFIG_USERCONFIG ---"
-          cat "$NPM_CONFIG_USERCONFIG" 2>/dev/null | sed 's/_authToken=.*/_authToken=<redacted>/'
-          echo "--- npm config registry ---"
-          npm config get registry
-          echo "--- NODE_AUTH_TOKEN set? ---"
-          if [ -n "$NODE_AUTH_TOKEN" ]; then echo "yes (len ${#NODE_AUTH_TOKEN})"; else echo "no / empty"; fi
       - run: npm ci
       - run: npm test
       - run: npm publish --provenance --access public
