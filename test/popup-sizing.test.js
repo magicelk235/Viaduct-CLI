@@ -9,10 +9,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { injectPopupSizing } from "../dist/shim.js";
 
-function size(html) {
+function size(html, fullHeight = false) {
   const dir = mkdtempSync(join(tmpdir(), "c2s-popup-"));
   writeFileSync(join(dir, "action.html"), html);
-  injectPopupSizing(dir, "action.html");
+  injectPopupSizing(dir, "action.html", fullHeight);
   const out = readFileSync(join(dir, "action.html"), "utf-8");
   rmSync(dir, { recursive: true, force: true });
   return out;
@@ -35,6 +35,14 @@ test("popup sizing: margin reset is !important, size floor is NOT", () => {
   assert.doesNotMatch(style, /max-content/);
   // injected BEFORE the app stylesheet.
   assert.ok(out.indexOf("c2s-popup-size") < out.indexOf("style.css"));
+});
+
+test("popup sizing: side-panel page gets an explicit height so 100% layout fills", () => {
+  // Claude's sidepanel.html — height:100% collapses in a popover without this.
+  const out = size('<head></head><body></body>', true);
+  const style = out.match(/<style id="c2s-popup-size">([^<]*)<\/style>/)[1];
+  assert.match(style, /height:\d+px!important/); // explicit height to resolve % against
+  assert.doesNotMatch(style, /[^-]width:\d+px/); // width still follows the app
 });
 
 test("popup sizing: idempotent (no double inject)", () => {

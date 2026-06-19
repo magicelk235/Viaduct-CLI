@@ -1611,7 +1611,7 @@ export function injectShimIntoHtmlPages(dir: string, polyfillFile?: string): num
  * window because they carry no intrinsic size. Inject a sizing style so the popup
  * opens at usable dimensions. style-src allows 'unsafe-inline' in typical MV3 CSPs.
  */
-export function injectPopupSizing(dir: string, popupFile: string): void {
+export function injectPopupSizing(dir: string, popupFile: string, fullHeight = false): void {
   const file = join(dir, popupFile);
   let html: string;
   try {
@@ -1637,9 +1637,17 @@ export function injectPopupSizing(dir: string, popupFile: string): void {
   //    no max caps: the popover follows the content/app, Safari clamps the ceiling.
   // ponytail: floor-only; if some app still opens too small add a per-extension
   // size override, don't reintroduce a global fixed size.
-  const style = `<style id="${marker}">:root{color-scheme:light dark;}` +
-    `html,body{margin:0!important;}` +
-    `body{min-width:320px;min-height:160px;}</style>`;
+  //
+  // fullHeight: a SIDE-PANEL page wired as the popup (Claude's sidepanel.html).
+  // Side panels lay out against the panel's full height (height:100%/100vh). In a
+  // popover with no fixed height, 100% resolves to ~0 and the app collapses to a
+  // sliver. Give html/body an explicit large height so the app's % layout fills.
+  // Use !important on height ONLY (the collapse is the bug); width still follows
+  // the app. This is gated to side-panel pages, so normal popups are untouched.
+  const sizeFloor = fullHeight
+    ? `html,body{margin:0!important;height:600px!important;min-width:380px;}`
+    : `html,body{margin:0!important;}body{min-width:320px;min-height:160px;}`;
+  const style = `<style id="${marker}">:root{color-scheme:light dark;}${sizeFloor}</style>`;
   const headMatch = html.match(/<head[^>]*>/i);
   if (headMatch) {
     const at = headMatch.index! + headMatch[0].length;

@@ -131,7 +131,20 @@ export function convert(opts: ConvertOptions): ConvertResult {
 
     writeManifest(stageDir, transformed);
     const popupFile = (transformed.action ?? transformed.browser_action)?.default_popup;
-    if (popupFile) injectPopupSizing(stageDir, popupFile);
+    if (popupFile) {
+      // A SIDE-PANEL page wired as the popup needs an explicit height or its
+      // height:100% layout collapses in a popover (Claude's sidepanel.html). Gate
+      // strictly on the side_panel manifest field OR a "side panel" filename —
+      // NOT generic names like index.html (that would blow up normal popups like
+      // Urban VPN's). Everything else gets the floor-only treatment.
+      const panelPath = transformed.side_panel?.default_path;
+      const stripFrag = (p?: string) => (typeof p === "string" ? p.split(/[#?]/)[0].replace(/^\//, "") : p);
+      const base = stripFrag(popupFile) ?? "";
+      const isSidePanel =
+        (!!panelPath && stripFrag(panelPath) === base) ||
+        /(^|\/)side[_-]?panel\.html$/i.test(base);
+      injectPopupSizing(stageDir, popupFile, isSidePanel);
+    }
     result.stagedPath = stageDir;
     ok(`Staged → ${stageDir}`);
 
