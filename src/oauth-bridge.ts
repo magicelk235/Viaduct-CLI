@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join, dirname } from "node:path";
+import { join, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Manifest } from "./types.js";
 
@@ -90,7 +90,7 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest, chromeId?
 
   // 2. The SW (or its loader) must run the polyfill FIRST so the bridge receiver
   //    and chrome.identity shim install before the bundle evaluates.
-  injectPolyfillImport(join(stageDir, sw));
+  injectPolyfillImport(stageDir, sw);
 
   // 3. The loader uses ES `import`, so the background MUST stay a module.
   //    `sw` is truthy here, so `manifest.background` is guaranteed defined.
@@ -134,14 +134,26 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest, chromeId?
   return notes;
 }
 
-/** Prepend `import "./identity-polyfill.js";` to the SW entry if absent. */
-function injectPolyfillImport(swPath: string): void {
+/**
+ * Prepend `import "<rel>/identity-polyfill.js";` to the SW entry if absent.
+ * The polyfill is copied to the stage ROOT, but the SW may live in a subdir
+ * (e.g. service-worker/index.js). A bare "./identity-polyfill.js" then resolves
+ * to service-worker/identity-polyfill.js → 404 → the whole SW module fails to
+ * load and never registers its onConnect/onMessage listeners. So compute the
+ * path FROM the SW's own directory back to the root where the polyfill sits.
+ */
+function injectPolyfillImport(stageDir: string, swRel: string): void {
+  const swPath = join(stageDir, swRel);
   if (!existsSync(swPath)) return;
   const src = readFileSync(swPath, "utf-8");
+  // Relative path from the SW's dir to the root polyfill. For a root SW this is
+  // "./identity-polyfill.js"; for service-worker/index.js it's "../identity-polyfill.js".
+  let rel = relative(dirname(swRel), BRIDGE_POLYFILL).split("\\").join("/");
+  if (!rel.startsWith(".")) rel = "./" + rel;
   // Match the actual import, not a bare filename mention (a comment or URL referencing
   // identity-polyfill.js would otherwise suppress the required import).
-  if (src.includes(`"./${BRIDGE_POLYFILL}"`)) return;
-  writeFileSync(swPath, `import "./${BRIDGE_POLYFILL}";\n` + src, "utf-8");
+  if (src.includes(`"${rel}"`)) return;
+  writeFileSync(swPath, `import "${rel}";\n` + src, "utf-8");
 }
 
 /** Ensure `resource` is exposed to `matches` in web_accessible_resources (MV3 form). */

@@ -26,6 +26,7 @@ export interface Manifest {
   action?: Record<string, unknown> & { default_popup?: string };
   browser_action?: Record<string, unknown> & { default_popup?: string };
   page_action?: Record<string, unknown> & { default_popup?: string };
+  side_panel?: Record<string, unknown> & { default_path?: string };
   permissions?: string[];
   optional_permissions?: string[];
   host_permissions?: string[];
