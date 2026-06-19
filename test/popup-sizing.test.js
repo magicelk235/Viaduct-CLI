@@ -8,10 +8,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { injectPopupSizing } from "../dist/shim.js";
 
-function size(html) {
+function size(html, fullPage = false) {
   const dir = mkdtempSync(join(tmpdir(), "c2s-popup-"));
   writeFileSync(join(dir, "action.html"), html);
-  injectPopupSizing(dir, "action.html");
+  injectPopupSizing(dir, "action.html", fullPage);
   const out = readFileSync(join(dir, "action.html"), "utf-8");
   rmSync(dir, { recursive: true, force: true });
   return out;
@@ -31,6 +31,17 @@ test("popup sizing: structural props are !important so app CSS can't override", 
   assert.match(style, /width:max-content!important/);
   // injected BEFORE the app stylesheet so later !important-free rules still lose.
   assert.ok(out.indexOf("c2s-popup-size") < out.indexOf("style.css"));
+});
+
+test("popup sizing: fullPage fills the popover instead of fitting content", () => {
+  // Claude's sidepanel.html wired as the action popup — must fill, not clip.
+  const out = size('<head><link href="app.css" rel="stylesheet"></head><body></body>', true);
+  const style = out.match(/<style id="c2s-popup-size">([^<]*)<\/style>/)[1];
+  assert.match(style, /width:780px!important/);
+  assert.match(style, /height:600px!important/);
+  // fit-content tokens must NOT appear in full-page mode (they were clipping it).
+  assert.doesNotMatch(style, /max-content/);
+  assert.doesNotMatch(style, /height:auto/);
 });
 
 test("popup sizing: idempotent (no double inject)", () => {
