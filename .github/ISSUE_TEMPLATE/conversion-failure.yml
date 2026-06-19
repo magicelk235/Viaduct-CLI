@@ -26,14 +26,6 @@ body:
       required: true
 
   - type: input
-    id: viaduct-version
-    attributes:
-      label: Viaduct version
-      placeholder: "viaduct --version"
-    validations:
-      required: true
-
-  - type: input
     id: os
     attributes:
       label: OS & Xcode version
