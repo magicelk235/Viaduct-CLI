@@ -129,7 +129,42 @@ var __C2S_DEBUG__ = false;
       if (typeof cb === "function") { p.then(function (r) { cb(r); }, function () { cb([]); }); return; }
       return p;
     };
+
+    // Intercept tabs.create/update to a chrome:// settings page (most commonly
+    // "chrome://extensions/shortcuts" — extensions link there so users can rebind
+    // keys). Safari has no such page and the navigation just errors. There is no
+    // API to deep-link Safari's per-extension shortcut pane, so the honest move is
+    // to NOT open a broken tab: swallow the chrome:// settings navigation and
+    // resolve a stub tab. The extension's own UI should tell the user to edit
+    // shortcuts in Safari -> Settings -> Extensions. Non-chrome:// URLs pass through.
+    var isChromeSettingsUrl = function (u) { return typeof u === "string" && /^chrome:\/\/(extensions|settings)\b/i.test(u); };
+    if (typeof ns.tabs.create === "function") {
+      var _create = ns.tabs.create.bind(ns.tabs);
+      ns.tabs.create = function (props, cb) {
+        if (props && isChromeSettingsUrl(props.url)) {
+          try { if (typeof console !== "undefined") console.warn("[c2s] " + props.url + " has no Safari equivalent; edit shortcuts in Safari -> Settings -> Extensions."); } catch (e) {}
+          return dualTab(cb);
+        }
+        return _create(props, cb);
+      };
+    }
+    if (typeof ns.tabs.update === "function") {
+      var _update = ns.tabs.update.bind(ns.tabs);
+      ns.tabs.update = function (a, b, c) {
+        // Signatures: update(props,cb) or update(tabId,props,cb).
+        var props = typeof a === "object" ? a : b;
+        var cb = typeof a === "object" ? b : c;
+        if (props && isChromeSettingsUrl(props.url)) return dualTab(cb);
+        return _update(a, b, c);
+      };
+    }
     ns.tabs.__c2sWrapped = true;
+  }
+  // Resolve a harmless stub tab (callback or promise) for a swallowed navigation.
+  function dualTab(cb) {
+    var stub = { id: -1, url: "" };
+    if (typeof cb === "function") { try { cb(stub); } catch (e) {} return; }
+    return Promise.resolve(stub);
   }
   wrapTabsQuery(typeof chrome !== "undefined" ? chrome : null);
   if (typeof browser !== "undefined" && browser !== chrome) wrapTabsQuery(browser);
@@ -952,10 +987,42 @@ var __C2S_DEBUG__ = false;
     chrome.topSites = chrome.topSites || {};
     fill(chrome.topSites, { get: function (cb) { return dual([], cb); } });
 
-    // chrome.commands — Safari wires manifest shortcuts itself; complete the JS side.
+    // chrome.commands — Safari wires manifest shortcuts itself, but there is NO
+    // chrome://extensions/shortcuts page: the user edits shortcuts in Safari ->
+    // Settings -> Extensions. Two things break otherwise:
+    //  1. getAll() returning [] leaves an extension's own "your shortcuts" UI
+    //     blank. Chrome returns {name, description, shortcut} per command, so
+    //     reconstruct that list from the manifest (the shortcut string is the
+    //     suggested_key; Safari may have remapped it, but the declared chord is
+    //     the best we can surface from JS — better than nothing).
+    //  2. Code that opens chrome://extensions/shortcuts to let users rebind keys
+    //     hits a non-existent page in Safari. openShortcutSettings() is a no-throw
+    //     affordance an extension can call instead; it can't deep-link to the
+    //     Safari pane (no API), so it resolves false and the extension should show
+    //     its own "edit in Safari -> Settings -> Extensions" hint.
     chrome.commands = chrome.commands || {};
+    var c2sCommandList = function () {
+      var out = [];
+      try {
+        var mf = chrome.runtime && chrome.runtime.getManifest && chrome.runtime.getManifest();
+        var cmds = (mf && mf.commands) || {};
+        for (var name in cmds) {
+          if (!Object.prototype.hasOwnProperty.call(cmds, name)) continue;
+          var def = cmds[name] || {};
+          var sk = def.suggested_key;
+          // suggested_key is a string or a per-platform map; prefer mac/default.
+          var shortcut = typeof sk === "string" ? sk : (sk && (sk.mac || sk.default || sk.windows || sk.chromeos)) || "";
+          out.push({ name: name, description: def.description || "", shortcut: shortcut });
+        }
+      } catch (e) {}
+      return out;
+    };
     fill(chrome.commands, {
-      getAll: function (cb) { return dual([], cb); },
+      getAll: function (cb) { return dual(c2sCommandList(), cb); },
+      // Not a Chrome API — a Safari-specific helper. There is no programmatic way
+      // to open Safari's per-extension shortcut UI, so this is honest: it resolves
+      // false so callers fall back to an in-UI instruction instead of a dead link.
+      openShortcutSettings: function (cb) { return dual(false, cb); },
       onCommand: event(),
     });
 
