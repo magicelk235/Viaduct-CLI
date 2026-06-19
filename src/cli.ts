@@ -36,13 +36,13 @@ const SAFARI_VERSION_RE = /^\d+(\.\d+){0,2}$/;
 // Apple Developer Team IDs are exactly 10 uppercase alphanumeric characters.
 const TEAM_ID_RE = /^[A-Z0-9]{10}$/;
 
-const HELP = `chrome2safari — convert a Chrome extension to a Safari Web Extension
+const HELP = `viaduct — convert a Chrome extension to a Safari Web Extension
 
 USAGE
-  chrome2safari <input> [options]
-  chrome2safari <input> --analyze         # report only, no conversion
-  chrome2safari --doctor                  # check local toolchain
-  chrome2safari --uninstall <AppName>     # remove a previously installed app
+  viaduct <input> [options]
+  viaduct <input> --analyze         # report only, no conversion
+  viaduct --doctor                  # check local toolchain
+  viaduct --uninstall <AppName>     # remove a previously installed app
 
 INPUT
   A .zip, .crx, .xpi, an unpacked extension directory, or a URL (type detected by magic bytes).
@@ -51,7 +51,7 @@ INPUT
 
 OPTIONS
   -o, --output <dir>        Output directory (default: ./<AppName>_Safari)
-      --bundle-id <id>      Reverse-DNS bundle id (default: com.chrome2safari.<app>)
+      --bundle-id <id>      Reverse-DNS bundle id (default: com.viaduct.<app>)
       --app-name <name>     Host app name (default: extension name)
       --min-safari <ver>    Safari strict_min_version (default: 15.4; use 18.4 for world:MAIN)
       --platforms <p>       all | macos | ios            (default: macos)
@@ -81,7 +81,7 @@ OPTIONS
       --uninstall <name>    Remove the installed <name>.app + unregister it (use with --install-dir)
   -v, --verbose             Verbose output
   -h, --help                Show this help
-      --version             Print the chrome2safari version and exit
+      --version             Print the viaduct version and exit
 `;
 
 function doctor(): number {
@@ -111,7 +111,7 @@ function doctor(): number {
 }
 
 function analyzeOnly(input: string, platforms: Platforms, json: boolean, strict: boolean): number {
-  const scratch = mkdtempSync(join(tmpdir(), "chrome2safari-"));
+  const scratch = mkdtempSync(join(tmpdir(), "viaduct-"));
   try {
     let extPath: string;
     let manifest;

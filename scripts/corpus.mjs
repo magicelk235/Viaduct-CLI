@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Corpus runner: download a curated set of popular Chrome extensions and run
-// `chrome2safari --analyze --json` against each, then aggregate convertibility.
+// `viaduct --analyze --json` against each, then aggregate convertibility.
 // This surfaces real-world conversion bugs and produces a headline number
 // ("converts N% of the corpus"). No Xcode needed — analyze is pure logic.
 //
