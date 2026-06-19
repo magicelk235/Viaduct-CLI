@@ -225,3 +225,44 @@ test("transformManifest does not mutate the input manifest", () => {
   assert.equal(input.update_url, "https://x");
   assert.equal(input.version, "1.0");
 });
+
+const remoteScriptIssues = (csp) =>
+  analyzeManifest({ manifest_version: 3, version: "1.0.0", content_security_policy: csp })
+    .issues.filter((i) => /remote origin/.test(i.message));
+
+test("analyzeManifest flags a remote script-src origin in CSP", () => {
+  const issues = remoteScriptIssues({ extension_pages: "script-src 'self' https://cdn.example.com" });
+  assert.equal(issues.length, 1);
+  assert.ok(issues[0].message.includes("https://cdn.example.com"));
+});
+
+test("analyzeManifest does NOT flag self/keyword-only CSP as remote", () => {
+  assert.equal(remoteScriptIssues({ extension_pages: "script-src 'self' 'wasm-unsafe-eval'" }).length, 0);
+  // bare-string MV2-form CSP maps to extension_pages; 'self' alone is clean.
+  assert.equal(remoteScriptIssues("script-src 'self'").length, 0);
+});
+
+test("analyzeManifest flags a bare-hostname script-src origin (no scheme)", () => {
+  const issues = remoteScriptIssues({ extension_pages: "script-src 'self' cdn.example.com" });
+  assert.equal(issues.length, 1);
+});
+
+test("analyzeManifest flags a host match pattern misplaced in MV3 permissions", () => {
+  const { issues } = analyzeManifest({
+    manifest_version: 3,
+    version: "1.0.0",
+    permissions: ["https://api.foo.com/*", "storage"],
+  });
+  const misplaced = issues.filter((i) => /ignored and grants no host access/.test(i.message));
+  assert.equal(misplaced.length, 1);
+  assert.ok(misplaced[0].message.includes("https://api.foo.com/*"));
+});
+
+test("analyzeManifest does not flag a real host_permissions entry as misplaced", () => {
+  const { issues } = analyzeManifest({
+    manifest_version: 3,
+    version: "1.0.0",
+    host_permissions: ["https://api.foo.com/*"],
+  });
+  assert.equal(issues.filter((i) => /ignored and grants no host access/.test(i.message)).length, 0);
+});
