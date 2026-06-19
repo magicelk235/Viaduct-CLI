@@ -144,7 +144,7 @@ function scanJsContent(content: string, rel: string, issues: Issue[]): void {
     }
   }
 
-  // chrome2safari converts the MV3 service worker into a module background page
+  // viaduct converts the MV3 service worker into a module background page
   // (<script type="module">). importScripts() is a worker-global function absent
   // in module scope, so the first call throws and the background dies silently.
   // Flag it anywhere — outside a worker it was already non-functional. (Not gated
