@@ -66,6 +66,16 @@ var __C2S_DEBUG__ = false;
   function event() {
     return { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } };
   }
+  // A live event with real listener storage + _emit, for emulated APIs that fire.
+  function eventList() {
+    var ls = [];
+    return {
+      addListener: function (f) { if (typeof f === "function") ls.push(f); },
+      removeListener: function (f) { var i = ls.indexOf(f); if (i >= 0) ls.splice(i, 1); },
+      hasListener: function (f) { return ls.indexOf(f) >= 0; },
+      _emit: function () { for (var i = 0; i < ls.length; i++) { try { ls[i].apply(null, arguments); } catch (e) {} } },
+    };
+  }
 
   // importScripts() in the SW bundle is handled at STAGING time (the imported
   // files are hoisted into background.html as classic <script> tags before the SW
@@ -722,17 +732,75 @@ var __C2S_DEBUG__ = false;
     chrome.proxy = chrome.proxy || {};
     fill(chrome.proxy, { settings: chromeSetting(), onProxyError: event() });
 
-    // chrome.power — keepAwake/releaseKeepAwake are fire-and-forget no-ops.
+    // chrome.power — back keepAwake with the Screen Wake Lock API (navigator.wakeLock)
+    // where available, so the screen actually stays on. "system" level (sleep but not
+    // screen) has no web equivalent, so any keepAwake takes a screen lock. The lock
+    // auto-releases when the document is hidden; re-acquire on visibility return so a
+    // long-lived request survives tab backgrounding. Falls back to a no-op when the
+    // API is absent (older Safari / no document).
     chrome.power = chrome.power || {};
-    fill(chrome.power, { requestKeepAwake: function () {}, releaseKeepAwake: function () {}, reportActivity: function (cb) { if (cb) cb(); } });
+    var __wakeLock = null, __wakeWanted = false;
+    var __acquireWake = function () {
+      try {
+        if (!__wakeWanted) return;
+        if (typeof navigator === "undefined" || !navigator.wakeLock || !navigator.wakeLock.request) return;
+        navigator.wakeLock.request("screen").then(function (s) { __wakeLock = s; }, function () {});
+      } catch (e) {}
+    };
+    if (typeof document !== "undefined" && document.addEventListener) {
+      document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState === "visible" && __wakeWanted && !__wakeLock) __acquireWake();
+        if (document.visibilityState === "hidden") __wakeLock = null; // browser already released it
+      });
+    }
+    fill(chrome.power, {
+      requestKeepAwake: function () { __wakeWanted = true; __acquireWake(); },
+      releaseKeepAwake: function () {
+        __wakeWanted = false;
+        try { if (__wakeLock && __wakeLock.release) __wakeLock.release(); } catch (e) {}
+        __wakeLock = null;
+      },
+      reportActivity: function (cb) { if (cb) cb(); },
+    });
 
     // chrome.system.* — each sub-namespace returns empty info. Backfill per
     // sub-namespace so a partial host (e.g. only chrome.system.cpu) is completed.
     chrome.system = chrome.system || {};
+    var __nproc = (typeof navigator !== "undefined" && navigator.hardwareConcurrency) || 0;
+    // navigator.deviceMemory is GiB, coarsely rounded (0.25–8); Safari may omit it.
+    var __memGiB = (typeof navigator !== "undefined" && navigator.deviceMemory) || 0;
+    var __memBytes = __memGiB * 1024 * 1024 * 1024;
     fill(chrome.system, {
-      cpu: { getInfo: resolveEmpty({ numOfProcessors: 0, archName: "", modelName: "", features: [], processors: [] }) },
-      memory: { getInfo: resolveEmpty({ capacity: 0, availableCapacity: 0 }) },
-      storage: { getInfo: resolveEmpty([]), onAttached: event(), onDetached: event() },
+      cpu: { getInfo: resolveEmpty({
+        numOfProcessors: __nproc,
+        archName: "", modelName: "", features: [],
+        // One per-processor usage entry per core so callers iterating .processors
+        // get the right length; usage counters are 0 (no web API for live load).
+        processors: (function () { var a = []; for (var i = 0; i < __nproc; i++) a.push({ usage: { user: 0, kernel: 0, idle: 0, total: 0 } }); return a; })(),
+      }) },
+      // availableCapacity unknown on the web; report capacity as available so callers
+      // that compute "used = capacity - available" get 0 rather than a bogus number.
+      memory: { getInfo: resolveEmpty({ capacity: __memBytes, availableCapacity: __memBytes }) },
+      storage: {
+        // Back getInfo with StorageManager.estimate() (origin quota) — one synthetic
+        // "fixed" unit whose capacity is the quota. Real number beats an empty list
+        // for callers checking available space. Falls back to [] when unavailable.
+        getInfo: function (cb) {
+          var fallback = [];
+          var done = function (val) { if (typeof cb === "function") { cb(val); return undefined; } return Promise.resolve(val); };
+          try {
+            if (typeof navigator !== "undefined" && navigator.storage && navigator.storage.estimate) {
+              var p = navigator.storage.estimate().then(function (est) {
+                return [{ id: "origin", name: "Origin storage", type: "fixed", capacity: (est && est.quota) || 0 }];
+              }, function () { return fallback; });
+              if (typeof cb === "function") { p.then(cb); return undefined; }
+              return p;
+            }
+          } catch (e) {}
+          return done(fallback);
+        },
+        onAttached: event(), onDetached: event(),
+      },
       display: { getInfo: resolveEmpty([]), onDisplayChanged: event() },
     });
 
@@ -740,7 +808,15 @@ var __C2S_DEBUG__ = false;
     chrome.management = chrome.management || {};
     fill(chrome.management, {
       getSelf: function (cb) {
-        var info = { id: (chrome.runtime && chrome.runtime.id) || "", enabled: true, installType: "normal", name: "", version: "" };
+        var mf = (chrome.runtime && chrome.runtime.getManifest && chrome.runtime.getManifest()) || {};
+        var info = {
+          id: (chrome.runtime && chrome.runtime.id) || "",
+          enabled: true, installType: "normal", mayDisable: false, type: "extension",
+          name: mf.name || "", version: mf.version || "",
+          description: mf.description || "",
+          hostPermissions: mf.host_permissions || [],
+          permissions: mf.permissions || [],
+        };
         if (typeof cb === "function") { cb(info); return; }
         return Promise.resolve(info);
       },
@@ -782,13 +858,69 @@ var __C2S_DEBUG__ = false;
     chrome.pageCapture = chrome.pageCapture || {};
     fill(chrome.pageCapture, { saveAsMHTML: rejectUnsupported("pageCapture") });
 
-    // chrome.readingList — native Reading List has no JS API.
+    // chrome.readingList — Safari's native Reading List has no JS API, so emulate
+    // it over an extension-private store in storage.local (like bookmarks): real
+    // add/remove/update/query keyed by URL, with live events. Not the user's actual
+    // Safari Reading List (unreachable), but the API behaves and persists.
     chrome.readingList = chrome.readingList || {};
-    fill(chrome.readingList, {
-      addEntry: rejectUnsupported("readingList.addEntry"), removeEntry: rejectUnsupported("readingList.removeEntry"),
-      updateEntry: rejectUnsupported("readingList.updateEntry"), query: resolveEmpty([]),
-      onEntryAdded: event(), onEntryRemoved: event(), onEntryUpdated: event(),
-    });
+    (function () {
+      var KEY = "__viaduct_readinglist__";
+      var entries = null; var loaded = false; var q = [];
+      var added = eventList(), removed = eventList(), updated = eventList();
+      var persist = function () { try { if (chrome.storage && chrome.storage.local) { var b = {}; b[KEY] = entries; chrome.storage.local.set(b); } } catch (e) {} };
+      var ensure = function (cb) {
+        if (loaded) { cb(); return; }
+        q.push(cb); if (q.length > 1) return;
+        var fin = function () { loaded = true; var c = q.slice(); q = []; for (var i = 0; i < c.length; i++) try { c[i](); } catch (e) {} };
+        try {
+          if (chrome.storage && chrome.storage.local) { chrome.storage.local.get(KEY, function (g) { entries = (g && g[KEY]) || {}; fin(); }); return; }
+        } catch (e) {}
+        entries = {}; fin();
+      };
+      var run = function (fn, cb) {
+        if (typeof cb === "function") { ensure(function () { try { var v = fn(); if (chrome.runtime) chrome.runtime.lastError = null; cb(v); } catch (e) { if (chrome.runtime) chrome.runtime.lastError = { message: e.message }; cb(undefined); } }); return undefined; }
+        return new Promise(function (res, rej) { ensure(function () { try { res(fn()); } catch (e) { rej(e); } }); });
+      };
+      var norm = function (e) { return { url: e.url, title: e.title || "", hasBeenRead: !!e.hasBeenRead, creationTime: e.creationTime || Date.now(), lastUpdateTime: e.lastUpdateTime || Date.now() }; };
+      fill(chrome.readingList, {
+        addEntry: function (entry, cb) {
+          return run(function () {
+            if (!entry || !entry.url) throw new Error("A URL is required.");
+            if (entries[entry.url]) throw new Error("Duplicate URL.");
+            var e = norm(entry); entries[entry.url] = e; persist(); added._emit(e); return undefined;
+          }, cb);
+        },
+        removeEntry: function (info, cb) {
+          return run(function () {
+            var url = info && info.url; var e = url && entries[url]; if (!e) throw new Error("URL not found.");
+            delete entries[url]; persist(); removed._emit(e); return undefined;
+          }, cb);
+        },
+        updateEntry: function (info, cb) {
+          return run(function () {
+            var url = info && info.url; var e = url && entries[url]; if (!e) throw new Error("URL not found.");
+            if (info.title != null) e.title = info.title;
+            if (info.hasBeenRead != null) e.hasBeenRead = !!info.hasBeenRead;
+            e.lastUpdateTime = Date.now(); persist(); updated._emit(e); return e;
+          }, cb);
+        },
+        query: function (info, cb) {
+          if (typeof info === "function") { cb = info; info = {}; }
+          return run(function () {
+            var out = [];
+            for (var u in entries) {
+              var e = entries[u];
+              if (info && info.url != null && e.url !== info.url) continue;
+              if (info && info.title != null && e.title !== info.title) continue;
+              if (info && info.hasBeenRead != null && e.hasBeenRead !== !!info.hasBeenRead) continue;
+              out.push(e);
+            }
+            return out;
+          }, cb);
+        },
+        onEntryAdded: added, onEntryRemoved: removed, onEntryUpdated: updated,
+      });
+    })();
 
     // dual(value, cb): honor Chrome's callback form AND return a promise otherwise.
     var dual = function (value, cb) {
@@ -887,47 +1019,116 @@ var __C2S_DEBUG__ = false;
     }
 
     // chrome.idle — derive state from page visibility where a document exists;
-    // a background context simply reports "active".
+    // a background context simply reports "active". onStateChanged is wired to the
+    // document's visibilitychange so listeners ACTUALLY fire (hidden->"idle",
+    // visible->"active") instead of being a dead event — that's the whole point of
+    // the API. ("locked" has no web signal, so it's never reported.)
     chrome.idle = chrome.idle || {};
+    var __idleState = function () {
+      return (typeof document !== "undefined" && document.visibilityState === "hidden") ? "idle" : "active";
+    };
+    var __idleListeners = [];
+    if (typeof document !== "undefined" && document.addEventListener) {
+      document.addEventListener("visibilitychange", function () {
+        var s = __idleState();
+        for (var i = 0; i < __idleListeners.length; i++) { try { __idleListeners[i](s); } catch (e) {} }
+      });
+    }
     fill(chrome.idle, {
-      queryState: function (sec, cb) {
-        var state = (typeof document !== "undefined" && document.visibilityState === "hidden") ? "idle" : "active";
-        return dual(state, cb);
-      },
+      queryState: function (sec, cb) { return dual(__idleState(), cb); },
       setDetectionInterval: function () {},
       getAutoLockDelay: function (cb) { return dual(0, cb); },
-      onStateChanged: event(),
+      onStateChanged: {
+        addListener: function (f) { if (typeof f === "function") __idleListeners.push(f); },
+        removeListener: function (f) { var i = __idleListeners.indexOf(f); if (i >= 0) __idleListeners.splice(i, 1); },
+        hasListener: function (f) { return __idleListeners.indexOf(f) >= 0; },
+      },
     });
 
     // chrome.downloads — no Safari API. Creative fallback: navigate a tab to the
     // URL so WebKit's downloader takes over (or click an <a download> when a DOM
     // exists). Enough for "save this file" flows; queries return empty.
+    // chrome.downloads — Safari has no downloads API, but we CAN start a real
+    // download (anchor[download] click, or a background tab) AND track it in an
+    // in-memory registry so search()/onCreated/onChanged behave. WebKit gives no
+    // progress callbacks, so each item goes in_progress -> complete immediately
+    // (bytesReceived == totalBytes == 0, unknown). Enough for "download then look it
+    // up / react to onChanged.state=complete" flows, which is the common pattern.
     chrome.downloads = chrome.downloads || {};
-    fill(chrome.downloads, {
-      download: function (opts, cb) {
-        var url = (opts && opts.url) || "";
-        var id = Date.now() % 2147483647;
-        try {
-          if (typeof document !== "undefined" && document.body) {
-            var a = document.createElement("a");
-            a.href = url; if (opts && opts.filename) a.download = opts.filename;
-            document.body.appendChild(a); a.click(); a.remove();
-          } else if (chrome.tabs && chrome.tabs.create) {
-            chrome.tabs.create({ url: url, active: false });
-          }
-        } catch (e) {}
-        return dual(id, cb);
-      },
-      search: function (q, cb) { return dual([], cb); },
-      cancel: function (id, cb) { return dual(undefined, cb); },
-      pause: function (id, cb) { return dual(undefined, cb); },
-      resume: function (id, cb) { return dual(undefined, cb); },
-      erase: function (q, cb) { return dual([], cb); },
-      open: rejectUnsupported("downloads.open"), show: function () {}, showDefaultFolder: function () {},
-      getFileIcon: function (id, o, cb) { if (typeof o === "function") { cb = o; } return dual("", cb); },
-      setUiOptions: function (o, cb) { return dual(undefined, cb); },
-      onCreated: event(), onChanged: event(), onErased: event(), onDeterminingFilename: event(),
-    });
+    (function () {
+      var items = [];          // DownloadItem[]
+      var seq = 1;
+      var dlCreated = eventList(), dlChanged = eventList(), dlErased = eventList();
+      var nowIso = function () { try { return new Date().toISOString(); } catch (e) { return ""; } };
+      var matchItem = function (it, q) {
+        if (!q) return true;
+        if (q.id != null && it.id !== q.id) return false;
+        if (q.url != null && it.url !== q.url) return false;
+        if (q.state != null && it.state !== q.state) return false;
+        if (q.filename != null && it.filename !== q.filename) return false;
+        if (Array.isArray(q.id)) return q.id.indexOf(it.id) >= 0;
+        return true;
+      };
+      fill(chrome.downloads, {
+        download: function (opts, cb) {
+          opts = opts || {};
+          var url = opts.url || "";
+          var id = seq++;
+          var fname = opts.filename || (function () { try { return decodeURIComponent(url.split("/").pop().split("?")[0]) || "download"; } catch (e) { return "download"; } })();
+          try {
+            if (typeof document !== "undefined" && document.body) {
+              var a = document.createElement("a");
+              a.href = url; if (opts.filename) a.download = opts.filename;
+              document.body.appendChild(a); a.click(); a.remove();
+            } else if (chrome.tabs && chrome.tabs.create) {
+              chrome.tabs.create({ url: url, active: false });
+            }
+          } catch (e) {}
+          var item = {
+            id: id, url: url, finalUrl: url, filename: fname, state: "in_progress",
+            paused: false, canResume: false, error: undefined, bytesReceived: 0,
+            totalBytes: 0, fileSize: 0, exists: true, mime: "", incognito: false,
+            startTime: nowIso(), endTime: undefined, danger: "safe", referrer: "", byExtensionId: "",
+          };
+          items.push(item);
+          dlCreated._emit(shallow(item));
+          // No progress signal from WebKit → resolve to complete on the next tick.
+          var complete = function () {
+            item.state = "complete"; item.endTime = nowIso();
+            dlChanged._emit({ id: id, state: { previous: "in_progress", current: "complete" } });
+          };
+          if (typeof Promise !== "undefined") Promise.resolve().then(complete); else complete();
+          return dual(id, cb);
+        },
+        search: function (q, cb) {
+          var out = items.filter(function (it) { return matchItem(it, q); }).map(shallow);
+          if (q && q.orderBy && q.orderBy.indexOf("-startTime") >= 0) out.reverse();
+          if (q && typeof q.limit === "number") out = out.slice(0, q.limit);
+          return dual(out, cb);
+        },
+        cancel: function (id, cb) {
+          var it = byId(id); if (it && it.state === "in_progress") { it.state = "interrupted"; it.error = "USER_CANCELED"; dlChanged._emit({ id: id, state: { previous: "in_progress", current: "interrupted" } }); }
+          return dual(undefined, cb);
+        },
+        pause: function (id, cb) { var it = byId(id); if (it) it.paused = true; return dual(undefined, cb); },
+        resume: function (id, cb) { var it = byId(id); if (it) it.paused = false; return dual(undefined, cb); },
+        erase: function (q, cb) {
+          var erased = [];
+          items = items.filter(function (it) { if (matchItem(it, q)) { erased.push(it.id); return false; } return true; });
+          for (var i = 0; i < erased.length; i++) dlErased._emit(erased[i]);
+          return dual(erased, cb);
+        },
+        removeFile: function (id, cb) { return dual(undefined, cb); },
+        open: function (id, cb) { return dual(undefined, cb); },
+        show: function () {}, showDefaultFolder: function () {},
+        acceptDanger: function (id, cb) { return dual(undefined, cb); },
+        getFileIcon: function (id, o, cb) { if (typeof o === "function") { cb = o; } return dual("", cb); },
+        setUiOptions: function (o, cb) { return dual(undefined, cb); },
+        onCreated: dlCreated, onChanged: dlChanged, onErased: dlErased, onDeterminingFilename: event(),
+      });
+      function byId(id) { for (var i = 0; i < items.length; i++) if (items[i].id === id) return items[i]; return null; }
+      function shallow(o) { var r = {}; for (var k in o) r[k] = o[k]; return r; }
+    })();
 
     // chrome.search — no Safari surface; open the query in a search-engine tab.
     chrome.search = chrome.search || {};
@@ -960,20 +1161,191 @@ var __C2S_DEBUG__ = false;
     });
 
     // chrome.bookmarks — same: partial/gated. Reads return an empty tree.
+    // chrome.bookmarks — Safari exposes no bookmark API, so emulate the whole thing
+    // against a flat node map persisted in chrome.storage.local. Real CRUD, search,
+    // tree assembly, and live events (onCreated/onRemoved/onChanged/onMoved). The
+    // store is per-extension (not the user's real Safari bookmarks — impossible to
+    // reach), but every method behaves and persists, so extensions that keep their
+    // own bookmark-like data work end-to-end.
+    // ponytail: in-memory cache + write-through to storage.local; single-context
+    // correctness. Cross-context live sync would need storage.onChanged rebroadcast —
+    // add if a real extension drives bookmarks from both popup and SW at once.
     chrome.bookmarks = chrome.bookmarks || {};
-    fill(chrome.bookmarks, {
-      getTree: function (cb) { return dual([{ id: "0", title: "", children: [] }], cb); },
-      get: function (ids, cb) { return dual([], cb); },
-      getChildren: function (id, cb) { return dual([], cb); },
-      getRecent: function (n, cb) { return dual([], cb); },
-      getSubTree: function (id, cb) { return dual([], cb); },
-      search: function (q, cb) { return dual([], cb); },
-      create: rejectUnsupported("bookmarks.create"), move: rejectUnsupported("bookmarks.move"),
-      update: rejectUnsupported("bookmarks.update"), remove: rejectUnsupported("bookmarks.remove"),
-      removeTree: rejectUnsupported("bookmarks.removeTree"),
-      onCreated: event(), onRemoved: event(), onChanged: event(), onMoved: event(),
-      onChildrenReordered: event(), onImportBegan: event(), onImportEnded: event(),
-    });
+    (function () {
+      var KEY = "__viaduct_bookmarks__";
+      var nodes = null;      // id -> { id, parentId, index, title, url?, dateAdded }
+      var nextId = 3;        // 0/1/2 reserved for roots
+      var loaded = false, loadQueue = [];
+      var bmEvent = function () { var ls = []; return { _ls: ls,
+        addListener: function (f) { if (typeof f === "function") ls.push(f); },
+        removeListener: function (f) { var i = ls.indexOf(f); if (i >= 0) ls.splice(i, 1); },
+        hasListener: function (f) { return ls.indexOf(f) >= 0; },
+        _emit: function () { var a = arguments; for (var i = 0; i < ls.length; i++) { try { ls[i].apply(null, a); } catch (e) {} } } }; };
+      var onCreated = bmEvent(), onRemoved = bmEvent(), onChanged = bmEvent(), onMoved = bmEvent();
+      var seed = function () {
+        nodes = {
+          "0": { id: "0", title: "", index: 0, children: ["1", "2"] },
+          "1": { id: "1", parentId: "0", index: 0, title: "Bookmarks Bar", dateAdded: Date.now(), dateGroupModified: Date.now() },
+          "2": { id: "2", parentId: "0", index: 1, title: "Other Bookmarks", dateAdded: Date.now(), dateGroupModified: Date.now() },
+        };
+        nextId = 3;
+      };
+      var persist = function () {
+        try {
+          if (chrome.storage && chrome.storage.local) {
+            var blob = {}; blob[KEY] = { nodes: nodes, nextId: nextId };
+            chrome.storage.local.set(blob);
+          }
+        } catch (e) {}
+      };
+      var ensure = function (cb) {
+        if (loaded) { cb(); return; }
+        loadQueue.push(cb);
+        if (loadQueue.length > 1) return; // a load is already in flight
+        var finish = function () { loaded = true; var q = loadQueue.slice(); loadQueue = []; for (var i = 0; i < q.length; i++) try { q[i](); } catch (e) {} };
+        try {
+          if (chrome.storage && chrome.storage.local) {
+            chrome.storage.local.get(KEY, function (got) {
+              var saved = got && got[KEY];
+              if (saved && saved.nodes && saved.nodes["0"]) { nodes = saved.nodes; nextId = saved.nextId || 3; }
+              else seed();
+              finish();
+            });
+            return;
+          }
+        } catch (e) {}
+        seed(); finish();
+      };
+      // Public node shape (Chrome omits children for leaves; parentId/url only when set).
+      var pub = function (id) {
+        var n = nodes[id]; if (!n) return null;
+        var o = { id: n.id, title: n.title || "", index: n.index || 0, dateAdded: n.dateAdded };
+        if (n.parentId != null) o.parentId = n.parentId;
+        if (n.url != null) o.url = n.url; else o.children = childIds(id).slice();
+        return o;
+      };
+      var childIds = function (parentId) {
+        var ids = [];
+        for (var k in nodes) { if (nodes[k].parentId === parentId) ids.push(k); }
+        ids.sort(function (a, b) { return (nodes[a].index || 0) - (nodes[b].index || 0); });
+        return ids;
+      };
+      var subtree = function (id) { var o = pub(id); if (o && o.children) { o.children = childIds(id).map(subtree); } return o; };
+      var reindex = function (parentId) { var ids = childIds(parentId); for (var i = 0; i < ids.length; i++) nodes[ids[i]].index = i; };
+
+      fill(chrome.bookmarks, {
+        getTree: function (cb) { return promiseOrCb(function () { return [subtree("0")]; }, cb); },
+        getSubTree: function (id, cb) { return promiseOrCb(function () { var t = subtree(id); return t ? [t] : []; }, cb); },
+        get: function (ids, cb) {
+          return promiseOrCb(function () {
+            var arr = Array.isArray(ids) ? ids : [ids];
+            return arr.map(function (i) { return pub(String(i)); }).filter(Boolean);
+          }, cb);
+        },
+        getChildren: function (id, cb) { return promiseOrCb(function () { return childIds(String(id)).map(pub); }, cb); },
+        getRecent: function (n, cb) {
+          return promiseOrCb(function () {
+            var leaves = [];
+            for (var k in nodes) if (nodes[k].url != null) leaves.push(pub(k));
+            leaves.sort(function (a, b) { return (b.dateAdded || 0) - (a.dateAdded || 0); });
+            return leaves.slice(0, n || 0);
+          }, cb);
+        },
+        search: function (query, cb) {
+          return promiseOrCb(function () {
+            var q = typeof query === "string" ? { query: query } : (query || {});
+            var terms = q.query ? String(q.query).toLowerCase().split(/\s+/).filter(Boolean) : [];
+            var out = [];
+            for (var k in nodes) {
+              var n = nodes[k]; if (n.id === "0") continue;
+              if (q.url != null && n.url !== q.url) continue;
+              if (q.title != null && (n.title || "") !== q.title) continue;
+              if (terms.length) {
+                var hay = ((n.title || "") + " " + (n.url || "")).toLowerCase();
+                var ok = true; for (var t = 0; t < terms.length; t++) if (hay.indexOf(terms[t]) < 0) { ok = false; break; }
+                if (!ok) continue;
+              }
+              out.push(pub(k));
+            }
+            return out;
+          }, cb);
+        },
+        create: function (b, cb) {
+          return promiseOrCb(function () {
+            b = b || {};
+            var parentId = b.parentId != null ? String(b.parentId) : "1";
+            if (!nodes[parentId]) throw new Error("Can't find parent bookmark for new bookmark.");
+            var id = String(nextId++);
+            var sibs = childIds(parentId).length;
+            var idx = (b.index != null && b.index <= sibs) ? b.index : sibs;
+            nodes[id] = { id: id, parentId: parentId, index: idx, title: b.title || "", dateAdded: Date.now() };
+            if (b.url != null) nodes[id].url = b.url;
+            // shift siblings at/after idx
+            var sib = childIds(parentId);
+            for (var i = 0; i < sib.length; i++) if (sib[i] !== id && nodes[sib[i]].index >= idx) nodes[sib[i]].index++;
+            reindex(parentId); persist();
+            var node = pub(id); onCreated._emit(id, node); return node;
+          }, cb);
+        },
+        update: function (id, changes, cb) {
+          return promiseOrCb(function () {
+            id = String(id); var n = nodes[id]; if (!n) throw new Error("Can't find bookmark for id.");
+            if (changes) { if (changes.title != null) n.title = changes.title; if (changes.url != null && n.url != null) n.url = changes.url; }
+            persist();
+            var info = { title: n.title || "" }; if (n.url != null) info.url = n.url;
+            onChanged._emit(id, info); return pub(id);
+          }, cb);
+        },
+        move: function (id, dest, cb) {
+          return promiseOrCb(function () {
+            id = String(id); var n = nodes[id]; if (!n) throw new Error("Can't find bookmark for id.");
+            var oldParent = n.parentId, oldIndex = n.index;
+            var newParent = dest && dest.parentId != null ? String(dest.parentId) : oldParent;
+            if (!nodes[newParent]) throw new Error("Can't find parent bookmark for new bookmark.");
+            var count = childIds(newParent).filter(function (c) { return c !== id; }).length;
+            var newIndex = dest && dest.index != null ? Math.max(0, Math.min(dest.index, count)) : count;
+            n.parentId = newParent; n.index = newIndex;
+            reindex(oldParent); reindex(newParent); persist();
+            onMoved._emit(id, { parentId: newParent, index: n.index, oldParentId: oldParent, oldIndex: oldIndex });
+            return pub(id);
+          }, cb);
+        },
+        remove: function (id, cb) {
+          return promiseOrCb(function () {
+            id = String(id); var n = nodes[id]; if (!n) throw new Error("Can't find bookmark for id.");
+            if (n.url == null && childIds(id).length) throw new Error("Can't remove non-empty folder (use removeTree).");
+            var parentId = n.parentId, index = n.index; delete nodes[id]; reindex(parentId); persist();
+            onRemoved._emit(id, { parentId: parentId, index: index, node: n }); return undefined;
+          }, cb);
+        },
+        removeTree: function (id, cb) {
+          return promiseOrCb(function () {
+            id = String(id); var n = nodes[id]; if (!n) throw new Error("Can't find bookmark for id.");
+            var parentId = n.parentId, index = n.index;
+            (function rm(x) { var kids = childIds(x); for (var i = 0; i < kids.length; i++) rm(kids[i]); delete nodes[x]; })(id);
+            reindex(parentId); persist();
+            onRemoved._emit(id, { parentId: parentId, index: index, node: n }); return undefined;
+          }, cb);
+        },
+        onCreated: onCreated, onRemoved: onRemoved, onChanged: onChanged, onMoved: onMoved,
+        onChildrenReordered: event(), onImportBegan: event(), onImportEnded: event(),
+      });
+
+      // Run fn after the store loads; honor callback form, else return a promise.
+      // Errors surface as a rejected promise / chrome.runtime.lastError + callback.
+      function promiseOrCb(fn, cb) {
+        if (typeof cb === "function") {
+          ensure(function () {
+            try { var v = fn(); if (chrome.runtime) chrome.runtime.lastError = null; cb(v); }
+            catch (e) { if (chrome.runtime) chrome.runtime.lastError = { message: e.message }; cb(undefined); }
+          });
+          return undefined;
+        }
+        return new Promise(function (resolve, reject) {
+          ensure(function () { try { resolve(fn()); } catch (e) { reject(e); } });
+        });
+      }
+    })();
 
     // chrome.sessions / chrome.topSites — no Safari surface; empty reads.
     chrome.sessions = chrome.sessions || {};
@@ -1172,13 +1544,54 @@ var __C2S_DEBUG__ = false;
       send: rejectUnsupported("gcm.send"),
       onMessage: event(), onMessagesDeleted: event(), onSendError: event(),
     });
+    // chrome.instanceID — getID/getCreationTime/deleteID are real: a stable random
+    // app instance ID persisted in storage.local (recreated after deleteID, like
+    // Chrome). getToken/deleteToken are FCM push tokens with no Safari surface, so
+    // they still reject — callers fall back to their polling path.
     chrome.instanceID = chrome.instanceID || {};
-    fill(chrome.instanceID, {
-      getID: rejectUnsupported("instanceID.getID"), getCreationTime: rejectUnsupported("instanceID.getCreationTime"),
-      getToken: rejectUnsupported("instanceID.getToken"), deleteToken: rejectUnsupported("instanceID.deleteToken"),
-      deleteID: rejectUnsupported("instanceID.deleteID"),
-      onTokenRefresh: event(),
-    });
+    (function () {
+      var KEY = "__viaduct_instanceid__";
+      var cache = null; var loaded = false; var q = [];
+      var genId = function () {
+        // 22-ish char URL-safe token, like Chrome's IID.
+        try {
+          if (typeof crypto !== "undefined" && crypto.getRandomValues) {
+            var b = new Uint8Array(16); crypto.getRandomValues(b);
+            var s = ""; for (var i = 0; i < b.length; i++) s += ("0" + b[i].toString(16)).slice(-2);
+            return "c" + s; // leading char so it never starts with a digit
+          }
+        } catch (e) {}
+        return "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+      };
+      var ensure = function (cb) {
+        if (loaded) { cb(); return; }
+        q.push(cb); if (q.length > 1) return;
+        var fin = function () { loaded = true; var c = q.slice(); q = []; for (var i = 0; i < c.length; i++) try { c[i](); } catch (e) {} };
+        try {
+          if (chrome.storage && chrome.storage.local) {
+            chrome.storage.local.get(KEY, function (g) {
+              cache = (g && g[KEY]) || null;
+              if (!cache) { cache = { id: genId(), creationTime: Date.now() }; save(); }
+              fin();
+            });
+            return;
+          }
+        } catch (e) {}
+        cache = { id: genId(), creationTime: Date.now() }; fin();
+      };
+      var save = function () { try { if (chrome.storage && chrome.storage.local) { var b = {}; b[KEY] = cache; chrome.storage.local.set(b); } } catch (e) {} };
+      var run = function (fn, cb) {
+        if (typeof cb === "function") { ensure(function () { try { cb(fn()); } catch (e) { cb(undefined); } }); return undefined; }
+        return new Promise(function (res) { ensure(function () { res(fn()); }); });
+      };
+      fill(chrome.instanceID, {
+        getID: function (cb) { return run(function () { return cache.id; }, cb); },
+        getCreationTime: function (cb) { return run(function () { return cache.creationTime; }, cb); },
+        deleteID: function (cb) { return run(function () { cache = { id: genId(), creationTime: Date.now() }; save(); return undefined; }, cb); },
+        getToken: rejectUnsupported("instanceID.getToken"), deleteToken: rejectUnsupported("instanceID.deleteToken"),
+        onTokenRefresh: event(),
+      });
+    })();
 
     // chrome.fontSettings / accessibilityFeatures — ChromeSetting-style leaves.
     chrome.fontSettings = chrome.fontSettings || {};
@@ -1205,13 +1618,51 @@ var __C2S_DEBUG__ = false;
       updateVoices: function () {},
       onSpeak: event(), onStop: event(), onPause: event(), onResume: event(),
     });
+    // chrome.userScripts — Safari has no persistent user-script registry, so keep a
+    // coherent in-memory one: register/getScripts/update/unregister round-trip
+    // correctly (the common "register then query/manage" pattern). ponytail: this
+    // does NOT actually inject the scripts (WebKit gives no API for dynamic user
+    // worlds); it makes the management surface consistent so callers don't reject.
+    // Upgrade path: map to scripting.registerContentScripts if/when Safari exposes it.
     chrome.userScripts = chrome.userScripts || {};
-    fill(chrome.userScripts, {
-      register: rejectUnsupported("userScripts.register"), unregister: function (f, cb) { return dual(undefined, cb); },
-      update: rejectUnsupported("userScripts.update"),
-      getScripts: function (f, cb) { if (typeof f === "function") { cb = f; } return dual([], cb); },
-      configureWorld: function (p, cb) { return dual(undefined, cb); },
-    });
+    (function () {
+      var scripts = {}; // id -> RegisteredUserScript
+      fill(chrome.userScripts, {
+        register: function (list, cb) {
+          var arr = Array.isArray(list) ? list : [];
+          for (var i = 0; i < arr.length; i++) {
+            var s = arr[i]; if (!s || !s.id) return rejectOrCb(new Error("Invalid script id."), cb);
+            if (scripts[s.id]) return rejectOrCb(new Error("Duplicate script id: " + s.id), cb);
+          }
+          for (var j = 0; j < arr.length; j++) scripts[arr[j].id] = shallowCopy(arr[j]);
+          return dual(undefined, cb);
+        },
+        unregister: function (filter, cb) {
+          if (typeof filter === "function") { cb = filter; filter = null; }
+          var ids = filter && filter.ids;
+          if (ids && ids.length) { for (var i = 0; i < ids.length; i++) delete scripts[ids[i]]; }
+          else scripts = {};
+          return dual(undefined, cb);
+        },
+        update: function (list, cb) {
+          var arr = Array.isArray(list) ? list : [];
+          for (var i = 0; i < arr.length; i++) { var s = arr[i]; if (!s || !scripts[s.id]) return rejectOrCb(new Error("No script with id: " + (s && s.id)), cb); }
+          for (var j = 0; j < arr.length; j++) { var u = arr[j]; var cur = scripts[u.id]; for (var k in u) cur[k] = u[k]; }
+          return dual(undefined, cb);
+        },
+        getScripts: function (filter, cb) {
+          if (typeof filter === "function") { cb = filter; filter = null; }
+          var ids = filter && filter.ids;
+          var out = [];
+          for (var id in scripts) { if (!ids || ids.indexOf(id) >= 0) out.push(shallowCopy(scripts[id])); }
+          return dual(out, cb);
+        },
+        configureWorld: function (p, cb) { return dual(undefined, cb); },
+        resetWorldConfiguration: function (p, cb) { if (typeof p === "function") { cb = p; } return dual(undefined, cb); },
+      });
+      function shallowCopy(o) { var r = {}; for (var k in o) r[k] = o[k]; return r; }
+      function rejectOrCb(err, cb) { if (typeof cb === "function") { if (chrome.runtime) chrome.runtime.lastError = { message: err.message }; cb(); return undefined; } return Promise.reject(err); }
+    })();
     chrome.dom = chrome.dom || {};
     fill(chrome.dom, {
       openOrClosedShadowRoot: function (el) { return (el && el.shadowRoot) || null; },
@@ -1346,6 +1797,46 @@ var __C2S_DEBUG__ = false;
           return dual(undefined, cb);
         },
       });
+    }
+
+    // Catch-all safety net: any documented chrome.* namespace NOT explicitly shimmed
+    // above (audio, dns, documentScan, printing, vpnProvider, wallpaper, input, etc.
+    // — rare / ChromeOS-only surfaces) stays undefined, so chrome.audio.getInfo()
+    // would throw a TypeError and crash the page. Install a recursive inert Proxy so
+    // unknown access degrades instead: a member that looks like an event
+    // (on* / *Listener) returns an event(); anything else returns a function that
+    // resolves a promise / calls back undefined. Sub-namespaces (chrome.foo.bar.baz)
+    // recurse. Only fills namespaces still missing — never clobbers a real Safari or
+    // earlier-shimmed one. Generic, so future Chrome APIs are covered too.
+    var inertProxy = function () {
+      var inertFn = function () {
+        var cb = arguments[arguments.length - 1];
+        if (typeof cb === "function") { try { cb(undefined); } catch (e) {} return; }
+        return Promise.resolve(undefined);
+      };
+      return new Proxy(inertFn, {
+        get: function (_t, prop) {
+          if (prop === "addListener" || prop === "removeListener" || prop === "hasListener") {
+            return event()[prop];
+          }
+          if (typeof prop === "string" && (/^on[A-Z]/.test(prop) || /Listener$/.test(prop))) {
+            return event();
+          }
+          // Symbol access (e.g. Symbol.toPrimitive) or "then" must NOT return a proxy,
+          // or awaiting chrome.x / string coercion hangs or misbehaves.
+          if (typeof prop !== "string" || prop === "then") return undefined;
+          return inertProxy();
+        },
+        apply: function (_t, _thisArg, args) { return inertFn.apply(null, args || []); },
+      });
+    };
+    // The truly-uncovered documented namespaces (the rest are explicitly shimmed
+    // above; the !chrome[ns] guard skips those harmlessly). audio/dns/input/systemLog
+    // have no Safari surface — the net keeps them from throwing.
+    var MAYBE_MISSING = ["audio", "dns", "input", "systemLog"];
+    for (var mi = 0; mi < MAYBE_MISSING.length; mi++) {
+      var ns = MAYBE_MISSING[mi];
+      if (!chrome[ns]) { try { chrome[ns] = inertProxy(); } catch (e) {} }
     }
   }
 
