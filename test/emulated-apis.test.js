@@ -1,0 +1,140 @@
+// Complex emulated APIs: downloads (registry+events), readingList (storage),
+// userScripts (registry), instanceID (stable id).
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { shimSource } from "../dist/shim.js";
+
+function makeStore() {
+  const data = {};
+  return {
+    local: {
+      get: (key, cb) => {
+        const out = {};
+        if (typeof key === "string") { if (key in data) out[key] = data[key]; }
+        else if (key == null) Object.assign(out, data);
+        else Object.keys(key).forEach((k) => { out[k] = k in data ? data[k] : key[k]; });
+        Promise.resolve().then(() => cb(out));
+      },
+      set: (obj, cb) => { Object.assign(data, JSON.parse(JSON.stringify(obj))); Promise.resolve().then(() => cb && cb()); },
+    },
+  };
+}
+function setup(store = makeStore(), extra = {}) {
+  const chrome = Object.assign({ runtime: { lastError: null, getManifest: () => ({}) }, storage: store }, extra);
+  new Function("chrome", "window", "self", "globalThis", shimSource())(chrome, { addEventListener() {} }, undefined, { chrome });
+  return chrome;
+}
+const tick = () => new Promise((r) => setTimeout(r, 0));
+
+// ---- downloads ----
+test("downloads: download records an item, fires onCreated then onChanged->complete", async () => {
+  const chrome = setup();
+  const created = [], changed = [];
+  chrome.downloads.onCreated.addListener((it) => created.push(it));
+  chrome.downloads.onChanged.addListener((d) => changed.push(d.state.current));
+  const id = await chrome.downloads.download({ url: "https://x.test/file.zip" });
+  assert.equal(typeof id, "number");
+  assert.equal(created.length, 1);
+  assert.equal(created[0].state, "in_progress");
+  await tick();
+  assert.deepEqual(changed, ["complete"]);
+});
+
+test("downloads: search finds the item and filters by state", async () => {
+  const chrome = setup();
+  await chrome.downloads.download({ url: "https://x.test/a.zip", filename: "a.zip" });
+  await tick();
+  const all = await chrome.downloads.search({});
+  assert.equal(all.length, 1);
+  assert.equal(all[0].filename, "a.zip");
+  assert.equal((await chrome.downloads.search({ state: "complete" })).length, 1);
+  assert.equal((await chrome.downloads.search({ state: "in_progress" })).length, 0);
+});
+
+test("downloads: erase removes matching items and fires onErased", async () => {
+  const chrome = setup();
+  const id = await chrome.downloads.download({ url: "https://x.test/b.zip" });
+  await tick();
+  const erased = [];
+  chrome.downloads.onErased.addListener((eid) => erased.push(eid));
+  const out = await chrome.downloads.erase({ id });
+  assert.deepEqual(out, [id]);
+  assert.deepEqual(erased, [id]);
+  assert.equal((await chrome.downloads.search({})).length, 0);
+});
+
+// ---- readingList ----
+test("readingList: add/query/update/remove with events", async () => {
+  const chrome = setup();
+  const added = [], removed = [], updated = [];
+  chrome.readingList.onEntryAdded.addListener((e) => added.push(e.url));
+  chrome.readingList.onEntryRemoved.addListener((e) => removed.push(e.url));
+  chrome.readingList.onEntryUpdated.addListener((e) => updated.push(e.hasBeenRead));
+
+  await chrome.readingList.addEntry({ url: "https://r.test/1", title: "One" });
+  assert.deepEqual(added, ["https://r.test/1"]);
+  assert.equal((await chrome.readingList.query({})).length, 1);
+
+  await chrome.readingList.updateEntry({ url: "https://r.test/1", hasBeenRead: true });
+  assert.deepEqual(updated, [true]);
+  assert.equal((await chrome.readingList.query({ hasBeenRead: true })).length, 1);
+
+  await chrome.readingList.removeEntry({ url: "https://r.test/1" });
+  assert.deepEqual(removed, ["https://r.test/1"]);
+  assert.equal((await chrome.readingList.query({})).length, 0);
+});
+
+test("readingList: duplicate URL rejects", async () => {
+  const chrome = setup();
+  await chrome.readingList.addEntry({ url: "https://dup.test", title: "x" });
+  await assert.rejects(() => chrome.readingList.addEntry({ url: "https://dup.test", title: "y" }));
+});
+
+test("readingList: persists across a fresh shim", async () => {
+  const store = makeStore();
+  await setup(store).readingList.addEntry({ url: "https://p.test", title: "keep" });
+  await tick();
+  const got = await setup(store).readingList.query({});
+  assert.equal(got.length, 1);
+  assert.equal(got[0].title, "keep");
+});
+
+// ---- userScripts ----
+test("userScripts: register then getScripts round-trips; update + unregister", async () => {
+  const chrome = setup();
+  await chrome.userScripts.register([{ id: "s1", matches: ["https://*/*"], js: [{ code: "1" }] }]);
+  let got = await chrome.userScripts.getScripts();
+  assert.equal(got.length, 1);
+  assert.equal(got[0].id, "s1");
+  await chrome.userScripts.update([{ id: "s1", allFrames: true }]);
+  got = await chrome.userScripts.getScripts({ ids: ["s1"] });
+  assert.equal(got[0].allFrames, true);
+  await chrome.userScripts.unregister({ ids: ["s1"] });
+  assert.equal((await chrome.userScripts.getScripts()).length, 0);
+});
+
+test("userScripts: duplicate id rejects", async () => {
+  const chrome = setup();
+  await chrome.userScripts.register([{ id: "dup", js: [{ code: "1" }] }]);
+  await assert.rejects(() => chrome.userScripts.register([{ id: "dup", js: [{ code: "2" }] }]));
+});
+
+// ---- instanceID ----
+test("instanceID: getID is stable and persists; deleteID rotates it", async () => {
+  const store = makeStore();
+  const chrome = setup(store);
+  const id1 = await chrome.instanceID.getID();
+  assert.ok(id1 && typeof id1 === "string");
+  assert.equal(await chrome.instanceID.getID(), id1, "stable within a session");
+  await tick();
+  // fresh shim, same store -> same id
+  assert.equal(await setup(store).instanceID.getID(), id1, "persists across contexts");
+  // deleteID rotates
+  await chrome.instanceID.deleteID();
+  assert.notEqual(await chrome.instanceID.getID(), id1);
+});
+
+test("instanceID: getToken still rejects (no FCM in Safari)", async () => {
+  const chrome = setup();
+  await assert.rejects(() => chrome.instanceID.getToken());
+});

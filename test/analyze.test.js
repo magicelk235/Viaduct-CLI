@@ -68,6 +68,22 @@ test("scanExtension does not flag chrome.action / chrome.runtime as a chrome:// 
   assert.equal(issues.filter((i) => /no Safari equivalent.*chrome:\/\//.test(i.message)).length, 0);
 });
 
+test("scanExtension treats importScripts() with string literals as auto-fixed info, not a blocking error", () => {
+  const dir = fixture({ "bg.js": 'importScripts("lib/a.js", "lib/b.js");' });
+  const issues = scanExtension(dir, { manifest_version: 3, background: { service_worker: "bg.js" } }, "macos");
+  const m = issues.find((i) => /importScripts/.test(i.message));
+  assert.ok(m, "expected an importScripts issue");
+  assert.equal(m.severity, "info");
+});
+
+test("scanExtension warns on importScripts() with a dynamic argument (can't hoist)", () => {
+  const dir = fixture({ "bg.js": "importScripts(libPath);" });
+  const issues = scanExtension(dir, { manifest_version: 3, background: { service_worker: "bg.js" } }, "macos");
+  const m = issues.find((i) => /importScripts/.test(i.message));
+  assert.ok(m, "expected an importScripts issue");
+  assert.equal(m.severity, "warning");
+});
+
 test("scanExtension stays quiet on a clean extension (no false positives)", () => {
   const dir = fixture({
     "icon.png": "PNG",
