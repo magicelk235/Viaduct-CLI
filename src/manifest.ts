@@ -202,9 +202,9 @@ export const UNSUPPORTED_APIS: Record<string, { severity: Issue["severity"]; mes
     fix: "Poll cookies, or monitor session state from a content script.",
   },
   "runtime.setUninstallURL": {
-    severity: "warning",
-    message: "runtime.setUninstallURL is unsupported.",
-    fix: "Remove or guard behind feature detection.",
+    severity: "info",
+    message: "runtime.setUninstallURL has no Safari surface; the shim no-ops the call (the uninstall page just won't open).",
+    fix: "No action needed; remove the call if you want to drop the dead code.",
   },
   "runtime.connectNative": {
     severity: "warning",
@@ -278,9 +278,9 @@ export const UNSUPPORTED_APIS: Record<string, { severity: Issue["severity"]; mes
     fix: "Remove or guard behind feature detection.",
   },
   "chrome.management": {
-    severity: "warning",
-    message: "chrome.management has no Safari equivalent.",
-    fix: "Remove, or move management logic to the native host app.",
+    severity: "info",
+    message: "chrome.management: the shim provides getSelf() (from the manifest); other methods reject/resolve empty.",
+    fix: "Self-introspection works; if you rely on managing other extensions, move that to the native host app.",
   },
   "chrome.power": {
     severity: "warning",
@@ -308,9 +308,9 @@ export const UNSUPPORTED_APIS: Record<string, { severity: Issue["severity"]; mes
     fix: "Remove or guard behind feature detection.",
   },
   "chrome.readingList": {
-    severity: "warning",
-    message: "chrome.readingList has no JS API in Safari (native Reading List only).",
-    fix: "Bridge through the native host, or drop.",
+    severity: "info",
+    message: "chrome.readingList is emulated (add/remove/update/query + events) over an extension-private store — NOT the user's native Safari Reading List (no API exists).",
+    fix: "No action needed if you manage your own list; you cannot read/write Safari's native Reading List.",
   },
   "chrome.sessions": {
     severity: "info",
@@ -334,8 +334,8 @@ export const UNSUPPORTED_APIS: Record<string, { severity: Issue["severity"]; mes
   },
   "chrome.userScripts": {
     severity: "warning",
-    message: "chrome.userScripts is unsupported in Safari; registration rejects.",
-    fix: "Statically declare content scripts, or inject via chrome.scripting.",
+    message: "chrome.userScripts: the management surface is emulated (register/getScripts/update/unregister round-trip), but the scripts are NOT actually injected — WebKit has no dynamic user-world API.",
+    fix: "For real injection, statically declare content scripts or use chrome.scripting.",
   },
   "chrome.idle": {
     severity: "info",
@@ -343,14 +343,14 @@ export const UNSUPPORTED_APIS: Record<string, { severity: Issue["severity"]; mes
     fix: "Don't rely on machine-level idle detection on Safari.",
   },
   "chrome.instanceID": {
-    severity: "warning",
-    message: "chrome.instanceID (push plumbing) is Chrome-only; calls reject.",
-    fix: "Use APNs via the native host, or poll with chrome.alarms.",
+    severity: "info",
+    message: "chrome.instanceID: getID/getCreationTime/deleteID work (stable persisted ID); getToken/deleteToken (FCM push) still reject — no Safari surface.",
+    fix: "For push, use APNs via the native host or poll with chrome.alarms.",
   },
   "chrome.bookmarks": {
     severity: "info",
-    message: "chrome.bookmarks is limited/gated in Safari.",
-    fix: "Verify availability + permission; feature-detect and degrade.",
+    message: "chrome.bookmarks is fully emulated (CRUD/search/events) over an extension-private store in storage.local — NOT the user's Safari bookmarks (no API exists for those).",
+    fix: "No action needed if you manage your own bookmark data; you cannot read/write the user's real Safari bookmarks.",
   },
   "chrome.history": {
     severity: "info",
@@ -359,8 +359,8 @@ export const UNSUPPORTED_APIS: Record<string, { severity: Issue["severity"]; mes
   },
   "chrome.downloads": {
     severity: "info",
-    message: "chrome.downloads is only partially supported in Safari.",
-    fix: "Test the flow; fall back to an <a download> link if unavailable.",
+    message: "chrome.downloads: download() triggers a real download and items are tracked in a registry (search/onCreated/onChanged work); WebKit gives no progress, so items go in_progress→complete with unknown byte counts.",
+    fix: "Works for start-then-track flows; don't rely on byte-level progress.",
   },
   "chrome.i18n.detectLanguage": {
     severity: "info",

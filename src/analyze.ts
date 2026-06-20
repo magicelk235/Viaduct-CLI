@@ -95,7 +95,11 @@ const CHROME_SETTINGS_URL_RE = /chrome:\/\/(extensions|settings)\b/;
 const BLOCKING_WEBREQUEST_RE = /chrome\.webRequest\.on\w+/;
 const TIMER_RE = /(setTimeout|setInterval)\s*\(/;
 const BACKGROUND_FILE_RE = /(background|service[-_]?worker)/i;
-const CONNECT_RE = /(tabs\.connect|runtime\.onConnect)/;
+// The Safari 18 port bug is specific to iframe ↔ content-script ports, reached
+// via tabs.connect(tabId, {frameId}). Plain runtime.onConnect for popup↔background
+// works fine in Safari, so don't warn on it (it fires on most extensions). Only
+// tabs.connect — the tab/frame-targeting side — hits the bug.
+const CONNECT_RE = /tabs\.connect\s*\(/;
 const IMPORT_SCRIPTS_RE = /\bimportScripts\s*\(/;
 
 function scanJsContent(content: string, rel: string, issues: Issue[]): void {
@@ -149,20 +153,30 @@ function scanJsContent(content: string, rel: string, issues: Issue[]): void {
     }
   }
 
-  // viaduct converts the MV3 service worker into a module background page
-  // (<script type="module">). importScripts() is a worker-global function absent
-  // in module scope, so the first call throws and the background dies silently.
-  // Flag it anywhere — outside a worker it was already non-functional. (Not gated
-  // on the filename: the SW entry is often named sw.js / index.js, not "background".)
+  // viaduct converts the MV3 service worker into a module background page, where
+  // importScripts() is undefined. convertServiceWorkerToBackgroundPage() handles
+  // this at staging: string-literal targets are hoisted into background.html as
+  // classic <script>s before the SW module, and every call is neutralized so the
+  // undefined global is never invoked. So static literals are auto-fixed (info);
+  // only dynamic args (a variable/expression we can't statically hoist) lose their
+  // imported code and need a manual rewrite (warning).
   const is = IMPORT_SCRIPTS_RE.exec(content);
   if (is) {
-    issues.push({
-      severity: "error",
+    const argList = /\bimportScripts\s*\(([^)]*)\)/.exec(content.slice(is.index))?.[1] ?? "";
+    const dynamic = argList.trim() !== "" && !/["']/.test(argList);
+    issues.push(dynamic ? {
+      severity: "warning",
       category: "background",
-      message: "importScripts() is undefined once the service worker is converted to a module background page.",
+      message: "importScripts() with a dynamic (non-literal) argument can't be hoisted; the imported code won't run in the converted background page.",
       file: rel,
       line: lineAt(is.index),
-      fix: 'Replace importScripts("a.js","b.js") with static ES imports (import "./a.js";) at the top of the worker.',
+      fix: 'Replace the dynamic importScripts(expr) with static ES imports (import "./a.js";) at the top of the worker.',
+    } : {
+      severity: "info",
+      category: "background",
+      message: "importScripts() targets are auto-hoisted into background.html as classic scripts; the calls are neutralized.",
+      file: rel,
+      line: lineAt(is.index),
     });
   }
 
