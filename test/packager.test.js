@@ -18,9 +18,15 @@ test("defaultBundleId drops leading digits (Apple rejects digit-led segments)", 
   assert.match(defaultBundleId("123App"), VALID_BUNDLE_ID);
 });
 
-test("defaultBundleId falls back to 'extension' when nothing usable remains", () => {
-  assert.equal(defaultBundleId("!!!"), "com.viaduct.extension");
-  assert.equal(defaultBundleId("99"), "com.viaduct.extension");
-  assert.equal(defaultBundleId(""), "com.viaduct.extension");
-  assert.match(defaultBundleId("☃"), VALID_BUNDLE_ID);
+test("defaultBundleId derives a valid, NON-colliding id when nothing alphanumeric remains", () => {
+  // All-symbol / all-digit / non-Latin names: must still be valid AND distinct, so
+  // two such extensions don't get the same bundle id and shadow each other in
+  // LaunchServices. (Regression: the old code collapsed them all to .extension.)
+  for (const name of ["!!!", "99", "☃", "日本語", "😀"]) {
+    assert.match(defaultBundleId(name), VALID_BUNDLE_ID, name);
+  }
+  assert.notEqual(defaultBundleId("!!!"), defaultBundleId("???"), "distinct names → distinct ids");
+  assert.notEqual(defaultBundleId("99"), defaultBundleId("88"));
+  // Stable: same name always yields the same id (needed for re-install / updates).
+  assert.equal(defaultBundleId("日本語"), defaultBundleId("日本語"));
 });
