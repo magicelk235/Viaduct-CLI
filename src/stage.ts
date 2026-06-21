@@ -1,4 +1,4 @@
-import { cpSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, writeFileSync, lstatSync } from "node:fs";
 import { basename, join, dirname, resolve, relative, sep } from "node:path";
 import { cleanExtendedAttributes } from "./extract.js";
 
@@ -54,6 +54,10 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
     filter: (src) => {
       const rel = relative(root, resolve(src)).split(sep).join("/");
       if (rel === "") return true; // the stage root itself
+      // Never copy symlinks into the package. cpSync reproduces them verbatim, so a
+      // link in the source (evil.txt -> /etc/hosts) would ship a dangling/absolute
+      // link that leaks the build host's layout and 404s in Safari. Drop them.
+      if (lstatSync(src).isSymbolicLink()) return false;
       // A manifest-referenced path is always kept, even under an excluded ancestor.
       if (keep.has(rel)) return true;
       // Excluded if its own name OR any ancestor segment is excluded — this stops a

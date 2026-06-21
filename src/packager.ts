@@ -1,4 +1,5 @@
 import { readdirSync, existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
 import { run, info, ok, warn } from "./util.js";
@@ -411,7 +412,13 @@ export function detectXcodeTeam(): string | null {
 export function defaultBundleId(appName: string): string {
   // Strip non-alphanumerics, then drop any leading digits: a CFBundleIdentifier
   // segment that starts with a digit (e.g. "123App") is rejected by parts of
-  // Apple's toolchain. Fall back to "extension" when nothing usable remains.
+  // Apple's toolchain.
   const slug = appName.replace(/[^A-Za-z0-9]/g, "").replace(/^[0-9]+/, "");
-  return `com.viaduct.${slug || "extension"}`;
+  // When nothing alphanumeric/Latin survives (all-symbol, all-digit, emoji-only,
+  // or non-Latin names), a constant fallback would give every such extension the
+  // SAME bundle id — LaunchServices then treats them as one app and the second
+  // install shadows the first. Derive a stable per-name suffix from the original
+  // name so distinct names stay distinct.
+  const suffix = slug || "ext" + createHash("sha1").update(appName).digest("hex").slice(0, 8);
+  return `com.viaduct.${suffix}`;
 }
