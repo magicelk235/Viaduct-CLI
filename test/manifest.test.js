@@ -208,9 +208,22 @@ test("transformManifest defaults the safari min version to 15.4", () => {
   assert.equal(out.browser_specific_settings.safari.strict_min_version, "15.4");
 });
 
-test("transformManifest folds MV2 page_action into action", () => {
+test("transformManifest folds MV2 page_action into browser_action (not action — Safari rejects MV2 action)", () => {
   const out = transformManifest(
     { manifest_version: 2, version: "1.0.0", page_action: { default_title: "x" } },
+    [],
+    NO_EXT,
+    XF
+  );
+  assert.equal(out.page_action, undefined);
+  // MV2 must use browser_action; an `action` key on an MV2 manifest fails Safari's load.
+  assert.equal(out.action, undefined);
+  assert.equal(out.browser_action.default_title, "x");
+});
+
+test("transformManifest folds MV3 page_action into action", () => {
+  const out = transformManifest(
+    { manifest_version: 3, version: "1.0.0", page_action: { default_title: "x" } },
     [],
     NO_EXT,
     XF

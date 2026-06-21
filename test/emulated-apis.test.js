@@ -138,3 +138,50 @@ test("instanceID: getToken still rejects (no FCM in Safari)", async () => {
   const chrome = setup();
   await assert.rejects(() => chrome.instanceID.getToken());
 });
+
+// ---- storage.sync callback bridge (BUG: promise-only local broke cb form) ----
+// Simulate the webextension-polyfill `browser` object: storage.local is
+// PROMISE-ONLY and ignores a trailing callback. Chrome code calling
+// chrome.storage.sync.get(keys, cb) must still get cb invoked.
+function promiseOnlyStore() {
+  const data = {};
+  return {
+    local: {
+      get: (key) => {
+        const out = {};
+        if (typeof key === "string") { if (key in data) out[key] = data[key]; }
+        else if (key == null) Object.assign(out, data);
+        else Object.keys(key).forEach((k) => { out[k] = k in data ? data[k] : key[k]; });
+        return Promise.resolve(out);
+      },
+      set: (obj) => { Object.assign(data, JSON.parse(JSON.stringify(obj))); return Promise.resolve(); },
+      remove: (k) => { (Array.isArray(k) ? k : [k]).forEach((x) => delete data[x]); return Promise.resolve(); },
+      clear: () => { Object.keys(data).forEach((k) => delete data[k]); return Promise.resolve(); },
+    },
+    onChanged: { addListener() {}, removeListener() {}, hasListener() { return false; } },
+  };
+}
+
+test("storage.sync: callback form fires even when local is promise-only", async () => {
+  const chrome = setup(promiseOnlyStore());
+  // set with callback
+  await new Promise((res) => chrome.storage.sync.set({ a: 1 }, res));
+  // get with callback
+  const got = await new Promise((res) => chrome.storage.sync.get("a", res));
+  assert.deepEqual(got, { a: 1 });
+});
+
+test("storage.sync: promise form still works (returns the promise)", async () => {
+  const chrome = setup(promiseOnlyStore());
+  await chrome.storage.sync.set({ b: 2 });
+  assert.deepEqual(await chrome.storage.sync.get("b"), { b: 2 });
+});
+
+test("storage.sync: remove and clear honor callbacks against promise-only local", async () => {
+  const chrome = setup(promiseOnlyStore());
+  await chrome.storage.sync.set({ x: 1, y: 2 });
+  await new Promise((res) => chrome.storage.sync.remove("x", res));
+  assert.deepEqual(await chrome.storage.sync.get(null), { y: 2 });
+  await new Promise((res) => chrome.storage.sync.clear(res));
+  assert.deepEqual(await chrome.storage.sync.get(null), {});
+});
