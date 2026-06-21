@@ -121,6 +121,7 @@ function scanJsContent(content: string, rel: string, issues: Issue[]): void {
       file: rel,
       line: lineAt(h.at),
       fix: h.info.fix,
+      shimmed: h.info.shimmed,
     });
   }
 

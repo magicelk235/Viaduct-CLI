@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { convert } from "./convert.js";
 import { extractExtension } from "./extract.js";
-import { loadManifest, analyzeManifest, resolveI18nString } from "./manifest.js";
+import { loadManifest, analyzeManifest, resolveI18nString, transformManifest } from "./manifest.js";
 import { scanExtension } from "./analyze.js";
-import { printIssues, countBlocking } from "./report.js";
-import { run, info, ok, warn, fail, color, commandExists, setVerbose } from "./util.js";
-import { LSREGISTER, uninstallFromSafari } from "./installer.js";
+import { printIssues, countBlocking, summarizeManifestChanges, buildReportMarkdown } from "./report.js";
+import { run, info, ok, warn, fail, color, commandExists, setVerbose, setQuiet } from "./util.js";
+import { LSREGISTER, uninstallFromSafari, listSafariExtensions } from "./installer.js";
 import { detectXcodeTeam, defaultBundleId } from "./packager.js";
 import { isUrl, downloadExtension } from "./download.js";
 import type { Platforms } from "./types.js";
@@ -42,6 +42,7 @@ USAGE
   viaduct <input> [options]
   viaduct <input> --analyze         # report only, no conversion
   viaduct --doctor                  # check local toolchain
+  viaduct --list                    # list registered Safari Web Extensions
   viaduct --uninstall <AppName>     # remove a previously installed app
 
 INPUT
@@ -75,10 +76,13 @@ OPTIONS
       --force               Convert despite blocking errors
       --strict              Treat warnings as blocking too (CI gate). With --analyze,
                             exit 1 if any warning/error is present.
-      --analyze             Analyze and report only
+      --analyze             Analyze and report only (also previews the manifest rewrites)
       --json                With --analyze, print a machine-readable JSON report
+      --report <file>       With --analyze, also write the report to <file> (.json if --json, else Markdown)
       --doctor              Verify xcrun/packager/xcodebuild availability
+      --list                List Safari Web Extensions registered with pluginkit
       --uninstall <name>    Remove the installed <name>.app + unregister it (use with --install-dir)
+  -q, --quiet               Suppress progress messages (warnings/errors still print)
   -v, --verbose             Verbose output
   -h, --help                Show this help
       --version             Print the viaduct version and exit
@@ -110,7 +114,13 @@ function doctor(): number {
   return allOk ? 0 : 1;
 }
 
-function analyzeOnly(input: string, platforms: Platforms, json: boolean, strict: boolean): number {
+function analyzeOnly(
+  input: string,
+  platforms: Platforms,
+  json: boolean,
+  strict: boolean,
+  reportPath?: string
+): number {
   const scratch = mkdtempSync(join(tmpdir(), "viaduct-"));
   try {
     let extPath: string;
@@ -130,6 +140,14 @@ function analyzeOnly(input: string, platforms: Platforms, json: boolean, strict:
     if (!json) info(`${name} (MV${manifest.manifest_version ?? 3})`);
     const { issues: mIssues, permissionsToRemove } = analyzeManifest(manifest);
     const issues = [...mIssues, ...scanExtension(extPath, manifest, platforms)];
+
+    // Preview the real manifest rewrites the converter would apply. transformManifest
+    // deep-clones its input and only reads from extPath, so this is side-effect-free.
+    const transformed = transformManifest(manifest, permissionsToRemove, extPath, {
+      keepModuleBackground: false,
+    });
+    const changes = summarizeManifestChanges(manifest, transformed);
+
     // Mirror the real conversion gate: an auto-fixed issue (e.g. the MV2 persistent
     // background that transformManifest rewrites) is NOT blocking, so --analyze and
     // an actual convert agree on the exit code.
@@ -137,37 +155,65 @@ function analyzeOnly(input: string, platforms: Platforms, json: boolean, strict:
     if (json) {
       const counts = { error: 0, warning: 0, info: 0 };
       let autoFixed = 0;
+      let shimmed = 0;
       for (const i of issues) {
         counts[i.severity]++;
-        if (i.autoFixed) autoFixed++;
+        if (i.shimmed) shimmed++;
+        else if (i.autoFixed) autoFixed++;
       }
       const appName = name.replace(/[\s/\\:]+/g, "") || "Extension";
-      console.log(
-        JSON.stringify(
+      const payload = {
+        name,
+        appName,
+        bundleId: defaultBundleId(appName),
+        version: manifest.version,
+        manifestVersion: manifest.manifest_version ?? 3,
+        platforms,
+        counts,
+        autoFixed,
+        shimmed,
+        blocking: blockingCount,
+        convertible: blockingCount === 0,
+        removedPermissions: permissionsToRemove,
+        manifestChanges: changes,
+        issues,
+      };
+      const out = JSON.stringify(payload, null, 2);
+      console.log(out);
+      if (reportPath) writeAnalyzeReport(reportPath, out);
+    } else {
+      printIssues(issues);
+      if (changes.length > 0) {
+        console.log(`\n${color("blue", `Manifest changes the converter would apply (${changes.length})`)}`);
+        for (const c of changes) console.log(`  • ${c}`);
+      }
+      if (reportPath) {
+        const md = buildReportMarkdown(
           {
             name,
-            appName,
-            bundleId: defaultBundleId(appName),
             version: manifest.version,
             manifestVersion: manifest.manifest_version ?? 3,
             platforms,
-            counts,
-            autoFixed,
-            blocking: blockingCount,
-            convertible: blockingCount === 0,
             removedPermissions: permissionsToRemove,
-            issues,
+            manifestChanges: changes,
           },
-          null,
-          2
-        )
-      );
-    } else {
-      printIssues(issues);
+          issues
+        );
+        writeAnalyzeReport(reportPath, md);
+      }
     }
     return blockingCount > 0 ? 1 : 0;
   } finally {
     if (existsSync(scratch)) rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+function writeAnalyzeReport(path: string, content: string): void {
+  try {
+    writeFileSync(resolve(path), content, "utf-8");
+    ok(`Report written → ${path}`);
+  } catch (e) {
+    warn(`Could not write report to ${path}: ${(e as Error).message}`);
   }
 }
 
@@ -199,8 +245,11 @@ async function main(): Promise<void> {
         strict: { type: "boolean", default: false },
         analyze: { type: "boolean", default: false },
         json: { type: "boolean", default: false },
+        report: { type: "string" },
         doctor: { type: "boolean", default: false },
+        list: { type: "boolean", default: false },
         uninstall: { type: "string" },
+        quiet: { type: "boolean", short: "q", default: false },
         verbose: { type: "boolean", short: "v", default: false },
         help: { type: "boolean", short: "h", default: false },
         version: { type: "boolean", default: false },
@@ -214,6 +263,7 @@ async function main(): Promise<void> {
 
   const { values, positionals } = parsed;
   setVerbose(values.verbose);
+  setQuiet(values.quiet && !values.verbose);
 
   if (values.version) {
     console.log(pkgVersion());
@@ -224,6 +274,16 @@ async function main(): Promise<void> {
     process.exit(0);
   }
   if (values.doctor) process.exit(doctor());
+  if (values.list) {
+    const exts = listSafariExtensions();
+    if (exts.length === 0) {
+      info("No Safari Web Extensions are registered with this user.");
+    } else {
+      info(`Registered Safari Web Extensions (${exts.length}):`);
+      for (const e of exts) console.log(`  ${e.bundleId}\n    ${color("dim", e.path)}`);
+    }
+    process.exit(0);
+  }
   if (values.uninstall !== undefined) {
     process.exit(uninstallFromSafari(values.uninstall, values["install-dir"]) ? 0 : 1);
   }
@@ -270,6 +330,11 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
+  if (values.report !== undefined && !values.analyze) {
+    fail("--report is only valid with --analyze.");
+    process.exit(2);
+  }
+
   let localInput = input;
   if (isUrl(input)) {
     info(`Downloading extension from ${input} …`);
@@ -287,7 +352,7 @@ async function main(): Promise<void> {
     ok(`Downloaded → ${basename(localInput)}`);
   }
 
-  if (values.analyze) process.exit(analyzeOnly(localInput, platforms, values.json, values.strict));
+  if (values.analyze) process.exit(analyzeOnly(localInput, platforms, values.json, values.strict, values.report));
 
   let team = values.team;
   if (team === "auto" || (team === undefined && values.install)) {

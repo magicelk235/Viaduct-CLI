@@ -24,6 +24,15 @@ test("scanExtension flags an unsupported chrome.* API in source", () => {
   assert.ok(has(issues, /launchWebAuthFlow is unsupported/));
 });
 
+test("scanExtension tags shim-backed APIs as shimmed, not truly-unsupported ones", () => {
+  const dir = fixture({ "bg.js": "chrome.identity.getAuthToken({}); chrome.tabCapture.capture({});" });
+  const issues = scanExtension(dir, { manifest_version: 3, background: { service_worker: "bg.js" } }, "macos");
+  const identity = issues.find((i) => /chrome\.identity is unsupported/.test(i.message));
+  const capture = issues.find((i) => /tabCapture is unsupported/.test(i.message));
+  assert.equal(identity?.shimmed, true);
+  assert.ok(capture && !capture.shimmed);
+});
+
 test("scanExtension flags a hardcoded chrome-extension://<id> URL", () => {
   const dir = fixture({ "x.js": 'var u = "chrome-extension://abcdefghijklmnopabcdefghijklmnop/p.html";' });
   const issues = scanExtension(dir, { manifest_version: 3 }, "macos");
