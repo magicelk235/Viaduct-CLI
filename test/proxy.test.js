@@ -42,3 +42,36 @@ test("shim proxy hardening: cookie forwarding, forbidden-header filter, SW relay
   assert.match(src, /"cookie": 1/, "Cookie is in the forbidden-header drop list");
   assert.match(src, /"origin": 1/, "Origin is in the forbidden-header drop list");
 });
+
+// proxyFetch builds a Response from the native host's reply. Response() only
+// accepts status 200-599, and rejects a body on a null-body status (204/205/304).
+// A host network failure returns status 0; without clamping, new Response throws
+// RangeError/TypeError and crashes the proxied fetch with a cryptic error instead
+// of surfacing the host result. This replays the exact status-handling the shim
+// emits and asserts it never throws.
+test("proxy: out-of-range / null-body statuses never crash Response construction", () => {
+  // Mirrors the clamp logic in proxyFetch (shim.ts).
+  function buildResponse(r) {
+    var bytes = new Uint8Array([1, 2, 3]); // pretend the host sent a body
+    var st = typeof r.status === "number" ? r.status : 200;
+    if (st < 200 || st > 599) st = 502;
+    if (st === 204 || st === 205 || st === 304) bytes = null;
+    return new Response(bytes, { status: st, statusText: r.statusText || "", headers: r.headers || {} });
+  }
+  // status 0 (host failure) → 502, no throw
+  assert.equal(buildResponse({ status: 0 }).status, 502);
+  // 1xx → 502
+  assert.equal(buildResponse({ status: 101 }).status, 502);
+  // 700 (bogus) → 502
+  assert.equal(buildResponse({ status: 700 }).status, 502);
+  // 204 with a body → no throw, body dropped
+  const r204 = buildResponse({ status: 204 });
+  assert.equal(r204.status, 204);
+  // normal 200 passes through
+  assert.equal(buildResponse({ status: 200 }).status, 200);
+
+  // And confirm the shim source actually carries the clamp (regression guard).
+  assert.match(shimSource(), /if \(st < 200 \|\| st > 599\) st = 502/);
+  // status read without `|| 200` (which would turn a host-failure 0 into 200).
+  assert.match(shimSource(), /typeof r\.status === "number" \? r\.status : 200/);
+});
