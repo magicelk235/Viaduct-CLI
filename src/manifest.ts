@@ -145,7 +145,7 @@ export const UNSUPPORTED_PERMISSIONS: Record<string, string> = {
   topSites: "chrome.topSites is unsupported; shim returns an empty list.",
   search: "chrome.search is unsupported; shim opens queries in a search-engine tab.",
   declarativeContent: "declarativeContent rules never fire in Safari; use content scripts + chrome.action.",
-  userScripts: "chrome.userScripts is unsupported; declare content scripts statically or use chrome.scripting.",
+  userScripts: "The shim emulates chrome.userScripts registration (register/update/getScripts/unregister); dynamic injection of new scripts at runtime is not supported, so declare content scripts statically or use chrome.scripting where injection must actually run.",
   idle: "chrome.idle is unsupported; shim derives state from page visibility.",
   instanceID: "instanceID push plumbing is Chrome-only; use APNs natively or poll.",
   // ChromeOS-only APIs — always drop on Safari.
@@ -164,8 +164,28 @@ export const UNSUPPORTED_PERMISSIONS: Record<string, string> = {
   fontSettings: "fontSettings has no Safari equivalent; drop.",
 };
 
+/**
+ * Permissions that are removed from the manifest (Safari rejects them) but whose
+ * API the runtime shim still emulates with real, usable behavior — so the feature
+ * keeps working at runtime. These get a "shimmed" tag instead of a bare "removed"
+ * warning, so the author isn't misled into thinking the capability is gone.
+ * Only list permissions the shim functionally backs; APIs that merely reject
+ * gracefully (debugger, tabCapture, tts, …) do NOT belong here.
+ */
+export const SHIMMED_PERMISSIONS = new Set([
+  "tabGroups",
+  "userScripts",
+  "idle",
+  "sessions",
+  "topSites",
+  "search",
+]);
+
 /** chrome.* API call patterns flagged during JS scans. */
-export const UNSUPPORTED_APIS: Record<string, { severity: Issue["severity"]; message: string; fix: string }> = {
+export const UNSUPPORTED_APIS: Record<
+  string,
+  { severity: Issue["severity"]; message: string; fix: string; shimmed?: boolean }
+> = {
   "chrome.identity.launchWebAuthFlow": {
     severity: "warning",
     message: "launchWebAuthFlow is unsupported and safari-web-extension:// redirects are blocked.",
@@ -175,6 +195,7 @@ export const UNSUPPORTED_APIS: Record<string, { severity: Issue["severity"]; mes
     severity: "warning",
     message: "chrome.identity is unsupported in Safari (all platforms).",
     fix: "Replace with a hosted OAuth2 redirect flow; shim stubs it so calls reject instead of throwing.",
+    shimmed: true,
   },
   "chrome.debugger": {
     severity: "warning",
@@ -205,6 +226,7 @@ export const UNSUPPORTED_APIS: Record<string, { severity: Issue["severity"]; mes
     severity: "info",
     message: "runtime.setUninstallURL has no Safari surface; the shim no-ops the call (the uninstall page just won't open).",
     fix: "No action needed; remove the call if you want to drop the dead code.",
+    shimmed: true,
   },
   "runtime.connectNative": {
     severity: "warning",
@@ -507,13 +529,17 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
   // would otherwise produce two identical issues.
   for (const perm of new Set(allPerms)) {
     if (perm in UNSUPPORTED_PERMISSIONS) {
+      const shimmed = SHIMMED_PERMISSIONS.has(perm);
       issues.push({
         severity: "warning",
         category: "permission",
-        message: `Unsupported permission "${perm}" will be removed.`,
+        message: shimmed
+          ? `Permission "${perm}" is removed (Safari rejects it), but the shim emulates the API so it keeps working.`
+          : `Unsupported permission "${perm}" will be removed.`,
         file: "manifest.json",
         fix: UNSUPPORTED_PERMISSIONS[perm],
         autoFixed: true,
+        shimmed,
       });
       permissionsToRemove.push(perm);
     }

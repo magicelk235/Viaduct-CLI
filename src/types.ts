@@ -8,6 +8,9 @@ export interface Issue {
   line?: number;
   fix?: string;
   autoFixed?: boolean;
+  /** The runtime shim emulates this call, so it won't throw — flagged so the
+   * report can reassure rather than alarm the author. */
+  shimmed?: boolean;
 }
 
 export interface Manifest {

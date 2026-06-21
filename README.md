@@ -160,6 +160,18 @@ Analyze an extension and report issues without converting:
 viaduct ./my-extension.zip --analyze
 ```
 
+Each issue is tagged so you can tell what needs your attention from what the
+converter already handles:
+
+- **`[auto-fixed]`** — the manifest rewrite resolves it; nothing to do.
+- **`[shimmed]`** — Safari rejects the API/permission, but the injected runtime
+  shim emulates it, so the feature keeps working. Migrate for real only if the
+  shim's documented limitation matters to you.
+
+The summary line and the `--analyze --json` payload both carry `autoFixed` and
+`shimmed` counts (disjoint), so CI can see at a glance how much the converter
+absorbed.
+
 Stage for Safari 18+ "Add Temporary Extension" (no Xcode, fastest iteration):
 
 ```
@@ -211,9 +223,11 @@ The default (without `--ci`) symlinks resources for live development edits; use
     --keep-module       Keep background.type:"module" (default strips it)
     --force             Convert despite blocking errors
     --strict            Treat warnings as blocking too (CI gate)
-    --analyze           Analyze and report only
+    --analyze           Analyze and report only (also previews the manifest rewrites)
     --json              With --analyze, print a machine-readable JSON report
+    --report <file>     With --analyze, also write the report to <file> (.json if --json, else Markdown)
     --doctor            Verify xcrun/packager/xcodebuild availability
+-q, --quiet             Suppress progress messages (warnings/errors still print)
 -v, --verbose           Verbose output
 -h, --help              Show this help
     --version           Print the viaduct version and exit
