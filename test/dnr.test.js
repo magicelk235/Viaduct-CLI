@@ -78,3 +78,55 @@ test("applyDnr leaves a clean block ruleset untouched and silent", () => {
   assert.deepEqual(JSON.parse(readFileSync(join(dir, "ok.json"), "utf-8")), rules);
   assert.equal(notes.length, 0);
 });
+
+test("applyDnr notes a ruleset that is not valid JSON instead of throwing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dnr-test-"));
+  writeFileSync(join(dir, "bad.json"), "{ not json");
+  const notes = applyDnr(dir, {
+    declarative_net_request: { rule_resources: [{ id: "bad", path: "bad.json" }] },
+  });
+  assert.ok(notes.some((n) => n.includes('"bad"') && n.includes("not valid JSON")));
+});
+
+test("applyDnr notes a ruleset whose JSON is not an array of rules", () => {
+  const dir = stageWith({ "obj.json": { rules: [] } }); // object, not array
+  const notes = applyDnr(dir, {
+    declarative_net_request: { rule_resources: [{ id: "obj", path: "obj.json" }] },
+  });
+  assert.ok(notes.some((n) => n.includes('"obj"') && n.includes("not a JSON array")));
+});
+
+test("applyDnr warns about regexFilter rules Safari may silently drop", () => {
+  const rules = [{ id: 1, action: { type: "block" }, condition: { regexFilter: "ad.*\\.js" } }];
+  const dir = stageWith({ "rx.json": rules });
+  const notes = applyDnr(dir, {
+    declarative_net_request: { rule_resources: [{ id: "rx", path: "rx.json" }] },
+  });
+  assert.ok(notes.some((n) => /1 regexFilter rule/.test(n)));
+});
+
+test("applyDnr warns when enabled static rules exceed Safari's cap", () => {
+  const rules = Array.from({ length: 30001 }, (_, i) => ({
+    id: i + 1,
+    action: { type: "block" },
+    condition: { urlFilter: `x${i}` },
+  }));
+  const dir = stageWith({ "big.json": rules });
+  const notes = applyDnr(dir, {
+    declarative_net_request: { rule_resources: [{ id: "big", enabled: true, path: "big.json" }] },
+  });
+  assert.ok(notes.some((n) => /exceed the ~30000 Safari honors/.test(n)));
+});
+
+test("applyDnr does not count a disabled ruleset toward the cap", () => {
+  const rules = Array.from({ length: 30001 }, (_, i) => ({
+    id: i + 1,
+    action: { type: "block" },
+    condition: { urlFilter: `x${i}` },
+  }));
+  const dir = stageWith({ "big.json": rules });
+  const notes = applyDnr(dir, {
+    declarative_net_request: { rule_resources: [{ id: "big", enabled: false, path: "big.json" }] },
+  });
+  assert.ok(!notes.some((n) => /exceed the/.test(n)));
+});
