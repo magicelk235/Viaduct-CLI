@@ -39,12 +39,23 @@ test("summarizeManifestChanges reports dropped Chrome-only keys and Safari setti
   assert.ok(changes.some((c) => c.includes("strict_min_version")));
 });
 
-test("summarizeManifestChanges detects removed permissions and folded page_action", () => {
+test("summarizeManifestChanges detects removed permissions and folded page_action (MV3 → action)", () => {
   const before = { permissions: ["tabs", "gcm"], page_action: { default_popup: "p.html" } };
   const after = { permissions: ["tabs"], action: { default_popup: "p.html" } };
   const changes = summarizeManifestChanges(before, after);
   assert.ok(changes.some((c) => c.includes("`gcm`")));
-  assert.ok(changes.some((c) => c.includes("page_action")));
+  assert.ok(changes.some((c) => c.includes("page_action") && c.includes("`action`")));
+});
+
+test("summarizeManifestChanges reports the MV2 page_action → browser_action fold", () => {
+  // MV2 folds into browser_action (Safari rejects MV2 `action`). The summary must
+  // not silently miss it nor mislabel it as `action`.
+  const before = { page_action: { default_popup: "p.html" } };
+  const after = { browser_action: { default_popup: "p.html" } };
+  const changes = summarizeManifestChanges(before, after);
+  const line = changes.find((c) => c.includes("page_action"));
+  assert.ok(line, "fold is reported");
+  assert.ok(line.includes("`browser_action`"), "names browser_action, not action");
 });
 
 test("summarizeManifestChanges returns nothing when nothing changed", () => {
