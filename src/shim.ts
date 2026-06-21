@@ -719,7 +719,10 @@ var __C2S_DEBUG__ = false;
     // "if (!chrome.X)" guard would skip backfill and let chrome.X.missing.foo throw.
     var fill = function (obj, members) {
       if (!obj) return;
-      for (var k in members) { if (!obj[k]) { try { obj[k] = members[k]; } catch (e) {} } }
+      // Backfill only members the platform is MISSING. Test presence with the "in"
+      // operator, not truthiness: a native member that is legitimately falsy (tabId 0,
+      // a real isInstalled:false, an empty-string value) must NOT be clobbered.
+      for (var k in members) { if (!(k in obj)) { try { obj[k] = members[k]; } catch (e) {} } }
     };
     // A ChromeSetting leaf (chrome.privacy.*, chrome.contentSettings.*): get/set/clear + event.
     var chromeSetting = function () {

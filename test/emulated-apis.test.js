@@ -185,3 +185,26 @@ test("storage.sync: remove and clear honor callbacks against promise-only local"
   await new Promise((res) => chrome.storage.sync.clear(res));
   assert.deepEqual(await chrome.storage.sync.get(null), {});
 });
+
+// ---- fill() must not clobber legitimately-falsy native members ----
+// Regression: fill used `if (!obj[k])`, so a real platform member that is falsy
+// (tabId 0, isInstalled:false, "") got overwritten by the stub. The shim now tests
+// presence with `in`. Provide a chrome whose contextMenus already exists with a
+// falsy member and assert the shim leaves it intact.
+test("fill: a falsy native member is preserved, not clobbered by the stub", () => {
+  // contextMenus present but missing onClicked; a real (falsy) sentinel member set.
+  const store = makeStore();
+  const chrome = setup(store, {
+    contextMenus: {
+      // present-but-falsy: must survive
+      _nativeFlag: 0,
+      // present method: must survive (fill only adds missing)
+      create: () => "native-id",
+    },
+  });
+  assert.equal(chrome.contextMenus._nativeFlag, 0, "falsy native member preserved");
+  assert.equal(chrome.contextMenus.create(), "native-id", "native method preserved");
+  // missing member backfilled
+  assert.equal(typeof chrome.contextMenus.removeAll, "function", "missing member added");
+  assert.ok(chrome.contextMenus.onClicked, "missing event added");
+});
