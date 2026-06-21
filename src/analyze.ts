@@ -93,6 +93,10 @@ const HARDCODED_EXT_URL_RE = /chrome-extension:\/\/[a-p]{32}\b/;
 // author still needs to add their own "edit in Safari → Settings → Extensions" UI.
 const CHROME_SETTINGS_URL_RE = /chrome:\/\/(extensions|settings)\b/;
 const BLOCKING_WEBREQUEST_RE = /chrome\.webRequest\.on\w+/;
+// A regex literal that matches Chrome/Chromium followed by a version number — the
+// telltale of UA version sniffing (e.g. /Chrom(e|ium)\/([0-9]+)\./). Matches the
+// source text of such a pattern; the version capture is what breaks on Safari.
+const UA_CHROME_SNIFF_RE = /Chrom\(\?:e\|ium\)|Chrom\(e\|ium\)/;
 const TIMER_RE = /(setTimeout|setInterval)\s*\(/;
 const BACKGROUND_FILE_RE = /(background|service[-_]?worker)/i;
 // The Safari 18 port bug is specific to iframe ↔ content-script ports, reached
@@ -122,6 +126,24 @@ function scanJsContent(content: string, rel: string, issues: Issue[]): void {
       line: lineAt(h.at),
       fix: h.info.fix,
       shimmed: h.info.shimmed,
+    });
+  }
+
+  // Chrome-version sniffing out of navigator.userAgent. Safari's UA has no Chrome
+  // token, so the match returns null/undefined and the dependent feature silently
+  // dies (e.g. download URLs built from the sniffed version). The shim appends a
+  // synthetic Chrome token to navigator.userAgent inside extension contexts, so
+  // this is auto-resolved — flag it as info/shimmed so the behaviour is visible.
+  const ua = UA_CHROME_SNIFF_RE.exec(content);
+  if (ua) {
+    issues.push({
+      severity: "info",
+      category: "api",
+      message: "navigator.userAgent Chrome-version sniff detected; Safari's UA omits the Chrome token.",
+      file: rel,
+      line: lineAt(ua.index),
+      fix: "The shim appends a synthetic Chrome/120.0.0.0 token to navigator.userAgent in extension contexts, so the sniff resolves. Remove the dependency if you can.",
+      shimmed: true,
     });
   }
 
