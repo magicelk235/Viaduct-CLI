@@ -63,6 +63,24 @@ test("system.storage.getInfo reports quota from StorageManager.estimate()", asyn
   assert.equal(info[0].capacity, 5000);
 });
 
+const CHROME_VER_RE = /Chrom(?:e|ium)\/([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)/;
+const SAFARI_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
+
+test("navigator.userAgent gains a Chrome version token on Safari (fixes UA sniffing)", () => {
+  const nav = { userAgent: SAFARI_UA };
+  assert.equal(SAFARI_UA.match(CHROME_VER_RE), null, "Safari UA must lack a Chrome token to start");
+  setup(nav);
+  assert.ok(CHROME_VER_RE.test(nav.userAgent), "shim should append a Chrome/<ver> token");
+  assert.ok(nav.userAgent.startsWith(SAFARI_UA), "real UA must be preserved, not replaced");
+});
+
+test("navigator.userAgent is left untouched when a real Chrome token exists", () => {
+  const chromeUA = "Mozilla/5.0 ... Chrome/118.5.6.7 Safari/537.36";
+  const nav = { userAgent: chromeUA };
+  setup(nav);
+  assert.equal(nav.userAgent, chromeUA, "must not double-append on real Chrome");
+});
+
 test("system.storage.getInfo falls back to [] without StorageManager", async () => {
   const chrome = setup({});
   assert.deepEqual(await chrome.system.storage.getInfo(), []);
