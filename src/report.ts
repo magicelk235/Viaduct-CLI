@@ -26,8 +26,13 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
   if (before.background?.type === "module" && after.background?.type === undefined)
     out.push("Stripped `background.type:\"module\"` (Safari service-worker compat).");
 
-  if (before.page_action && after.action && !after.page_action)
-    out.push("Folded `page_action` into `action` (MV3 has no page_action).");
+  // page_action folds into the toolbar-button key valid for the manifest version:
+  // `action` on MV3, `browser_action` on MV2 (Safari rejects MV2 `action`). Report
+  // whichever one the transform actually produced.
+  if (before.page_action && !after.page_action) {
+    const foldedInto = after.action ? "action" : after.browser_action ? "browser_action" : null;
+    if (foldedInto) out.push(`Folded \`page_action\` into \`${foldedInto}\` (Safari has no page_action).`);
+  }
 
   if (typeof before.content_security_policy === "string" && typeof after.content_security_policy === "object")
     out.push("Wrapped string CSP into MV3 `{ extension_pages }` object.");
