@@ -942,11 +942,14 @@ export function transformManifest(
     delete out.background.type;
   }
 
-  // MV2 page_action has no MV3 equivalent; fold it into action so the toolbar
-  // button still works. (MV3 dropped the show-only-on-some-pages distinction —
-  // Safari treats both as a plain action.)
+  // page_action has no Safari equivalent; fold it into the toolbar-button key that
+  // is valid for THIS manifest version. On MV3 that's `action`; on MV2 it must be
+  // `browser_action` — injecting an `action` key into an MV2 manifest makes Safari
+  // reject it at load (same rule the popup-wiring below relies on). (MV3 dropped the
+  // show-only-on-some-pages distinction; Safari treats both as a plain action.)
   if (out.page_action && !out.action && !out.browser_action) {
-    out.action = out.page_action as Manifest["action"];
+    const foldKey = mv === 3 ? "action" : "browser_action";
+    out[foldKey] = out.page_action as Manifest["action"];
     delete out.page_action;
   }
 

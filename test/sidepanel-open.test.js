@@ -69,3 +69,14 @@ test("sidePanel.open() falls back to a tab when openPopup is absent (old Safari)
   await chrome.sidePanel.open({});
   assert.ok(tabCreated, "old Safari without openPopup still opens the panel");
 });
+
+// Regression: the tabId panel shim must NOT monkeypatch URLSearchParams.prototype.get.
+// Doing so clobbered a native method for every URLSearchParams instance in the doc,
+// feeding unrelated app code the injected tabId. The tabId now reaches consumers via
+// history.replaceState writing it into location.search instead.
+test("shim does not clobber URLSearchParams.prototype.get", () => {
+  assert.ok(
+    !/URLSearchParams\.prototype\.get\s*=/.test(shimSource()),
+    "shim must not override the native URLSearchParams.prototype.get"
+  );
+});
