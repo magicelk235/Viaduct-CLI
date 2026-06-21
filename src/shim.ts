@@ -1996,7 +1996,15 @@ var __C2S_DEBUG__ = false;
         if (!r || r.error) throw new Error((r && r.error) || "native host: empty reply");
         var bytes = null;
         try { if (typeof r.bodyB64 === "string") { var bin = atob(r.bodyB64); bytes = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i); } } catch (e) {}
-        return new Response(bytes, { status: r.status || 200, statusText: r.statusText || "", headers: r.headers || {} });
+        // Response() only accepts status 200-599; a host network failure (0) or a 1xx
+        // throws RangeError, and a body alongside a null-body status (204/205/304)
+        // throws TypeError — either would crash proxyFetch with a cryptic error
+        // instead of surfacing the host result. Clamp the status and drop the body
+        // for null-body statuses.
+        var st = typeof r.status === "number" ? r.status : 200;
+        if (st < 200 || st > 599) st = 502; // out-of-range (incl. 0) → Bad Gateway
+        if (st === 204 || st === 205 || st === 304) bytes = null;
+        return new Response(bytes, { status: st, statusText: r.statusText || "", headers: r.headers || {} });
       });
     }
 
