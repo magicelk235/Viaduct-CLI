@@ -62,6 +62,23 @@ var __C2S_DEBUG__ = false;
   if (!api) return;
   var hasChrome = typeof chrome !== "undefined";
 
+  // navigator.userAgent Chrome-version spoof. Extensions commonly sniff the
+  // Chrome version out of the UA (e.g. /Chrom(e|ium)\/(\d+)\.(\d+)\.(\d+)\.(\d+)/)
+  // to build Web-Store / update URLs or gate behaviour. Safari's UA has no Chrome
+  // token, so that sniff returns undefined and the feature silently dies (the
+  // "Extension Source Downloader" download button is the canonical case). Only
+  // patch when the real UA lacks a Chrome token, and only inside the extension's
+  // own pages/worker (this shim never runs in web content), so we don't lie to
+  // sites or break Safari feature detection. Append a plausible Chrome token to
+  // the genuine UA rather than replacing it.
+  try {
+    if (typeof navigator !== "undefined" && navigator.userAgent &&
+        !/Chrom(e|ium)\/\d+\.\d+\.\d+\.\d+/.test(navigator.userAgent)) {
+      var __ua = navigator.userAgent + " Chrome/120.0.0.0";
+      Object.defineProperty(navigator, "userAgent", { get: function () { return __ua; }, configurable: true });
+    }
+  } catch (e) {}
+
   // Inert event stub so module-eval code that reads .addListener on a missing API does not throw.
   function event() {
     return { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } };
@@ -185,14 +202,26 @@ var __C2S_DEBUG__ = false;
   if (api.storage && api.storage.local &&
       (!api.storage.sync || typeof api.storage.sync.get !== "function")) {
     var local = api.storage.local;
+    // Bridge Chrome's callback form. When api is the webextension-polyfill
+    // browser object, local.get/set/... are promise-ONLY and ignore a trailing
+    // callback — so chrome.storage.sync.get(keys, cb) would never fire cb. Strip a
+    // trailing function arg and route the promise result to it; otherwise return the
+    // promise. (Mirrors Chrome's dual callback/Promise contract.)
+    var syncFwd = function (fn) {
+      return function () {
+        var a = [].slice.call(arguments);
+        var cb = typeof a[a.length - 1] === "function" ? a.pop() : null;
+        var p = fn.apply(local, a);
+        if (cb) { Promise.resolve(p).then(function (r) { cb(r); }, function () { cb(); }); return; }
+        return p;
+      };
+    };
     api.storage.sync = {
-      get: function () { return local.get.apply(local, arguments); },
-      set: function () { return local.set.apply(local, arguments); },
-      remove: function () { return local.remove.apply(local, arguments); },
-      clear: function () { return local.clear.apply(local, arguments); },
-      getBytesInUse: function () {
-        return local.getBytesInUse ? local.getBytesInUse.apply(local, arguments) : Promise.resolve(0);
-      },
+      get: syncFwd(local.get),
+      set: syncFwd(local.set),
+      remove: syncFwd(local.remove),
+      clear: syncFwd(local.clear),
+      getBytesInUse: local.getBytesInUse ? syncFwd(local.getBytesInUse) : function () { return Promise.resolve(0); },
       // Bundles read storage.sync.onChanged.addListener at module-eval; a stub
       // without it throws and aborts evaluation. storage.onChanged (Chrome's real
       // location — there is no storage.local.onChanged) fires for local writes too.
@@ -2086,12 +2115,11 @@ var __C2S_DEBUG__ = false;
             if (qret && typeof qret.then === "function") qret.then(assign);
           } catch (e) {}
         }
-        var _uspGet = URLSearchParams.prototype.get;
-        URLSearchParams.prototype.get = function (k) {
-          var val = _uspGet.call(this, k);
-          if (val == null && k === "tabId" && c2sTabId != null) return c2sTabId;
-          return val;
-        };
+        // The tabId is written into location.search via history.replaceState above,
+        // so new URLSearchParams(location.search).get("tabId") sees it naturally. We
+        // deliberately do NOT monkeypatch URLSearchParams.prototype.get — doing so
+        // would clobber a native method for every instance in the document, feeding
+        // unrelated app code the injected tabId.
       }
     } catch (e) { /* ignore */ }
   }
