@@ -126,6 +126,40 @@ export function installToSafari(opts: InstallOptions): InstallResult {
   return result;
 }
 
+export interface SafariExtension {
+  bundleId: string;
+  path: string;
+}
+
+/**
+ * Parse pluginkit's machine-readable `-mv` output: each extension is one line of
+ * `<flags>\t<bundleId>(<version>)\t<path>`. pluginkit prints "(no matches)" (or
+ * nothing) when none are registered. Pure (no I/O) so it's unit-testable.
+ */
+export function parsePluginkitList(stdout: string): SafariExtension[] {
+  const out: SafariExtension[] = [];
+  for (const raw of stdout.split("\n")) {
+    const line = raw.trim();
+    if (!line || line === "(no matches)") continue;
+    // Format: `<flags> <bundleId>(<version>)\t<path>`. Flags and id share the
+    // first tab-column (space-separated); the path follows the last tab.
+    const cols = line.split("\t").filter((c) => c.length > 0);
+    if (cols.length < 2) continue;
+    const path = cols[cols.length - 1];
+    // The id is the last space-separated token of the first column; it carries a
+    // trailing "(version)" — strip it for a clean id.
+    const idToken = cols[0].split(/\s+/).filter(Boolean).pop() ?? "";
+    const bundleId = idToken.replace(/\(.*\)$/, "").trim();
+    if (bundleId) out.push({ bundleId, path });
+  }
+  return out;
+}
+
+/** List Safari Web Extensions registered with pluginkit for this user. */
+export function listSafariExtensions(): SafariExtension[] {
+  return parsePluginkitList(run("pluginkit", ["-mv", "-p", "com.apple.Safari.web-extension"]).stdout);
+}
+
 /**
  * Remove a previously installed Safari host app: delete <AppName>.app from the
  * install dir and unregister it from LaunchServices. Inverse of installToSafari.

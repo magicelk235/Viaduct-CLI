@@ -29,6 +29,12 @@ export function setVerbose(v: boolean): void {
   verbose = v;
 }
 
+let quiet = false;
+/** Suppress progress chatter (info/ok); warnings and failures still print. */
+export function setQuiet(v: boolean): void {
+  quiet = v;
+}
+
 /** Run a command, capturing output. Never throws on non-zero exit. */
 export function run(cmd: string, args: string[], opts: SpawnSyncOptions = {}): RunResult {
   if (verbose) console.error(color("dim", `$ ${cmd} ${args.join(" ")}`));
@@ -57,9 +63,11 @@ export function commandExists(cmd: string): boolean {
 // --analyze --json payload). A consumer piping stdout must get clean JSON, not
 // interleaved progress lines.
 export function info(msg: string): void {
+  if (quiet) return;
   console.error(`${color("blue", "›")} ${msg}`);
 }
 export function ok(msg: string): void {
+  if (quiet) return;
   console.error(`${color("green", "✓")} ${msg}`);
 }
 export function warn(msg: string): void {

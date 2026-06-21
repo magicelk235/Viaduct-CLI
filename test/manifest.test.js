@@ -80,6 +80,17 @@ test("analyzeManifest marks unsupported permissions for removal", () => {
   assert.ok(!permissionsToRemove.includes("tabs"));
 });
 
+test("analyzeManifest tags shim-backed removed permissions as shimmed", () => {
+  const { issues } = analyzeManifest({
+    manifest_version: 3,
+    permissions: ["tabGroups", "offscreen"],
+  });
+  const tabGroups = issues.find((i) => i.category === "permission" && i.message.includes('"tabGroups"'));
+  const offscreen = issues.find((i) => i.category === "permission" && i.message.includes('"offscreen"'));
+  assert.equal(tabGroups?.shimmed, true);
+  assert.ok(offscreen && !offscreen.shimmed);
+});
+
 test("analyzeManifest errors on an invalid content-script match pattern", () => {
   const { issues } = analyzeManifest({
     manifest_version: 3,
