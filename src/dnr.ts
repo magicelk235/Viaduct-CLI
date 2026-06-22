@@ -1,6 +1,18 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { resolve, relative, isAbsolute } from "node:path";
 import type { Manifest } from "./types.js";
+
+// res.path comes from the extension's manifest.json — untrusted. A path like
+// "../../etc/x" would make join() resolve outside stageDir, and the modifyHeaders
+// strip below writeFileSync()s back to it: arbitrary file overwrite from a
+// malicious extension. Confirm the resolved path stays under stageDir.
+// ponytail: string-prefix check via path.relative; fine for a local single root.
+function resolveInside(stageDir: string, p: string): string | null {
+  const full = resolve(stageDir, p);
+  const rel = relative(resolve(stageDir), full);
+  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return null;
+  return full;
+}
 
 /** True if the extension talks to api.anthropic.com (CSP, host_permissions, etc.). */
 export function needsAnthropicCorsBypass(manifest: Manifest): boolean {
@@ -44,7 +56,11 @@ export function applyDnr(stageDir: string, manifest: Manifest): string[] {
       continue;
     }
     const id = res.id ?? res.path;
-    const file = join(stageDir, res.path);
+    const file = resolveInside(stageDir, res.path);
+    if (file === null) {
+      notes.push(`DNR ruleset "${id}" path ${res.path} escapes the extension directory; skipped.`);
+      continue;
+    }
     if (!existsSync(file)) {
       notes.push(`DNR ruleset "${id}" points to missing file ${res.path}; Safari will fail to load it.`);
       continue;
