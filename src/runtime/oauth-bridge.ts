@@ -1,10 +1,8 @@
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, dirname, relative } from "node:path";
-import { fileURLToPath } from "node:url";
-import type { Manifest } from "./types.js";
-
-const TEMPLATE_DIR = join(dirname(fileURLToPath(import.meta.url)), "templates");
+import type { Manifest } from "../types.js";
+import { TEMPLATE_DIR } from "../paths.js";
 
 export const BRIDGE_POLYFILL = "identity-polyfill.js";
 export const BRIDGE_PAGE = "page-bridge.js";

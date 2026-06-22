@@ -5,14 +5,14 @@ import { tmpdir } from "node:os";
 import { join, resolve, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { convert } from "./convert.js";
-import { extractExtension } from "./extract.js";
-import { loadManifest, analyzeManifest, resolveI18nString, transformManifest } from "./manifest.js";
-import { scanExtension } from "./analyze.js";
-import { printIssues, countBlocking, summarizeManifestChanges, buildReportMarkdown } from "./report.js";
+import { extractExtension } from "./input/extract.js";
+import { loadManifest, analyzeManifest, resolveI18nString, transformManifest } from "./manifest/manifest.js";
+import { scanExtension } from "./analyze/analyze.js";
+import { printIssues, countBlocking, summarizeManifestChanges, buildReportMarkdown } from "./analyze/report.js";
 import { run, info, ok, warn, fail, color, commandExists, setVerbose, setQuiet } from "./util.js";
-import { LSREGISTER, uninstallFromSafari, listSafariExtensions } from "./installer.js";
-import { detectXcodeTeam, defaultBundleId } from "./packager.js";
-import { isUrl, downloadExtension } from "./download.js";
+import { LSREGISTER, uninstallFromSafari, listSafariExtensions } from "./build/installer.js";
+import { detectXcodeTeam, defaultBundleId } from "./build/packager.js";
+import { isUrl, downloadExtension } from "./input/download.js";
 import type { Platforms } from "./types.js";
 
 function pkgVersion(): string {

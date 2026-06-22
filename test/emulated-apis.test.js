@@ -2,7 +2,7 @@
 // userScripts (registry), instanceID (stable id).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { shimSource } from "../dist/shim.js";
+import { shimSource } from "../dist/runtime/shim.js";
 
 function makeStore() {
   const data = {};

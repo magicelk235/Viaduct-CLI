@@ -19,7 +19,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { convert } from "../dist/convert.js";
-import { shimSource, SHIM_FILENAME } from "../dist/shim.js";
+import { shimSource, SHIM_FILENAME } from "../dist/runtime/shim.js";
 
 const CHROME_ID = "abcdefghijklmnopabcdefghijklmnop";
 

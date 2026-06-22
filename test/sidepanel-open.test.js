@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
-import { shimSource } from "../dist/shim.js";
+import { shimSource } from "../dist/runtime/shim.js";
 
 // Run the generated shim in a sandbox with a chrome mock that LACKS sidePanel
 // (Safari), so the shim installs its sidePanel fallback. Then assert open()

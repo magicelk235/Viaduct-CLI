@@ -2,7 +2,7 @@
 // bookmark API). These exercise CRUD, tree assembly, search, events, persistence.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { shimSource } from "../dist/shim.js";
+import { shimSource } from "../dist/runtime/shim.js";
 
 // Shared async storage.local backing two shim instances to test persistence.
 function makeStore() {

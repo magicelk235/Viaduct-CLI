@@ -1,9 +1,7 @@
 import { writeFileSync, readFileSync, readdirSync, copyFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-import type { Manifest } from "./types.js";
-
-const TEMPLATE_DIR = join(dirname(fileURLToPath(import.meta.url)), "templates");
+import type { Manifest } from "../types.js";
+import { TEMPLATE_DIR, RUNTIME_DIR } from "../paths.js";
 
 export const SHIM_FILENAME = "safari-compat-shim.js";
 export const POLYFILL_FILENAME = "browser-polyfill.min.js";
@@ -40,8 +38,6 @@ export interface ShimConfig {
    *  browser blocks (CORS/401/403) is retried through the native host. */
   proxyHosts?: string[];
 }
-
-const RUNTIME_DIR = join(dirname(fileURLToPath(import.meta.url)), "runtime");
 
 export function shimSource(config: ShimConfig = {}): string {
   // The proxy allowlist + spoofed origin are injected as a JSON literal so the

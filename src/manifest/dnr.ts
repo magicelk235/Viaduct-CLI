@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { resolve, relative, isAbsolute } from "node:path";
-import type { Manifest } from "./types.js";
+import type { Manifest } from "../types.js";
 
 // res.path comes from the extension's manifest.json — untrusted. A path like
 // "../../etc/x" would make join() resolve outside stageDir, and the modifyHeaders

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { deriveChromeId } from "../dist/oauth-bridge.js";
+import { deriveChromeId } from "../dist/runtime/oauth-bridge.js";
 
 // deriveChromeId reproduces Chrome's extension-id algorithm: SHA-256 the decoded
 // `key` (DER public key), take the first 16 bytes, map each nibble 0–15 to a–p.

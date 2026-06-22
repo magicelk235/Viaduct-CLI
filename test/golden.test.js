@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { analyzeManifest, transformManifest } from "../dist/manifest.js";
-import { scanExtension } from "../dist/analyze.js";
+import { analyzeManifest, transformManifest } from "../dist/manifest/manifest.js";
+import { scanExtension } from "../dist/analyze/analyze.js";
 
 // Run a real manifest through the analyze → transform pipeline against an
 // on-disk extension dir (so popup auto-wiring and any path probing behave as
