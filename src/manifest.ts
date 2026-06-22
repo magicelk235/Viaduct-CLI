@@ -701,7 +701,7 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
   const mv = m.manifest_version ?? 2;
   if (mv === 2 && m.background && m.background.persistent !== false) {
     issues.push({
-      severity: "error",
+      severity: "warning",
       category: "background",
       message: "MV2 persistent background is unsupported; setting persistent:false.",
       file: "manifest.json",

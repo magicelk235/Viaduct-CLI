@@ -130,3 +130,18 @@ test("applyDnr does not count a disabled ruleset toward the cap", () => {
   });
   assert.ok(!notes.some((n) => /exceed the/.test(n)));
 });
+
+test("applyDnr refuses a rule_resources path that escapes the stage dir", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dnr-test-"));
+  // a sentinel file one level up that a "../" path could clobber
+  const outside = join(dir, "..", "dnr-escape-victim.json");
+  writeFileSync(outside, "ORIGINAL");
+  const notes = applyDnr(dir, {
+    declarative_net_request: {
+      rule_resources: [{ id: "evil", path: "../dnr-escape-victim.json" }],
+    },
+  });
+  assert.ok(notes.some((n) => /escapes the extension directory/.test(n)));
+  // and it was not read/rewritten
+  assert.equal(readFileSync(outside, "utf-8"), "ORIGINAL");
+});
