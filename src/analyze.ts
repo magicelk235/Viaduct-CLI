@@ -152,13 +152,22 @@ function scanJsContent(content: string, rel: string, issues: Issue[]): void {
   // addListener extraInfoSpec array. Match the quoted token, not the bare word
   // (which fires on comments, CSS classes, and unrelated identifiers).
   if (wr && /["']blocking["']/.test(content)) {
+    // Blocking webRequest can't BLOCK in Safari, but it doesn't abort the
+    // extension: the shim (and Safari's own webRequest) accept the listener
+    // registration, the blocking return value is simply ignored, and every
+    // other feature of the extension still works. Aborting conversion here
+    // killed every ad-blocker / password-manager / VPN (Bitwarden, LastPass,
+    // Honey, Urban VPN, uBlock…) — the single largest cause of "didn't convert".
+    // Downgrade to a warning: the network-blocking feature degrades, the
+    // extension still installs and runs. DNR migration is the real fix.
     issues.push({
-      severity: "error",
+      severity: "warning",
       category: "api",
-      message: "Blocking webRequest detected; unsupported in Safari (and absent on iOS).",
+      message: "Blocking webRequest detected; Safari ignores the blocking return (listeners still fire as observers). The network-modifying feature degrades, but the extension still loads.",
       file: rel,
       line: lineAt(wr.index),
-      fix: "Migrate to declarativeNetRequest rulesets.",
+      fix: "Migrate the blocking rules to declarativeNetRequest rulesets for them to actually take effect in Safari.",
+      shimmed: true,
     });
   }
 
