@@ -105,6 +105,44 @@ var __C2S_DEBUG__ = false;
     try { self.importScripts = function () {}; } catch (e) {}
   }
 
+  // requestIdleCallback / cancelIdleCallback are missing in Safari worker and some
+  // extension contexts. uBlock's contentscript calls self.requestIdleCallback(...)
+  // and throws "is not a function". Polyfill with a setTimeout shim (the standard
+  // fallback) so idle-scheduled work still runs.
+  (function () {
+    var g = (typeof self !== "undefined") ? self : (typeof globalThis !== "undefined" ? globalThis : null);
+    if (!g) return;
+    if (typeof g.requestIdleCallback !== "function") {
+      try {
+        g.requestIdleCallback = function (cb, opts) {
+          var start = Date.now();
+          return setTimeout(function () {
+            try { cb({ didTimeout: false, timeRemaining: function () { return Math.max(0, 50 - (Date.now() - start)); } }); } catch (e) {}
+          }, (opts && opts.timeout) ? Math.min(opts.timeout, 1) : 1);
+        };
+        g.cancelIdleCallback = function (id) { clearTimeout(id); };
+      } catch (e) {}
+    }
+    // In a converted MV3 background PAGE (not a real service worker) self.registration
+    // is undefined; code that reads self.registration.addEventListener at eval
+    // (Momentum) throws. Provide an inert ServiceWorkerRegistration-shaped stub so
+    // the read/addEventListener does not abort the bundle. It cannot fire real SW
+    // lifecycle events, but neither can a background page — the goal is "don't crash".
+    if (typeof self !== "undefined" && !self.registration) {
+      try {
+        self.registration = {
+          scope: (typeof location !== "undefined" && location.href) || "/",
+          active: null, installing: null, waiting: null,
+          addEventListener: function () {}, removeEventListener: function () {},
+          update: function () { return Promise.resolve(); },
+          unregister: function () { return Promise.resolve(true); },
+          showNotification: function () { return Promise.resolve(); },
+          getNotifications: function () { return Promise.resolve([]); },
+        };
+      } catch (e) {}
+    }
+  })();
+
   // Chrome exposes runtime lifecycle event objects that Safari omits. The SW
   // bundle reads chrome.runtime.<event>.addListener at module-eval; a missing one
   // throws a TypeError that aborts module evaluation BEFORE onMessageExternal is
@@ -114,14 +152,46 @@ var __C2S_DEBUG__ = false;
   // OAuth bridge handlers.
   var rtEvents = ["onStartup", "onInstalled", "onSuspend", "onSuspendCanceled",
     "onUpdateAvailable", "onBrowserUpdateAvailable", "onRestartRequired"];
+  // Chrome also exposes ENUM objects on chrome.runtime (OnInstalledReason, etc.).
+  // SW bundles read e.g. chrome.runtime.OnInstalledReason.INSTALL at module-eval;
+  // Safari's polyfill omits them, so the read throws TypeError and aborts the SW
+  // (→ Loom/Requestly/Alarms "OnInstalledReason.INSTALL" undefined). Backfill the
+  // documented string-enum objects when absent.
+  var rtEnums = {
+    OnInstalledReason: { INSTALL: "install", UPDATE: "update", CHROME_UPDATE: "chrome_update", SHARED_MODULE_UPDATE: "shared_module_update" },
+    OnRestartRequiredReason: { APP_UPDATE: "app_update", OS_UPDATE: "os_update", PERIODIC: "periodic" },
+    PlatformOs: { MAC: "mac", WIN: "win", ANDROID: "android", CROS: "cros", LINUX: "linux", OPENBSD: "openbsd", FUCHSIA: "fuchsia" },
+    PlatformArch: { ARM: "arm", "ARM64": "arm64", X86_32: "x86-32", X86_64: "x86-64", MIPS: "mips", MIPS64: "mips64" },
+    PlatformNaclArch: { ARM: "arm", X86_32: "x86-32", X86_64: "x86-64", MIPS: "mips", MIPS64: "mips64" },
+    RequestUpdateCheckStatus: { THROTTLED: "throttled", NO_UPDATE: "no_update", UPDATE_AVAILABLE: "update_available" },
+    ContextType: { TAB: "TAB", POPUP: "POPUP", BACKGROUND: "BACKGROUND", OFFSCREEN_DOCUMENT: "OFFSCREEN_DOCUMENT", SIDE_PANEL: "SIDE_PANEL" },
+  };
   function backfillRuntimeEvents(rt) {
     if (!rt) return;
     for (var ri = 0; ri < rtEvents.length; ri++) {
       if (!rt[rtEvents[ri]]) { try { rt[rtEvents[ri]] = event(); } catch (e) {} }
     }
+    for (var ek in rtEnums) {
+      if (!rt[ek]) { try { rt[ek] = rtEnums[ek]; } catch (e) {} }
+    }
   }
-  backfillRuntimeEvents(typeof chrome !== "undefined" && chrome.runtime);
-  if (typeof browser !== "undefined" && browser !== chrome) backfillRuntimeEvents(browser.runtime);
+  backfillRuntimeEvents(hasChrome && chrome.runtime);
+  // Guard the chrome ref: Safari can expose browser with NO chrome global, so a
+  // bare 'browser !== chrome' throws Reference(chrome) and aborts the whole shim —
+  // taking every stub below it down too. Only compare when chrome exists.
+  if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) backfillRuntimeEvents(browser.runtime);
+
+  // chrome.scripting exists in Safari but omits the ExecutionWorld / RegistrationWorld
+  // enum objects. SW/background code reads chrome.scripting.ExecutionWorld.ISOLATED
+  // at module-eval (Bitwarden, React DevTools), which throws and aborts the bundle.
+  // Backfill the documented enums onto whichever scripting namespace exists.
+  function backfillScriptingEnums(sc) {
+    if (!sc) return;
+    if (!sc.ExecutionWorld) { try { sc.ExecutionWorld = { ISOLATED: "ISOLATED", MAIN: "MAIN" }; } catch (e) {} }
+    if (!sc.RegistrationWorld) { try { sc.RegistrationWorld = { ISOLATED: "ISOLATED", MAIN: "MAIN" }; } catch (e) {} }
+  }
+  backfillScriptingEnums(hasChrome && chrome.scripting);
+  if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) backfillScriptingEnums(browser.scripting);
 
   // Safari's action popup (default_popup) is a POPOVER, not a side panel sharing
   // the browser window. So tabs.query({active:true,currentWindow:true}) resolves
@@ -193,8 +263,8 @@ var __C2S_DEBUG__ = false;
     if (typeof cb === "function") { try { cb(stub); } catch (e) {} return; }
     return Promise.resolve(stub);
   }
-  wrapTabsQuery(typeof chrome !== "undefined" ? chrome : null);
-  if (typeof browser !== "undefined" && browser !== chrome) wrapTabsQuery(browser);
+  wrapTabsQuery(hasChrome ? chrome : null);
+  if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) wrapTabsQuery(browser);
 
   // storage.sync has no iCloud sync in Safari; route it to local so data persists.
   // Only shim when sync is missing or non-functional — never clobber a browser
@@ -1882,6 +1952,20 @@ var __C2S_DEBUG__ = false;
   // so the crash never arms; block/redirect/allow rules pass through untouched.
   if (hasChrome && chrome.declarativeNetRequest) {
     var dnrNs = chrome.declarativeNetRequest;
+    // Chrome exposes string-enum objects + onRuleMatchedDebug on the DNR namespace
+    // that Safari omits. Module-eval code reads e.g. RuleActionType.MODIFY_HEADERS
+    // (Claude) or onRuleMatchedDebug.addListener (URL Blocker) at top level, which
+    // throws and aborts the SW. Backfill the documented enums + the debug event.
+    var dnrEnums = {
+      RuleActionType: { BLOCK: "block", REDIRECT: "redirect", ALLOW: "allow", UPGRADE_SCHEME: "upgradeScheme", MODIFY_HEADERS: "modifyHeaders", ALLOW_ALL_REQUESTS: "allowAllRequests" },
+      ResourceType: { MAIN_FRAME: "main_frame", SUB_FRAME: "sub_frame", STYLESHEET: "stylesheet", SCRIPT: "script", IMAGE: "image", FONT: "font", OBJECT: "object", XMLHTTPREQUEST: "xmlhttprequest", PING: "ping", CSP_REPORT: "csp_report", MEDIA: "media", WEBSOCKET: "websocket", WEBTRANSPORT: "webtransport", WEBBUNDLE: "webbundle", OTHER: "other" },
+      HeaderOperation: { APPEND: "append", SET: "set", REMOVE: "remove" },
+      DomainType: { FIRST_PARTY: "firstParty", THIRD_PARTY: "thirdParty" },
+      RequestMethod: { CONNECT: "connect", DELETE: "delete", GET: "get", HEAD: "head", OPTIONS: "options", PATCH: "patch", POST: "post", PUT: "put", OTHER: "other" },
+      UnsupportedRegexReason: { SYNTAX_ERROR: "syntaxError", MEMORY_LIMIT_EXCEEDED: "memoryLimitExceeded" },
+    };
+    for (var dk in dnrEnums) { if (!dnrNs[dk]) { try { dnrNs[dk] = dnrEnums[dk]; } catch (e) {} } }
+    if (!dnrNs.onRuleMatchedDebug) { try { dnrNs.onRuleMatchedDebug = event(); } catch (e) {} }
     var stripModifyHeaders = function (opts) {
       if (!opts || !Array.isArray(opts.addRules)) return opts;
       var safe = opts.addRules.filter(function (r) {
