@@ -93,6 +93,19 @@ test("scanExtension warns on importScripts() with a dynamic argument (can't hois
   assert.equal(m.severity, "warning");
 });
 
+test("scanExtension warns (not fatal) on blocking webRequest so the extension still converts", () => {
+  // Bitwarden/LastPass/Honey/uBlock all use blocking webRequest. Safari ignores
+  // the blocking return but the extension loads and works — so this must NOT be a
+  // blocking error, or every ad-blocker/password-manager fails to convert.
+  const dir = fixture({
+    "bg.js": 'chrome.webRequest.onBeforeRequest.addListener(fn, {urls:["<all_urls>"]}, ["blocking"]);',
+  });
+  const issues = scanExtension(dir, { manifest_version: 3 }, "macos");
+  const m = issues.find((i) => /blocking webRequest/i.test(i.message));
+  assert.ok(m, "expected a blocking-webRequest issue");
+  assert.equal(m.severity, "warning");
+});
+
 test("scanExtension stays quiet on a clean extension (no false positives)", () => {
   const dir = fixture({
     "icon.png": "PNG",
