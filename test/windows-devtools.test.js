@@ -52,6 +52,30 @@ test("devtools: panels/network/inspectedWindow stubbed so a devtools page loads"
   assert.equal(typeof chrome.devtools.network.onRequestFinished.addListener, "function");
   assert.doesNotThrow(() => chrome.devtools.panels.create("t", "", "p.html", () => {}));
   assert.equal(chrome.devtools.inspectedWindow.tabId, -1);
+  // elements/sources sidebar panes: the elements-panel extension pattern calls
+  // createSidebarPane at devtools load; a missing method threw and killed the page.
+  let pane;
+  assert.doesNotThrow(() => { pane = chrome.devtools.panels.elements.createSidebarPane("My Pane", (p) => { pane = p; }); });
+  assert.equal(typeof pane.setObject, "function");
+  assert.equal(typeof pane.setExpression, "function");
+  assert.equal(typeof chrome.devtools.panels.sources.createSidebarPane, "function");
+});
+
+test("a throw inside a backfill section never escapes the shim to abort the host script", () => {
+  // Core contract: the shim is prepended to every content script and HTML page,
+  // so a throw at its top level kills that whole script (blank popup / dead content
+  // script). The chrome.* backfill blocks run ~1100 sequential statements; if any
+  // one throws (here simulated with a hostile getter on chrome.omnibox), the
+  // per-block try/catch must swallow it. Whatever ran before the throw stays;
+  // the host script keeps executing. This is the guarantee that matters in prod —
+  // real Safari namespaces are plain objects and don't throw on read, but a
+  // future Safari quirk must never take the host script down.
+  const chrome = {
+    runtime: { lastError: null, getManifest: () => ({}) },
+    tabs: { onUpdated: { addListener() {} }, onRemoved: { addListener() {} } },
+  };
+  Object.defineProperty(chrome, "omnibox", { configurable: true, get() { throw new Error("hostile getter"); } });
+  assert.doesNotThrow(() => runShim(chrome), "shim must not propagate a section throw to the host script");
 });
 
 test("app: isInstalled reports not-installed", async () => {

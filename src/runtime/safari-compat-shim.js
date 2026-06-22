@@ -7,6 +7,25 @@ var __C2S_DEBUG__ = false;
   "use strict";
   var api = typeof browser !== "undefined" ? browser : (typeof chrome !== "undefined" ? chrome : null);
   if (!api) return;
+
+  // Publish a global `chrome` aliased to `browser` BEFORE anything else. Safari
+  // exposes `browser` in extension pages/content scripts/background, but `chrome`
+  // is frequently absent (it is not guaranteed, and browser-polyfill's aliasing
+  // can lose to load order). The overwhelming majority of converted bundles call
+  // `chrome.*` directly at top level (popup.js: `chrome.storage.local`), so a
+  // missing `chrome` throws "chrome is not defined" and kills the whole script —
+  // blank popups, dead content scripts, dead background. Aliasing here means every
+  // `chrome.X` read below resolves to the real `browser.X`, and the `hasChrome`-
+  // gated backfills now also run. Only create it when truly absent so we never
+  // clobber a real `chrome` (and so `browser === chrome` stays true on Safari).
+  if (typeof chrome === "undefined" && typeof browser !== "undefined") {
+    try {
+      var __g = (typeof globalThis !== "undefined") ? globalThis
+        : (typeof self !== "undefined") ? self
+        : (typeof window !== "undefined") ? window : null;
+      if (__g) __g.chrome = browser;
+    } catch (e) {}
+  }
   var hasChrome = typeof chrome !== "undefined";
 
   // navigator.userAgent Chrome-version spoof. Extensions commonly sniff the
@@ -355,7 +374,13 @@ var __C2S_DEBUG__ = false;
   // works, so grouping logic runs instead of silently no-opping.
   // ponytail: in-memory only — groups don't survive a background-page restart; add
   // chrome.storage.session persistence if a restart drops groups the UI still shows.
-  if (hasChrome) {
+  // Per-section guard: this block backfills many chrome.* namespaces in sequence.
+  // A throw partway through (a getter on a partial Safari namespace, an exotic
+  // native object) must NOT skip the patches below it — and must NEVER propagate
+  // out of the IIFE, which would abort the entire host script this shim is
+  // prepended to (blank popup / dead content script). Individual try/catch inside
+  // covers the known-risky calls; this wraps the structural statements between them.
+  if (hasChrome) try {
     var NONE = -1;
     var c2sGroups = Object.create(null); // groupId -> { id,title,color,collapsed,windowId }
     var c2sTabGroup = Object.create(null); // tabId -> groupId
@@ -477,7 +502,7 @@ var __C2S_DEBUG__ = false;
         }
       }
     }
-  }
+  } catch (__tabGroupsErr) {}
 
   // chrome.debugger (CDP) polyfill. Safari has no DevTools Protocol, but
   // Claude-for-Chrome drives pages ENTIRELY through it: attach -> Page.enable ->
@@ -732,7 +757,10 @@ var __C2S_DEBUG__ = false;
   // aborts SW/page evaluation and blanks the surface — same failure class as
   // tabGroups/notifications above. Backfill each absent namespace with inert stubs:
   // event objects no-op, methods resolve/reject so callers degrade instead of crash.
-  if (hasChrome) {
+  // Per-section guard (see the tabGroups block above): ~1100 lines of sequential
+  // chrome.* namespace backfills. A throw in any one must not skip the rest, and
+  // must never escape the IIFE to abort the host script.
+  if (hasChrome) try {
     var rejectUnsupported = function (name) {
       return function () { return Promise.reject(new Error(name + " is unsupported in Safari.")); };
     };
@@ -1532,7 +1560,12 @@ var __C2S_DEBUG__ = false;
         onRequestFinished: event(), onNavigated: event(),
       },
       panels: {
-        themeName: "default", elements: { onSelectionChanged: event() }, sources: { onSelectionChanged: event() },
+        themeName: "default",
+        // elements/sources sidebar panes: bundles call createSidebarPane(title, cb)
+        // at devtools-load (the elements panel extension pattern). Missing it throws
+        // and kills the devtools page. Hand back an inert ExtensionSidebarPane.
+        elements: { onSelectionChanged: event(), createSidebarPane: function (title, cb) { var pane = { setObject: function () {}, setExpression: function () {}, setPage: function () {}, setHeight: function () {}, onShown: event(), onHidden: event() }; if (typeof cb === "function") { try { cb(pane); } catch (e) {} } return pane; } },
+        sources: { onSelectionChanged: event(), createSidebarPane: function (title, cb) { var pane = { setObject: function () {}, setExpression: function () {}, setPage: function () {}, setHeight: function () {}, onShown: event(), onHidden: event() }; if (typeof cb === "function") { try { cb(pane); } catch (e) {} } return pane; } },
         create: function (title, icon, page, cb) { if (typeof cb === "function") { try { cb({ onShown: event(), onHidden: event(), onSearch: event() }); } catch (e) {} } },
         setOpenResourceHandler: function () {}, openResource: function (url, line, cb) { if (typeof cb === "function") cb(); },
         onThemeChanged: event(),
@@ -1902,7 +1935,7 @@ var __C2S_DEBUG__ = false;
       var ns = MAYBE_MISSING[mi];
       if (!chrome[ns]) { try { chrome[ns] = inertProxy(); } catch (e) {} }
     }
-  }
+  } catch (__namespaceBackfillErr) {}
 
   // Safari (current WebKit) CRASHES THE WHOLE BROWSER when a declarativeNetRequest
   // ruleset contains a "modifyHeaders" action: reading the rule back from its SQLite
