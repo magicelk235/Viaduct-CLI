@@ -5,7 +5,7 @@
 // "ReferenceError: Can't find variable: chrome (safari-compat-shim.js)".)
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { shimSource } from "../dist/shim.js";
+import { shimSource } from "../dist/runtime/shim.js";
 
 // Run the shim in a context where `browser` exists but `chrome` does NOT.
 function runBrowserOnly(browser) {

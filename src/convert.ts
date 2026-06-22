@@ -2,16 +2,16 @@ import { mkdtempSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, basename } from "node:path";
 import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
-import { extractExtension } from "./extract.js";
-import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths } from "./manifest.js";
-import { scanExtension } from "./analyze.js";
-import { stageExtension, stripDanglingSourcemaps } from "./stage.js";
-import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, deriveProxyHosts } from "./shim.js";
-import { applyOAuthBridge, deriveChromeId } from "./oauth-bridge.js";
-import { applyDnr } from "./dnr.js";
-import { synthesizePlaceholderIcons } from "./icons.js";
-import { writeTempLoadInstructions } from "./tempload.js";
-import { installToSafari } from "./installer.js";
+import { extractExtension } from "./input/extract.js";
+import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths } from "./manifest/manifest.js";
+import { scanExtension } from "./analyze/analyze.js";
+import { stageExtension, stripDanglingSourcemaps } from "./input/stage.js";
+import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, deriveProxyHosts } from "./runtime/shim.js";
+import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
+import { applyDnr } from "./manifest/dnr.js";
+import { synthesizePlaceholderIcons } from "./input/icons.js";
+import { writeTempLoadInstructions } from "./build/tempload.js";
+import { installToSafari } from "./build/installer.js";
 import {
   runPackager,
   patchProjectBundleIds,
@@ -21,8 +21,8 @@ import {
   pluginkitStatus,
   unsignedExtensionsAllowed,
   defaultBundleId,
-} from "./packager.js";
-import { printIssues, countBlocking, writeReportFile } from "./report.js";
+} from "./build/packager.js";
+import { printIssues, countBlocking, writeReportFile } from "./analyze/report.js";
 import { info, ok, warn, fail, moveBundle, run } from "./util.js";
 
 export function convert(opts: ConvertOptions): ConvertResult {

@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, readdirSync, statSync, lstatSync, writeFileSync, mkdirSync, openSync, readSync, closeSync, realpathSync, rmSync } from "node:fs";
 import { join, extname, resolve, sep } from "node:path";
-import { run } from "./util.js";
+import { run } from "../util.js";
 
 /** Strip macOS extended attributes that break code signing. */
 export function cleanExtendedAttributes(path: string): void {

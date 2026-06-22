@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
-import { shimSource } from "../dist/shim.js";
+import { shimSource } from "../dist/runtime/shim.js";
 
 // Run the generated shim against a Safari-like chrome mock (commands lacks
 // getAll; no chrome://extensions/shortcuts page) and assert the shim makes

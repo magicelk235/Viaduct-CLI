@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { deriveProxyHosts, shimSource } from "../dist/shim.js";
+import { deriveProxyHosts, shimSource } from "../dist/runtime/shim.js";
 
 test("deriveProxyHosts pulls discrete hosts from host_permissions + externally_connectable", () => {
   const hosts = deriveProxyHosts({

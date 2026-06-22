@@ -1,6 +1,6 @@
 import { readFileSync, existsSync, writeFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import type { Manifest, Issue } from "./types.js";
+import type { Manifest, Issue } from "../types.js";
 
 /**
  * Parse JSON that may carry // and /* *\/ comments or trailing commas — both are

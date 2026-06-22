@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { scanExtension } from "../dist/analyze.js";
+import { scanExtension } from "../dist/analyze/analyze.js";
 
 // Build a throwaway extension dir from a {relpath: contents} map. Contents that
 // are objects are JSON-stringified (manifest-style messages.json etc.).

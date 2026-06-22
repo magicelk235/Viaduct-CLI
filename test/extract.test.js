@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync } from
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { extractExtension } from "../dist/extract.js";
+import { extractExtension } from "../dist/input/extract.js";
 
 const tmp = (p) => mkdtempSync(join(tmpdir(), p));
 

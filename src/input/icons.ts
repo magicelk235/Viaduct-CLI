@@ -1,7 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
-import type { Manifest } from "./types.js";
+import type { Manifest } from "../types.js";
 
 const SIZES = [48, 128, 256, 512];
 

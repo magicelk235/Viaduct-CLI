@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { injectPopupSizing } from "../dist/shim.js";
+import { injectPopupSizing } from "../dist/runtime/shim.js";
 
 function size(html, fullHeight = false) {
   const dir = mkdtempSync(join(tmpdir(), "c2s-popup-"));

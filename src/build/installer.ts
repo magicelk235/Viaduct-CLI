@@ -1,7 +1,7 @@
 import { mkdirSync, existsSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { run, info, ok, warn, fail, moveBundle } from "./util.js";
+import { run, info, ok, warn, fail, moveBundle } from "../util.js";
 import { pluginkitStatus } from "./packager.js";
 
 /** Full path to LaunchServices' lsregister (not on PATH). */

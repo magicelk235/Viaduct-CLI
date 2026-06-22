@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isUrl, extractStoreId, crxEndpoint } from "../dist/download.js";
+import { isUrl, extractStoreId, crxEndpoint } from "../dist/input/download.js";
 
 test("isUrl recognizes http and https only", () => {
   assert.equal(isUrl("https://example.com/x.crx"), true);

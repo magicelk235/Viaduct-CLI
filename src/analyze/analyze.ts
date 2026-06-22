@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, existsSync, realpathSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
-import type { Issue, Manifest, Platforms } from "./types.js";
-import { UNSUPPORTED_APIS, parseJsonc, resolveI18nString } from "./manifest.js";
+import type { Issue, Manifest, Platforms } from "../types.js";
+import { UNSUPPORTED_APIS, parseJsonc, resolveI18nString } from "../manifest/manifest.js";
 
 /**
  * Recursive file finder. Dirent-based so each entry costs no extra stat (only
