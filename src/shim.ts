@@ -151,7 +151,10 @@ var __C2S_DEBUG__ = false;
   // onMessageExternal / onConnect* — those are real (or polyfilled) and carry the
   // OAuth bridge handlers.
   var rtEvents = ["onStartup", "onInstalled", "onSuspend", "onSuspendCanceled",
-    "onUpdateAvailable", "onBrowserUpdateAvailable", "onRestartRequired"];
+    "onUpdateAvailable", "onBrowserUpdateAvailable", "onRestartRequired",
+    // userScripts-API message events (MV3) — Tampermonkey probes these and throws
+    // "onUserScriptMessage is not available!" when absent.
+    "onUserScriptMessage", "onUserScriptConnect"];
   // Chrome also exposes ENUM objects on chrome.runtime (OnInstalledReason, etc.).
   // SW bundles read e.g. chrome.runtime.OnInstalledReason.INSTALL at module-eval;
   // Safari's polyfill omits them, so the read throws TypeError and aborts the SW
@@ -180,6 +183,10 @@ var __C2S_DEBUG__ = false;
   // bare 'browser !== chrome' throws Reference(chrome) and aborts the whole shim —
   // taking every stub below it down too. Only compare when chrome exists.
   if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) backfillRuntimeEvents(browser.runtime);
+  // Belt: also patch the RESOLVED namespace (api === the one extensions actually
+  // call) in case chrome/browser are distinct objects and the SW reads whichever
+  // didn't get covered above.
+  if (api.runtime) backfillRuntimeEvents(api.runtime);
 
   // chrome.scripting exists in Safari but omits the ExecutionWorld / RegistrationWorld
   // enum objects. SW/background code reads chrome.scripting.ExecutionWorld.ISOLATED
@@ -192,6 +199,7 @@ var __C2S_DEBUG__ = false;
   }
   backfillScriptingEnums(hasChrome && chrome.scripting);
   if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) backfillScriptingEnums(browser.scripting);
+  if (api.scripting) backfillScriptingEnums(api.scripting);
 
   // Safari's action popup (default_popup) is a POPOVER, not a side panel sharing
   // the browser window. So tabs.query({active:true,currentWindow:true}) resolves
@@ -1118,6 +1126,13 @@ var __C2S_DEBUG__ = false;
         getBytesInUse: function (k, cb) { if (typeof k === "function") { cb = k; } return dual(0, cb); },
         onChanged: event(),
       };
+    }
+    // Mirror managed onto the RESOLVED namespace too: Tampermonkey/Grammarly read
+    // browser.storage.managed.get (the native namespace, distinct from chrome here),
+    // which Safari omits → "undefined is not an object". Patch api.storage.managed
+    // when it differs from the chrome one we just stubbed.
+    if (api.storage && api.storage !== chrome.storage && !api.storage.managed) {
+      api.storage.managed = chrome.storage.managed;
     }
 
     // chrome.idle — derive state from page visibility where a document exists;
