@@ -14,7 +14,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc && node -e \"require('node:fs').cpSync('src/templates','dist/templates',{recursive:true})\" && node -e \"require('node:fs').chmodSync('dist/cli.js',0o755)\"",
+    "build": "tsc && node -e \"const f=require('node:fs');f.cpSync('src/templates','dist/templates',{recursive:true});f.cpSync('src/runtime','dist/runtime',{recursive:true})\" && node -e \"require('node:fs').chmodSync('dist/cli.js',0o755)\"",
     "dev": "tsc --watch",
     "start": "node dist/cli.js",
     "typecheck": "tsc --noEmit",
