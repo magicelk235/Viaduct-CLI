@@ -1,0 +1,285 @@
+import type { Issue } from "../types.js";
+
+// Compatibility data tables — pure data, no logic. Which Chrome permissions/APIs
+// Safari lacks, which the shim emulates, and the per-API remediation notes the
+// analyzer surfaces. Split out of manifest.ts to keep that file focused on
+// parsing + transform logic.
+
+/** Permissions Safari does not implement. Value = remediation note. */
+export const UNSUPPORTED_PERMISSIONS: Record<string, string> = {
+  identity: "Safari lacks chrome.identity; use a hosted web OAuth2 flow + window.postMessage.",
+  debugger: "chrome.debugger (CDP) is unsupported; build a Web Inspector Extension (devtools_page).",
+  sidePanel: "Safari has no sidePanel API; falling back to an action popup.",
+  tabGroups: "Safari has no native tabGroups API; the shim emulates it in memory (no tab-bar coloring).",
+  offscreen: "Safari has no offscreen documents API; use the service worker or web workers.",
+  webRequestBlocking: "Blocking webRequest is unsupported; use declarativeNetRequest.",
+  gcm: "chrome.gcm is Chrome-only; relay via APNs in the host app or poll with chrome.alarms.",
+  tts: "Text-to-speech API unavailable; bridge to AVSpeechSynthesizer natively or use Web Speech API.",
+  ttsEngine: "TTS engine API unavailable.",
+  platformKeys: "platformKeys unavailable.",
+  "enterprise.platformKeys": "enterprise.platformKeys unavailable.",
+  // OS-capability APIs — route through the native container app or drop.
+  tabCapture: "tabCapture is unsupported; use getDisplayMedia() or a native bridge.",
+  desktopCapture: "desktopCapture is unsupported; use getDisplayMedia() or a native bridge.",
+  pageCapture: "pageCapture is unsupported; drop or reimplement via a native bridge.",
+  proxy: "chrome.proxy has no Safari equivalent; drop or configure proxy natively.",
+  privacy: "chrome.privacy has no Safari equivalent; drop.",
+  contentSettings: "chrome.contentSettings has no Safari equivalent; drop.",
+  browsingData: "chrome.browsingData has no Safari equivalent; drop.",
+  management: "chrome.management has no Safari equivalent; drop or move to the native host app.",
+  power: "chrome.power has no Safari equivalent; use IOKit natively or drop.",
+  "system.cpu": "chrome.system.cpu has no Safari equivalent; native bridge or drop.",
+  "system.memory": "chrome.system.memory has no Safari equivalent; native bridge or drop.",
+  "system.storage": "chrome.system.storage has no Safari equivalent; native bridge or drop.",
+  "system.display": "chrome.system.display has no Safari equivalent; native bridge or drop.",
+  // Chrome-UI APIs — no Safari surface; reshape to popup/page or drop.
+  omnibox: "Safari has no address-bar keyword API; drop the omnibox feature.",
+  sessions: "chrome.sessions is unsupported; shim returns empty results.",
+  topSites: "chrome.topSites is unsupported; shim returns an empty list.",
+  search: "chrome.search is unsupported; shim opens queries in a search-engine tab.",
+  declarativeContent: "declarativeContent rules never fire in Safari; use content scripts + chrome.action.",
+  userScripts: "The shim emulates chrome.userScripts registration (register/update/getScripts/unregister); dynamic injection of new scripts at runtime is not supported, so declare content scripts statically or use chrome.scripting where injection must actually run.",
+  idle: "chrome.idle is unsupported; shim derives state from page visibility.",
+  instanceID: "instanceID push plumbing is Chrome-only; use APNs natively or poll.",
+  // ChromeOS-only APIs — always drop on Safari.
+  fileBrowserHandler: "fileBrowserHandler is ChromeOS-only; drop.",
+  fileSystemProvider: "fileSystemProvider is ChromeOS-only; drop.",
+  documentScan: "documentScan is ChromeOS-only; drop.",
+  printerProvider: "printerProvider is ChromeOS/print-only; drop or move to a native bridge.",
+  printing: "chrome.printing is ChromeOS-only; drop.",
+  printingMetrics: "chrome.printingMetrics is ChromeOS-only; drop.",
+  certificateProvider: "certificateProvider is ChromeOS-enterprise-only; drop.",
+  vpnProvider: "vpnProvider is ChromeOS-only; use a Network Extension natively or drop.",
+  wallpaper: "chrome.wallpaper is ChromeOS-only; drop.",
+  loginScreenStorage: "loginScreenStorage is ChromeOS-kiosk-only; drop.",
+  webAuthenticationProxy: "webAuthenticationProxy is enterprise-only; drop.",
+  accessibilityFeatures: "accessibilityFeatures has no Safari equivalent; drop.",
+  fontSettings: "fontSettings has no Safari equivalent; drop.",
+};
+
+/**
+ * Permissions that are removed from the manifest (Safari rejects them) but whose
+ * API the runtime shim still emulates with real, usable behavior — so the feature
+ * keeps working at runtime. These get a "shimmed" tag instead of a bare "removed"
+ * warning, so the author isn't misled into thinking the capability is gone.
+ * Only list permissions the shim functionally backs; APIs that merely reject
+ * gracefully (debugger, tabCapture, tts, …) do NOT belong here.
+ */
+export const SHIMMED_PERMISSIONS = new Set([
+  "tabGroups",
+  "userScripts",
+  "idle",
+  "sessions",
+  "topSites",
+  "search",
+]);
+
+/** chrome.* API call patterns flagged during JS scans. */
+export const UNSUPPORTED_APIS: Record<
+  string,
+  { severity: Issue["severity"]; message: string; fix: string; shimmed?: boolean }
+> = {
+  "chrome.identity.launchWebAuthFlow": {
+    severity: "warning",
+    message: "launchWebAuthFlow is unsupported and safari-web-extension:// redirects are blocked.",
+    fix: "Open hosted auth in a tab, redirect to your own HTTPS callback, postMessage the code back.",
+  },
+  "chrome.identity": {
+    severity: "warning",
+    message: "chrome.identity is unsupported in Safari (all platforms).",
+    fix: "Replace with a hosted OAuth2 redirect flow; shim stubs it so calls reject instead of throwing.",
+    shimmed: true,
+  },
+  "chrome.debugger": {
+    severity: "warning",
+    message: "chrome.debugger (Chrome DevTools Protocol) is unsupported.",
+    fix: "Build a Safari Web Inspector Extension via the devtools_page manifest key.",
+  },
+  "chrome.gcm": {
+    severity: "warning",
+    message: "chrome.gcm push messaging is Chrome-only.",
+    fix: "Use APNs in the native host app, or poll via chrome.alarms + fetch.",
+  },
+  "chrome.notifications": {
+    severity: "warning",
+    message: "chrome.notifications is missing in Safari.",
+    fix: "Bridge to native notifications via sendNativeMessage, or inject a DOM banner.",
+  },
+  "chrome.contextMenus": {
+    severity: "warning",
+    message: "chrome.contextMenus is unsupported on Safari iOS.",
+    fix: "Register a 'contextmenu' listener in a content script and relay via runtime.sendMessage.",
+  },
+  "cookies.onChanged": {
+    severity: "warning",
+    message: "cookies.onChanged is unsupported.",
+    fix: "Poll cookies, or monitor session state from a content script.",
+  },
+  "runtime.setUninstallURL": {
+    severity: "info",
+    message: "runtime.setUninstallURL has no Safari surface; the shim no-ops the call (the uninstall page just won't open).",
+    fix: "No action needed; remove the call if you want to drop the dead code.",
+    shimmed: true,
+  },
+  "runtime.connectNative": {
+    severity: "warning",
+    message: "connectNative has no Chrome-style native host in Safari; messages route to the containing app.",
+    fix: "Handle the message in the macOS app's SafariWebExtensionHandler (beginRequest); there is no native-messaging-hosts manifest.",
+  },
+  "runtime.sendNativeMessage": {
+    severity: "warning",
+    message: "sendNativeMessage has no Chrome-style native host in Safari; messages route to the containing app.",
+    fix: "Respond from the macOS app's SafariWebExtensionHandler (beginRequest) instead of a registered host binary.",
+  },
+  "tabs.move": { severity: "warning", message: "tabs.move is unsupported.", fix: "Remove or rework UX." },
+  "tabs.highlighted": {
+    severity: "warning",
+    message: "tabs.highlighted query is unsupported.",
+    fix: "Use tabs.query({ active: true }).",
+  },
+  "webNavigation.onCreatedNavigationTarget": {
+    severity: "warning",
+    message: "webNavigation.onCreatedNavigationTarget is unsupported.",
+    fix: "Use webNavigation.onCommitted.",
+  },
+  "webNavigation.onHistoryStateUpdated": {
+    severity: "warning",
+    message: "webNavigation.onHistoryStateUpdated is unsupported.",
+    fix: "Monitor history changes from a content script.",
+  },
+  "chrome.tts\\b": {
+    severity: "warning",
+    message: "chrome.tts (text-to-speech) is unsupported in Safari.",
+    fix: "Use the Web Speech API (speechSynthesis), or bridge to AVSpeechSynthesizer in the native host.",
+  },
+  "chrome.ttsEngine": {
+    severity: "warning",
+    message: "chrome.ttsEngine is unsupported in Safari.",
+    fix: "Provide TTS via the native host (AVSpeechSynthesizer); there is no Safari TTS-engine API.",
+  },
+  "chrome.tabCapture": {
+    severity: "warning",
+    message: "chrome.tabCapture is unsupported in Safari.",
+    fix: "Use navigator.mediaDevices.getDisplayMedia(), or a native bridge.",
+  },
+  "chrome.desktopCapture": {
+    severity: "warning",
+    message: "chrome.desktopCapture is unsupported in Safari.",
+    fix: "Use navigator.mediaDevices.getDisplayMedia(), or a native bridge.",
+  },
+  "chrome.pageCapture": {
+    severity: "warning",
+    message: "chrome.pageCapture is unsupported in Safari.",
+    fix: "Reconstruct via content-script DOM serialization, or drop.",
+  },
+  "chrome.proxy": {
+    severity: "warning",
+    message: "chrome.proxy has no Safari equivalent.",
+    fix: "Configure proxying natively (Network Extension) or drop the feature.",
+  },
+  "chrome.privacy": {
+    severity: "warning",
+    message: "chrome.privacy has no Safari equivalent.",
+    fix: "Remove or guard behind feature detection.",
+  },
+  "chrome.contentSettings": {
+    severity: "warning",
+    message: "chrome.contentSettings has no Safari equivalent.",
+    fix: "Remove or guard behind feature detection.",
+  },
+  "chrome.browsingData": {
+    severity: "warning",
+    message: "chrome.browsingData has no Safari equivalent.",
+    fix: "Remove or guard behind feature detection.",
+  },
+  "chrome.management": {
+    severity: "info",
+    message: "chrome.management: the shim provides getSelf() (from the manifest); other methods reject/resolve empty.",
+    fix: "Self-introspection works; if you rely on managing other extensions, move that to the native host app.",
+  },
+  "chrome.power": {
+    severity: "warning",
+    message: "chrome.power has no Safari equivalent.",
+    fix: "Use IOKit in the native host, or drop wake-lock behavior.",
+  },
+  "chrome.system": {
+    severity: "warning",
+    message: "chrome.system.* (cpu/memory/storage/display) has no Safari equivalent.",
+    fix: "Route through a native bridge, or drop.",
+  },
+  "chrome.omnibox": {
+    severity: "warning",
+    message: "chrome.omnibox has no Safari equivalent (no address-bar keyword).",
+    fix: "Drop the omnibox feature; expose the action via the popup instead.",
+  },
+  "chrome.fontSettings": {
+    severity: "warning",
+    message: "chrome.fontSettings has no Safari equivalent.",
+    fix: "Remove or guard behind feature detection.",
+  },
+  "chrome.accessibilityFeatures": {
+    severity: "warning",
+    message: "chrome.accessibilityFeatures has no Safari equivalent.",
+    fix: "Remove or guard behind feature detection.",
+  },
+  "chrome.readingList": {
+    severity: "info",
+    message: "chrome.readingList is emulated (add/remove/update/query + events) over an extension-private store — NOT the user's native Safari Reading List (no API exists).",
+    fix: "No action needed if you manage your own list; you cannot read/write Safari's native Reading List.",
+  },
+  "chrome.sessions": {
+    severity: "info",
+    message: "chrome.sessions has no Safari equivalent; shim returns empty results.",
+    fix: "Feature-detect; hide recently-closed UI on Safari.",
+  },
+  "chrome.topSites": {
+    severity: "info",
+    message: "chrome.topSites has no Safari equivalent; shim returns an empty list.",
+    fix: "Feature-detect; hide top-sites UI on Safari.",
+  },
+  "chrome.declarativeContent": {
+    severity: "warning",
+    message: "chrome.declarativeContent rules never fire in Safari (shim stubs the constructors).",
+    fix: "Use content scripts + chrome.action instead of declarative page rules.",
+  },
+  "chrome.search\\b": {
+    severity: "info",
+    message: "chrome.search has no Safari equivalent; shim opens the query in a search-engine tab.",
+    fix: "Acceptable fallback for most flows; otherwise open a search URL yourself.",
+  },
+  "chrome.userScripts": {
+    severity: "warning",
+    message: "chrome.userScripts: the management surface is emulated (register/getScripts/update/unregister round-trip), but the scripts are NOT actually injected — WebKit has no dynamic user-world API.",
+    fix: "For real injection, statically declare content scripts or use chrome.scripting.",
+  },
+  "chrome.idle": {
+    severity: "info",
+    message: "chrome.idle is unsupported; shim derives state from page visibility.",
+    fix: "Don't rely on machine-level idle detection on Safari.",
+  },
+  "chrome.instanceID": {
+    severity: "info",
+    message: "chrome.instanceID: getID/getCreationTime/deleteID work (stable persisted ID); getToken/deleteToken (FCM push) still reject — no Safari surface.",
+    fix: "For push, use APNs via the native host or poll with chrome.alarms.",
+  },
+  "chrome.bookmarks": {
+    severity: "info",
+    message: "chrome.bookmarks is fully emulated (CRUD/search/events) over an extension-private store in storage.local — NOT the user's Safari bookmarks (no API exists for those).",
+    fix: "No action needed if you manage your own bookmark data; you cannot read/write the user's real Safari bookmarks.",
+  },
+  "chrome.history": {
+    severity: "info",
+    message: "chrome.history is limited in Safari.",
+    fix: "Verify availability; feature-detect and degrade.",
+  },
+  "chrome.downloads": {
+    severity: "info",
+    message: "chrome.downloads: download() triggers a real download and items are tracked in a registry (search/onCreated/onChanged work); WebKit gives no progress, so items go in_progress→complete with unknown byte counts.",
+    fix: "Works for start-then-track flows; don't rely on byte-level progress.",
+  },
+  "chrome.i18n.detectLanguage": {
+    severity: "info",
+    message: "chrome.i18n.detectLanguage has no Safari engine; the shim returns 'und' (undetermined).",
+    fix: "Don't branch on detected language in Safari; detect server-side or skip the feature.",
+  },
+};
