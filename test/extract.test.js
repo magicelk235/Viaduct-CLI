@@ -37,6 +37,30 @@ test("extractExtension unwraps a single top-level folder (keepParent zip)", () =
   assert.ok(readFileSync(join(root, "manifest.json"), "utf-8").includes('"name"'));
 });
 
+test("extractExtension descends into the lone manifest-bearing subdir among siblings", () => {
+  // Repo-style layout: extension/ + host/ + README.md (Chrome native-messaging
+  // sample). No root manifest; only `extension/` carries one — descend into it.
+  const d = tmp("nested-");
+  mkdirSync(join(d, "extension"), { recursive: true });
+  mkdirSync(join(d, "host"), { recursive: true });
+  writeFileSync(join(d, "extension", "manifest.json"), JSON.stringify({ name: "Nested", version: "1.0.0" }));
+  writeFileSync(join(d, "host", "echo.json"), "{}");
+  writeFileSync(join(d, "README.md"), "# docs");
+  const root = extractExtension(d, tmp("out-"));
+  assert.equal(JSON.parse(readFileSync(join(root, "manifest.json"), "utf-8")).name, "Nested");
+});
+
+test("extractExtension stays put when two subdirs each carry a manifest (ambiguous)", () => {
+  const d = tmp("monorepo-");
+  mkdirSync(join(d, "ext-a"), { recursive: true });
+  mkdirSync(join(d, "ext-b"), { recursive: true });
+  writeFileSync(join(d, "ext-a", "manifest.json"), "{}");
+  writeFileSync(join(d, "ext-b", "manifest.json"), "{}");
+  const root = extractExtension(d, tmp("out-"));
+  // Ambiguous → don't guess; return the dir as-is (caller errors on no manifest).
+  assert.equal(root, d);
+});
+
 test("extractExtension parses a CRX3 container by magic bytes (even named .zip)", () => {
   const zipBytes = readFileSync(zipDir(manifestDir({ name: "CrxV3" })));
   // CRX3 header: "Cr24" + version(3, LE) + headerLen(LE) + header + embedded zip.
