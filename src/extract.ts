@@ -100,6 +100,17 @@ function resolveExtensionRoot(dir: string): string {
   if (subdirs.length === 1 && existsSync(join(dir, subdirs[0], "manifest.json"))) {
     return join(dir, subdirs[0]);
   }
+  // A repo-style layout nests the extension alongside siblings that are NOT the
+  // extension (host binaries, docs, build scripts) — e.g. the Chrome
+  // native-messaging sample's `extension/` + `host/` + `README.md`. The single
+  // top-level-folder check above misses that. So when the root has no manifest,
+  // look for subdirs that DO carry one: if exactly one does, descend into it.
+  // Two or more is ambiguous (a monorepo of extensions) — stay put and let the
+  // caller error rather than silently pick the wrong one.
+  const manifestSubdirs = subdirs.filter((e) => existsSync(join(dir, e, "manifest.json")));
+  if (manifestSubdirs.length === 1) {
+    return join(dir, manifestSubdirs[0]);
+  }
   return dir;
 }
 
