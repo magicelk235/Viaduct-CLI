@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { shimSource, convertServiceWorkerToBackgroundPage, SHIM_FILENAME } from "../dist/shim.js";
+import { shimSource, convertServiceWorkerToBackgroundPage, SHIM_FILENAME } from "../dist/runtime/shim.js";
 
 function runShim(chrome) {
   const window = { addEventListener() {} };

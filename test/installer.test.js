@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parsePluginkitList } from "../dist/installer.js";
+import { parsePluginkitList } from "../dist/build/installer.js";
 
 test("parsePluginkitList returns [] for no matches", () => {
   assert.deepEqual(parsePluginkitList("    (no matches)\n"), []);

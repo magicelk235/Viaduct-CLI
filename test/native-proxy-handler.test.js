@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { writeNativeProxyHandler } from "../dist/packager.js";
+import { writeNativeProxyHandler } from "../dist/build/packager.js";
 
 // Build a minimal xcodeproj layout with a placeholder handler file, run the
 // generator, return the rewritten handler source.

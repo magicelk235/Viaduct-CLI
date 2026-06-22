@@ -3,7 +3,7 @@
 //   chrome.system.cpu/memory.getInfo -> navigator.hardwareConcurrency / deviceMemory
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { shimSource } from "../dist/shim.js";
+import { shimSource } from "../dist/runtime/shim.js";
 
 // Build a chrome shim with an injected navigator/document on globalThis so the
 // web-API branches are exercised (the shim reads these as globals).

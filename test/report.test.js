@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { countBlocking, summarizeManifestChanges, buildReportMarkdown } from "../dist/report.js";
+import { countBlocking, summarizeManifestChanges, buildReportMarkdown } from "../dist/analyze/report.js";
 
 const err = { severity: "error", category: "x", message: "e" };
 const warn = { severity: "warning", category: "x", message: "w" };

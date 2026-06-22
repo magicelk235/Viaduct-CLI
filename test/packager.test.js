@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { defaultBundleId } from "../dist/packager.js";
+import { defaultBundleId } from "../dist/build/packager.js";
 
 // A reverse-DNS CFBundleIdentifier: dot-separated segments of letters, digits and
 // hyphens, no empty segments, no segment starting with a digit. A malformed id

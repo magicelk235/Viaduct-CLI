@@ -7,7 +7,7 @@ import {
   analyzeManifest,
   transformManifest,
   collectReferencedPaths,
-} from "../dist/manifest.js";
+} from "../dist/manifest/manifest.js";
 
 // transformManifest probes extPath for popup candidates; a path that doesn't
 // exist simply yields no auto-wired popup, which is fine for these unit tests.

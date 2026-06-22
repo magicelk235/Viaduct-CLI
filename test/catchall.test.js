@@ -3,7 +3,7 @@
 // of throwing TypeError when an extension touches them.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { shimSource } from "../dist/shim.js";
+import { shimSource } from "../dist/runtime/shim.js";
 
 function setup() {
   const chrome = { runtime: { lastError: null, getManifest: () => ({}) } };

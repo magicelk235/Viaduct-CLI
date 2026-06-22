@@ -1,7 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Issue, Manifest, Severity } from "./types.js";
-import { color } from "./util.js";
+import type { Issue, Manifest, Severity } from "../types.js";
+import { color } from "../util.js";
 
 /**
  * Human-readable list of what transformManifest() changed, original → transformed.

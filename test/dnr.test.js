@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { needsAnthropicCorsBypass, applyDnr } from "../dist/dnr.js";
+import { needsAnthropicCorsBypass, applyDnr } from "../dist/manifest/dnr.js";
 
 function stageWith(rulesets) {
   const dir = mkdtempSync(join(tmpdir(), "dnr-test-"));
