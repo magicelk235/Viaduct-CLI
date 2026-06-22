@@ -110,3 +110,23 @@ test("importScripts: unresolved target → no tag, call still neutralized", () =
   assert.doesNotMatch(sw, /importScripts\s*\(\s*["']/);
   rmSync(dir, { recursive: true, force: true });
 });
+
+test("importScripts: nested parens in args are fully neutralized (no dangling ')')", () => {
+  // webpack's chunk loader emits importScripts(o.p+o.u(t)) — the call argument
+  // itself contains parens. A regex that stopped at the FIRST ")" left the outer
+  // ")" dangling and broke the bundle with "Unexpected token ')'" (Bitwarden).
+  const dir = mkdtempSync(join(tmpdir(), "c2s-imp3-"));
+  writeFileSync(
+    join(dir, "sw.js"),
+    'var o={p:"",u:t=>t};o.f.i=(t,i)=>{e[t]||importScripts(o.p+o.u(t))};var done=1;',
+  );
+  const manifest = { name: "T", background: { service_worker: "sw.js" } };
+  convertServiceWorkerToBackgroundPage(dir, manifest);
+  const sw = readFileSync(join(dir, "sw.js"), "utf-8");
+  assert.doesNotMatch(sw, /importScripts\s*\(/);
+  // The whole call (including the outer paren) must be gone — no orphan ")".
+  assert.match(sw, /e\[t\]\|\|void 0 \/\* importScripts hoisted[^*]*\*\/\};/);
+  // And the result must actually parse.
+  assert.doesNotThrow(() => new Function(sw), "neutralized SW must be syntactically valid");
+  rmSync(dir, { recursive: true, force: true });
+});

@@ -2327,6 +2327,43 @@ ${polyTag}${shimTag}${importTags}<script type="module" src="${sw}"></script>
  * the emitted src is relative to the extension root (where background.html lives).
  * Returns "" when there are no resolvable importScripts calls.
  */
+/**
+ * Given the index of an opening "(" in `src`, return the index just PAST its
+ * matching ")", honoring nested parens and skipping string literals (', ", `)
+ * and // and / * * / comments so their parens/quotes don't throw off the count.
+ * Returns -1 if no balanced close is found. Template-literal `${}` expressions
+ * are tracked so a ")" inside an interpolation still counts.
+ */
+function matchBalancedParen(src: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    const c = src[i];
+    if (c === "(") depth++;
+    else if (c === ")") {
+      depth--;
+      if (depth === 0) return i + 1;
+    } else if (c === '"' || c === "'" || c === "`") {
+      // skip the string literal
+      const quote = c;
+      i++;
+      while (i < src.length) {
+        if (src[i] === "\\") { i += 2; continue; }
+        if (src[i] === quote) break;
+        i++;
+      }
+    } else if (c === "/" && src[i + 1] === "/") {
+      const nl = src.indexOf("\n", i);
+      if (nl < 0) return -1;
+      i = nl;
+    } else if (c === "/" && src[i + 1] === "*") {
+      const close = src.indexOf("*/", i + 2);
+      if (close < 0) return -1;
+      i = close + 1;
+    }
+  }
+  return -1;
+}
+
 function hoistImportScripts(dir: string, swPath: string): string {
   const swFile = join(dir, swPath);
   let src: string;
@@ -2340,13 +2377,22 @@ function hoistImportScripts(dir: string, swPath: string): string {
   const swDir = dirname(swPath); // e.g. "service-worker"
   const tags: string[] = [];
   const seen = new Set<string>();
-  // Match importScripts( "..."/'...' [, "..."]* ) — string-literal args only
-  // (dynamic args can't be statically hoisted; the no-op below still prevents the
-  // throw). Each whole call is replaced once neutralized.
-  const callRe = /\bimportScripts\s*\(([^)]*)\)/g;
+  // Find each importScripts( ... ) call and its argument list. A regex with
+  // [^)]* truncates at the FIRST ")", which is wrong when an argument itself
+  // contains parens — e.g. webpack's `importScripts(o.p+o.u(t))`. That left the
+  // outer ")" dangling after the no-op replacement and broke the bundle with a
+  // SyntaxError. Scan for the balanced closing paren instead (string-literal and
+  // comment aware), so the WHOLE call is replaced regardless of nesting.
+  const callOpenRe = /\bimportScripts\s*\(/g;
   let neutralized = 0;
-  src = src.replace(callRe, (_full, argList: string) => {
-    neutralized++;
+  let out = "";
+  let last = 0;
+  let mm: RegExpExecArray | null;
+  while ((mm = callOpenRe.exec(src))) {
+    const openParen = mm.index + mm[0].length - 1; // index of the "(" itself
+    const end = matchBalancedParen(src, openParen); // index just past the ")"
+    if (end < 0) continue; // unbalanced (shouldn't happen in valid JS) → leave as-is
+    const argList = src.slice(openParen + 1, end - 1);
     const argRe = /["']([^"']+)["']/g;
     let m: RegExpExecArray | null;
     while ((m = argRe.exec(argList))) {
@@ -2358,8 +2404,13 @@ function hoistImportScripts(dir: string, swPath: string): string {
       seen.add(fromRoot);
       tags.push(`<script src="${fromRoot}"></script>`);
     }
-    return "void 0 /* importScripts hoisted to background.html */";
-  });
+    out += src.slice(last, mm.index) + "void 0 /* importScripts hoisted to background.html */";
+    last = end;
+    neutralized++;
+    callOpenRe.lastIndex = end; // continue scanning after the full call
+  }
+  out += src.slice(last);
+  src = out;
 
   // Write whenever ANY call was neutralized — even an unresolved target must be
   // de-fanged (it would throw on the undefined global), not just hoisted ones.
