@@ -8,7 +8,7 @@ and tested in Safari with the bg-page Web Inspector.
 |-----------|--------|-----------------|
 | [uBlock Origin](./uBlock-Origin.md) | ✅ Working | Popup loads, live block stats render |
 | [Bitwarden](./Bitwarden.md) | ⚠️ Partial | UI loads; WASM SDK + passkey are platform limits |
-| [Grammarly](./Grammarly.md) | 🔶 Retest pending | Shared fixes applied; verify popup init |
+| [Grammarly](./Grammarly.md) | ⚠️ Partial | bg cookies.onChanged crash fixed; popup init stalls on Grammarly-internal RPC/treatments |
 
 ## Cross-cutting root causes found this round
 All pinned with **live diagnostics** (debug flag → `chrome.storage.local` → read from

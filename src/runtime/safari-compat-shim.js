@@ -2047,6 +2047,27 @@ var __C2S_DEBUG__ = false;
       getAllCookieStores: function (cb) { return dual([{ id: "0", tabIds: [] }], cb); },
       onChanged: event(),
     });
+    // Safari's native chrome.cookies.onChanged fires with a NULL changeInfo, so a
+    // listener that does `const {cookie} = changeInfo` throws — and an unhandled
+    // throw in the bg page kills the whole bg (Grammarly: bg.unhandledException →
+    // popup's bg calls all time out → "All initialization attempts failed").
+    // `fill` above can't help: it no-clobbers, and Safari DOES expose onChanged, so
+    // the inert stub is skipped and the broken native event survives. Wrap
+    // addListener to swallow null/undefined events before they reach the listener.
+    try {
+      var __co = chrome.cookies.onChanged;
+      if (__co && typeof __co.addListener === "function" && !__co.__c2sGuarded) {
+        var __realAdd = __co.addListener.bind(__co);
+        __co.addListener = function (fn) {
+          if (typeof fn !== "function") return __realAdd(fn);
+          return __realAdd(function (changeInfo) {
+            if (changeInfo == null) return; // Safari delivers null — drop it
+            return fn.apply(this, arguments);
+          });
+        };
+        try { __co.__c2sGuarded = true; } catch (e) {}
+      }
+    } catch (e) {}
 
     // chrome.permissions — answer "not granted" rather than throw, so callers
     // take their no-permission code path.
