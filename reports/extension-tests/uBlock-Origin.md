@@ -1,6 +1,6 @@
 # uBlock Origin — Safari conversion test report
 
-**Status: ✅ WORKING.** Popup loads and renders live data ("Domains connected: 6 out of 6", per-page block counts). Content blocking active.
+**Status: ✅ WORKING.** Popup loads and renders live data ("Domains connected: 6 out of 6", per-page block counts), content blocking active, and the popup now sits flush to the left edge (the right-shift is fixed).
 
 Source: `test extensions/uBlock Origin.zip` (MV2). Bundle id: `com.viaduct.uBlockOrigin`.
 
@@ -62,10 +62,29 @@ Supporting fixes that had to land first for uBlock to get this far:
 This is a **general fix**: any extension that privilege-gates by comparing
 `sender.origin` to a `getURL`-derived origin was silently failing on Safari.
 
+## The popup right-shift (fixed)
+The popup content opened offset to the right with an empty left gutter. Initial guess
+blamed `#panes{flex-direction:row-reverse}` and the collapsed firewall pane, but the
+actual cause is one rule in `popup-fenix.css`:
+
+```css
+:root.desktop {            /* mouse-driven devices = macOS */
+    display: flex;
+    justify-content: flex-end;
+}
+```
+
+uBlock makes `<html>` itself a flex container that pushes `<body>` to the **right
+edge**, and relies on Chrome sizing the popover to the exact body width so `flex-end`
+has no slack to act on. Safari's popover is wider than the content (our `min-width`
+floor + Safari's own popover minimum), so `flex-end` shoves the whole popup right.
+
+**Fix** (`injectPopupSizing` in `src/runtime/shim.ts`): the injected `c2s-popup-size`
+style now forces `:root{justify-content:flex-start!important;align-items:flex-start
+!important}`. This removes the slack push so the popup hugs the left edge. It's a
+no-op for popups whose root isn't a flex container, so it's safe to apply to every
+popup. Regression covered in `test/popup-sizing.test.js`.
+
 ## What's left
-- **Cosmetic only:** the popup content is offset right with an empty left gutter. This
-  is uBlock's own `#panes { flex-direction: row-reverse }` two-pane layout — the
-  collapsed firewall pane reserves the left side, shown when the Safari popover is
-  wider than `#main`. Fixing risks breaking the "More" firewall expansion; left as-is.
 - `assets/.../pgl.yoyo.org/.../serverlist.txt invalid path` — a filter-list asset not
   present in the bundle; cosmetic fetch warning, does not block core function.

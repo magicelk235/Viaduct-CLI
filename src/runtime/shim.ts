@@ -201,7 +201,16 @@ export function injectPopupSizing(dir: string, popupFile: string, fullHeight = f
   const sizeFloor = fullHeight
     ? `html,body{margin:0!important;height:600px!important;min-width:380px;}`
     : `html,body{margin:0!important;}body{min-width:320px;min-height:160px;}`;
-  const style = `<style id="${marker}">:root{color-scheme:light dark;}${sizeFloor}</style>`;
+  // Anchor a flex `:root` to the start. uBlock makes `<html>` a flex container with
+  // `justify-content:flex-end` (popup-fenix.css `:root.desktop`) and relies on Chrome
+  // sizing the popover to the exact body width so flex-end never has slack to act on.
+  // Safari's popover is wider than the content (our min-width floor + Safari's own
+  // popover minimum), so that flex-end shoves the whole popup to the right edge.
+  // `:root:root:root` (specificity 0,3,0) beats uBlock's class-qualified
+  // `:root.desktop` (0,2,0) — a bare `:root!important` ties on importance but LOSES
+  // the specificity tiebreak, which is why a plain `:root` override didn't take.
+  const flexAnchor = `:root:root:root{justify-content:flex-start!important;align-items:flex-start!important;}`;
+  const style = `<style id="${marker}">:root{color-scheme:light dark;}${sizeFloor}${flexAnchor}</style>`;
   const at = headInsertIndex(html);
   if (at >= 0) {
     html = html.slice(0, at) + "\n    " + style + html.slice(at);
