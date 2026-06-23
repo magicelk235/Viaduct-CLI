@@ -154,3 +154,18 @@ test("importScripts: nested parens in args are fully neutralized (no dangling ')
   assert.doesNotThrow(() => new Function(sw), "neutralized SW must be syntactically valid");
   rmSync(dir, { recursive: true, force: true });
 });
+
+// Regression: manifest.name is raw — may contain "<", "&", or "</title>". It is
+// interpolated into the background page's <title>, so it must be HTML-escaped or a
+// stray "</title><script>" breaks out and corrupts the page.
+test("background page escapes < & > in the manifest name title", () => {
+  const dir = mkdtempSync(join(tmpdir(), "c2s-title-"));
+  writeFileSync(join(dir, "sw.js"), "// sw");
+  const manifest = { name: "Save </title><script>x</script> & co", background: { service_worker: "sw.js" } };
+  convertServiceWorkerToBackgroundPage(dir, manifest);
+  const html = readFileSync(join(dir, "background.html"), "utf-8");
+  rmSync(dir, { recursive: true, force: true });
+  assert.ok(!html.includes("</title><script>x"), "raw markup must not survive into the page");
+  assert.match(html, /&lt;\/title&gt;&lt;script&gt;/);
+  assert.match(html, /&amp; co/);
+});

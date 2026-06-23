@@ -1,6 +1,6 @@
 import { mkdirSync, existsSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve, relative, isAbsolute } from "node:path";
 import { run, info, ok, warn, fail, moveBundle } from "../util.js";
 import { pluginkitStatus } from "./packager.js";
 
@@ -168,8 +168,17 @@ export function listSafariExtensions(): SafariExtension[] {
  */
 export function uninstallFromSafari(appName: string, installDir?: string): boolean {
   const cleanName = appName.replace(/\.app$/i, "");
-  const targetDir = expandHome(installDir ?? "~/Applications");
-  const dest = join(targetDir, `${cleanName}.app`);
+  const targetDir = resolve(expandHome(installDir ?? "~/Applications"));
+  const dest = resolve(targetDir, `${cleanName}.app`);
+
+  // Guard against path traversal: `--uninstall "../../../Other"` would escape the
+  // install dir and let us rmSync an arbitrary .app elsewhere. Refuse anything
+  // whose resolved path isn't a direct child of targetDir.
+  const rel = relative(targetDir, dest);
+  if (rel.startsWith("..") || isAbsolute(rel) || rel.includes("/")) {
+    fail(`Refusing to remove ${dest}: outside the install dir ${targetDir}.`);
+    return false;
+  }
 
   if (!existsSync(dest)) {
     fail(`No installed app found at ${dest}.`);
