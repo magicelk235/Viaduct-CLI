@@ -87,3 +87,39 @@ userScripts registry, etc.). Sections are commented `// chrome.<api> — …`.
 - ESM imports use the `.js` extension (`from "./util.js"`), even from `.ts` sources.
 - macOS-only; system binaries invoked by name via `util.run()`, found on `PATH`.
 - Comments explain *why* (the Safari quirk being worked around), not *what*. Match that density.
+
+## Live-testing a converted extension (debug protocol)
+
+When a converted extension misbehaves in Safari, **do NOT guess from pasted console
+errors** — they're often stale or symptoms, not causes. Diagnose with live evidence:
+
+- **The background-page console is reliable; the popover/popup console relay is flaky.**
+  Drive diagnostics from the bg console (Safari → Develop → Web Extension Background Pages).
+- **Write structured state to `chrome.storage.local` from the shim, read it from the bg
+  console.** The shim has a `__C2S_DEBUG__` flag (top of `safari-compat-shim.js`); gate
+  temporary `chrome.storage.local.set({...})` traces behind it. Flip on for a diagnostic
+  build, **flip OFF and strip the temporary traces before committing.**
+- **Trace the failing flow link by link**, not the end symptom: connect outcome → did the
+  request reach the bg port → did the bg post a reply → privileged flag → the exact string
+  values being compared. Each link narrows the cause to one fact.
+- **Reproduce the suspected Safari behavior in a Node `vm` context** (frozen objects, exotic
+  getters, case-mismatched origins) and prove the fix locally before reinstalling. Safari's
+  native namespaces are frozen/immutable/exotic in ways a plain object mock won't show — use
+  `vm` with `Object.freeze`, accessor descriptors, and live globals to match reality.
+- **Reinstall cycle:** `--uninstall <App>`, `rm -rf <App>_Safari` (stale output dir →
+  ENOTEMPTY), reinstall with `--install --force --clean`, then **quit and reopen Safari**
+  before retesting. Verify the new shim actually reached the installed `.appex`
+  (`grep` a marker in `…/Contents/Resources/safari-compat-shim.js`) — a stale install is a
+  common false "fix didn't work".
+- **Distinguish shim-fixable from platform limits.** WebAuthn/passkey RPID, WASM-SDK chunk
+  loaders, and webfont CSP refusals are platform/extension-internal, not converter bugs —
+  document them, don't chase them.
+- **After a test session, write/update a per-extension report** in
+  `reports/extension-tests/` (problem → process → solution → what's left), and keep the
+  `README.md` status table current.
+
+Known Safari namespace quirks already handled (see `safari-compat-shim.js` comments):
+frozen `browser`/`chrome` roots (shim must not throw at top level), exotic-immutable
+`chrome.scripting` (enums inlined at conversion in `stage.ts`), extension-UUID case
+mismatch between `getURL()` (UPPER) and `sender.origin` (lower) — getURL lowercases the
+host so origin-privilege checks pass.
