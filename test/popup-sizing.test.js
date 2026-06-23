@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { injectPopupSizing } from "../dist/runtime/shim.js";
+import { injectPopupSizing, injectShimIntoHtmlPages } from "../dist/runtime/shim.js";
 
 function size(html, fullHeight = false) {
   const dir = mkdtempSync(join(tmpdir(), "c2s-popup-"));
@@ -53,4 +53,30 @@ test("popup sizing: idempotent (no double inject)", () => {
   const out = readFileSync(join(dir, "p.html"), "utf-8");
   rmSync(dir, { recursive: true, force: true });
   assert.equal(out.match(/c2s-popup-size/g).length, 1);
+});
+
+// Regression: a `<head>` appearing first inside an HTML comment must NOT be the
+// injection point — a <script> placed there is swallowed by the comment and the
+// shim never runs (blank popup / dead page). Both injectors must skip it.
+test("injection skips a <head> that's inside an HTML comment", () => {
+  const dir = mkdtempSync(join(tmpdir(), "c2s-headcomment-"));
+  const file = join(dir, "p.html");
+  writeFileSync(
+    file,
+    `<!DOCTYPE html><!-- <head> sample --><html><head><title>x</title></head><body></body></html>`
+  );
+
+  injectShimIntoHtmlPages(dir);
+  let out = readFileSync(file, "utf-8");
+  const realHead = out.indexOf("<head>");
+  const shim = out.indexOf("safari-compat-shim");
+  assert.ok(shim > realHead, "shim must inject after the real <head>, not the commented one");
+  assert.ok(shim > out.indexOf("-->"), "shim must not land inside the HTML comment");
+
+  injectPopupSizing(dir, "p.html");
+  out = readFileSync(file, "utf-8");
+  const style = out.indexOf("c2s-popup-size");
+  assert.ok(style > out.indexOf("-->"), "popup style must not land inside the HTML comment");
+
+  rmSync(dir, { recursive: true, force: true });
 });

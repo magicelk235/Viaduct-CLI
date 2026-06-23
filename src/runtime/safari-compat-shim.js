@@ -28,6 +28,101 @@ var __C2S_DEBUG__ = false;
   }
   var hasChrome = typeof chrome !== "undefined";
 
+  // CORE RULE ENFORCEMENT: this shim is prepended to every content script and
+  // extension page; a throw at top level aborts the WHOLE script chain it leads
+  // (→ dead popup / dead content script / dead background — onConnect never
+  // registers). Individual blocks try/catch their own work, but Safari freezes
+  // some namespaces (browser, browser.storage, browser.runtime) as non-extensible
+  // natives, so a stray raw assignment like `api.storage.sync = {…}` throws a
+  // TypeError that escapes its block. This outer guard is the backstop: whatever
+  // partially applied stays, and the host script keeps running. Never remove it.
+  try {
+
+  // ── DE-FREEZE THE ROOTS ────────────────────────────────────────────────────
+  // Safari exposes the WHOLE namespace tree as frozen/non-extensible natives:
+  // `browser` (and the `chrome` alias), and one level down `browser.runtime`,
+  // `browser.storage`, `browser.scripting`, … This is the master root cause behind
+  // "every fix is ineffective live": every backfill/wrap below ultimately does
+  //   parent[key] = …            (add a namespace / enum / wrapper)
+  // and on a frozen parent that throws or no-ops, so getURL stays unwrapped,
+  // storage.sync never installs, connect is never proxied — exactly the live
+  // symptoms. We cannot mutate the frozen natives, but the GLOBAL BINDINGS
+  // (`globalThis.browser` / `self.chrome` / …) are reassignable even when the
+  // object they point at is frozen. So: rebuild an extensible shallow clone of the
+  // root and of each sub-namespace (native methods .bind()-ed to the original to
+  // preserve `this`), then republish it on every global the bundle reads. After
+  // this, `browser.runtime.getURL` (uBlock line 219: `vAPI.getURL = browser.runtime.getURL`)
+  // resolves to our extensible clone whose getURL we go on to wrap.
+  var __globals = [];
+  (function () {
+    try { if (typeof globalThis !== "undefined") __globals.push(globalThis); } catch (e) {}
+    try { if (typeof self !== "undefined" && __globals.indexOf(self) < 0) __globals.push(self); } catch (e) {}
+    try { if (typeof window !== "undefined" && __globals.indexOf(window) < 0) __globals.push(window); } catch (e) {}
+  })();
+  function __publishGlobal(name, value) {
+    for (var gi = 0; gi < __globals.length; gi++) {
+      var g = __globals[gi];
+      try { g[name] = value; if (g[name] === value) continue; } catch (e) {}
+      try { Object.defineProperty(g, name, { value: value, writable: true, configurable: true }); } catch (e) {}
+    }
+  }
+  // Shallow-clone a frozen namespace object: own + inherited members, native
+  // functions bound to the original so `this` survives the copy. Returns the same
+  // object untouched when it is already extensible (nothing to fix).
+  function __thaw(ns) {
+    if (!ns || typeof ns !== "object" || Object.isExtensible(ns)) return ns;
+    var clone = {};
+    var put = function (k) {
+      if (k in clone) return;
+      var v; try { v = ns[k]; } catch (e) { return; }
+      if (typeof v === "function") { try { clone[k] = v.bind(ns); return; } catch (e) {} }
+      try { clone[k] = v; } catch (e) {}
+    };
+    for (var tk in ns) put(tk);
+    try { var own = Object.getOwnPropertyNames(ns); for (var oi = 0; oi < own.length; oi++) put(own[oi]); } catch (e) {}
+    return clone;
+  }
+  // Thaw the root and one level of sub-namespaces, then republish on every global.
+  function __thawRoot(root, name) {
+    if (!root) return root;
+    var rootFrozen = !Object.isExtensible(root);
+    var out = rootFrozen ? __thaw(root) : root;
+    var keys; try { keys = Object.getOwnPropertyNames(root); } catch (e) { keys = []; }
+    for (var ki = 0; ki < keys.length; ki++) {
+      var key = keys[ki];
+      var sub; try { sub = root[key]; } catch (e) { continue; }
+      if (sub && typeof sub === "object" && !Object.isExtensible(sub)) {
+        try { out[key] = __thaw(sub); } catch (e) {}
+      }
+    }
+    if (rootFrozen) __publishGlobal(name, out);
+    // Diagnostic marker: lets a bg/popup probe confirm it is reading the shim's
+    // (possibly thawed) root rather than an un-patched native namespace.
+    try { out.__c2sThawed = true; } catch (e) {}
+    return out;
+  }
+  // Capture identities BEFORE thawing — __thawRoot republishes the global, after
+  // which the free vars `browser`/`chrome` already read the new clone, so a
+  // post-thaw `chrome === browser` check would mis-fire.
+  var __preBrowser = (typeof browser !== "undefined") ? browser : null;
+  var __preChrome = (typeof chrome !== "undefined") ? chrome : null;
+  var __chromeAliasedBrowser = __preChrome != null && __preChrome === __preBrowser;
+  if (__preBrowser) {
+    var __thawedBrowser = __thawRoot(__preBrowser, "browser");
+    // On Safari chrome aliases browser — keep them the SAME thawed object so
+    // `browser === chrome` holds and both see every later backfill.
+    if (__preChrome == null || __chromeAliasedBrowser) __publishGlobal("chrome", __thawedBrowser);
+  }
+  if (__preChrome && !__chromeAliasedBrowser) {
+    __thawRoot(__preChrome, "chrome");
+  }
+  // Re-resolve api/hasChrome against the (now possibly thawed) globals — `api` was
+  // captured off the frozen originals at the top of the IIFE.
+  api = typeof browser !== "undefined" ? browser : (typeof chrome !== "undefined" ? chrome : null);
+  hasChrome = typeof chrome !== "undefined";
+  if (!api) return;
+  // ────────────────────────────────────────────────────────────────────────────
+
   // navigator.userAgent Chrome-version spoof. Extensions commonly sniff the
   // Chrome version out of the UA (e.g. /Chrom(e|ium)\/(\d+)\.(\d+)\.(\d+)\.(\d+)/)
   // to build Web-Store / update URLs or gate behaviour. Safari's UA has no Chrome
@@ -137,12 +232,8 @@ var __C2S_DEBUG__ = false;
   };
   function backfillRuntimeEvents(rt) {
     if (!rt) return;
-    for (var ri = 0; ri < rtEvents.length; ri++) {
-      if (!rt[rtEvents[ri]]) { try { rt[rtEvents[ri]] = event(); } catch (e) {} }
-    }
-    for (var ek in rtEnums) {
-      if (!rt[ek]) { try { rt[ek] = rtEnums[ek]; } catch (e) {} }
-    }
+    for (var ri = 0; ri < rtEvents.length; ri++) setIfMissing(rt, rtEvents[ri], event());
+    for (var ek in rtEnums) setIfMissing(rt, ek, rtEnums[ek]);
   }
   backfillRuntimeEvents(hasChrome && chrome.runtime);
   // Guard the chrome ref: Safari can expose browser with NO chrome global, so a
@@ -158,14 +249,280 @@ var __C2S_DEBUG__ = false;
   // enum objects. SW/background code reads chrome.scripting.ExecutionWorld.ISOLATED
   // at module-eval (Bitwarden, React DevTools), which throws and aborts the bundle.
   // Backfill the documented enums onto whichever scripting namespace exists.
+  // Safari's native chrome.* namespaces are sometimes non-extensible/frozen, so a
+  // plain `obj.prop = …` silently no-ops (sloppy) or throws (strict — this file is
+  // "use strict"). Either way the backfill never lands and the bundle re-reads
+  // undefined → TypeError aborts SW eval → onConnect never registers ("No onConnect
+  // listeners found"). Assign defensively: try direct, then defineProperty, and if
+  // the host object itself rejects new props, leave it (caller already null-checked).
+  function setIfMissing(obj, prop, value) {
+    if (!obj || obj[prop] != null) return;
+    try { obj[prop] = value; if (obj[prop] != null) return; } catch (e) {}
+    try { Object.defineProperty(obj, prop, { value: value, writable: true, configurable: true, enumerable: false }); } catch (e) {}
+  }
+  // Safari exposes some chrome.* sub-namespaces (scripting, storage) as FROZEN
+  // native objects: setIfMissing can't add to them (defineProperty also fails on a
+  // frozen object), so the enum/managed backfills never land and the bundle aborts.
+  // Return a MUTABLE stand-in: if parent[key] is non-extensible, replace it on the
+  // parent with an extensible shallow clone (parent itself is extensible in Safari —
+  // we assign chrome.idle etc. elsewhere) and patch that. Returns the object the
+  // caller should backfill onto, or null if even the parent rejects the swap.
+  function mutableNamespace(parent, key) {
+    if (!parent) return null;
+    var ns = parent[key];
+    if (ns && Object.isExtensible(ns)) return ns;
+    if (ns == null) ns = {};
+    var clone = {};
+    // Copy members onto the clone. CRITICAL: native methods (runtime.sendMessage,
+    // runtime.connect, storage.local.get …) are bound to the original namespace so
+    // calling them through the clone preserves their `this` — an unbound native
+    // method invoked with this=clone throws "Can only be called on …" in Safari.
+    var copy = function (name) {
+      if (name in clone) return;
+      var v;
+      try { v = ns[name]; } catch (e) { return; }
+      if (typeof v === "function") { try { clone[name] = v.bind(ns); return; } catch (e) {} }
+      try { clone[name] = v; } catch (e) {}
+    };
+    for (var k in ns) copy(k);
+    // for-in skips non-enumerable native members; include own names too.
+    try { var names = Object.getOwnPropertyNames(ns); for (var i = 0; i < names.length; i++) copy(names[i]); } catch (e) {}
+    try { parent[key] = clone; if (parent[key] === clone) return clone; } catch (e) {}
+    try {
+      Object.defineProperty(parent, key, { value: clone, writable: true, configurable: true });
+      if (parent[key] === clone) return clone;
+    } catch (e) {}
+    return (parent[key] && Object.isExtensible(parent[key])) ? parent[key] : null;
+  }
+  // Safari's native `chrome.scripting` is an EXOTIC, IMMUTABLE host slot. Proven
+  // live, exhaustively: assign is a silent no-op (no throw, value unchanged);
+  // defineProperty is a silent no-op; `delete` returns true but the native slot
+  // immediately re-materializes empty. So the missing ExecutionWorld/RegistrationWorld
+  // enums CANNOT be installed onto chrome.scripting from JS at all. The real fix is
+  // the converter rewriting `chrome.scripting.ExecutionWorld.X` → "X" in the bundle
+  // (see inlineImmutableEnums in stage.ts). This stays as a best-effort for non-Safari
+  // / content-script contexts where the namespace is mutable; it's a no-op when it
+  // can't take, and never throws.
+  function backfillScripting(parent) {
+    if (!parent) return;
+    var sc; try { sc = parent.scripting; } catch (e) { return; }
+    if (!sc) {
+      sc = {};
+      try { parent.scripting = sc; } catch (e) {
+        try { Object.defineProperty(parent, "scripting", { value: sc, writable: true, configurable: true }); } catch (e2) { return; }
+      }
+    }
+    setIfMissing(sc, "ExecutionWorld", { ISOLATED: "ISOLATED", MAIN: "MAIN" });
+    setIfMissing(sc, "RegistrationWorld", { ISOLATED: "ISOLATED", MAIN: "MAIN" });
+  }
+  // Direct enum backfill for the rare third (api) namespace; chrome/browser go
+  // through backfillScripting above.
   function backfillScriptingEnums(sc) {
     if (!sc) return;
-    if (!sc.ExecutionWorld) { try { sc.ExecutionWorld = { ISOLATED: "ISOLATED", MAIN: "MAIN" }; } catch (e) {} }
-    if (!sc.RegistrationWorld) { try { sc.RegistrationWorld = { ISOLATED: "ISOLATED", MAIN: "MAIN" }; } catch (e) {} }
+    setIfMissing(sc, "ExecutionWorld", { ISOLATED: "ISOLATED", MAIN: "MAIN" });
+    setIfMissing(sc, "RegistrationWorld", { ISOLATED: "ISOLATED", MAIN: "MAIN" });
   }
-  backfillScriptingEnums(hasChrome && chrome.scripting);
-  if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) backfillScriptingEnums(browser.scripting);
-  if (api.scripting) backfillScriptingEnums(api.scripting);
+  if (typeof chrome !== "undefined" && chrome) backfillScripting(chrome);
+  if (typeof browser !== "undefined" && browser && !(typeof chrome !== "undefined" && browser === chrome)) backfillScripting(browser);
+  // `api` is browser||chrome||null; both already handled above when they're the
+  // resolved namespace. Only patch here if api is a third distinct object. Never
+  // reference a bare `chrome`/`browser` — guard via hasChrome / typeof.
+  var __browser = (typeof browser !== "undefined") ? browser : null;
+  if (api && api !== __browser && !(hasChrome && api === chrome)) backfillScriptingEnums(mutableNamespace(api, "scripting"));
+
+  // runtime.getURL("") — Chrome returns the extension base URL ("chrome-extension://id/");
+  // Safari returns undefined/"" for a falsy path, so callers doing getURL("").slice(...)
+  // (uBlock's vAPI.getURL) crash with "undefined is not an object". Wrap getURL so a
+  // falsy/relative arg always yields a usable absolute base. Patch each namespace once.
+  // Safari is INCONSISTENT about the extension UUID's case across APIs: it reports it
+  // UPPERCASE in getURL()/sender.url but LOWERCASE in sender.origin. Extensions gate
+  // their own privileged pages with `sender.origin === getURL('').slice(0,-1)`, and
+  // that equality is always false on Safari (lower !== UPPER) → the popup's port is
+  // judged unprivileged → privileged messages (uBlock getPopupData) go unanswered →
+  // blank popup. We can't fix sender.origin (it's an exotic getter returning a fresh
+  // object each read — mutation doesn't stick). The authority/host of a URL is
+  // case-insensitive per RFC 3986, so the FIX that makes both sides match without
+  // breaking resource loads is to LOWERCASE the safari-web-extension://<host> authority
+  // in getURL()'s output. Then getURL-derived origins equal the lowercase sender.origin.
+  function lowerHost(u) {
+    if (typeof u !== "string") return u;
+    // Lowercase only the scheme://authority prefix; leave the case-sensitive path.
+    return u.replace(/^(safari-web-extension|chrome-extension|moz-extension):\/\/([^/]+)/i, function (_m, scheme, host) {
+      return scheme.toLowerCase() + "://" + host.toLowerCase();
+    });
+  }
+  function patchGetURL(rt) {
+    if (!rt || typeof rt.getURL !== "function" || rt.__c2sGetURL) return;
+    var orig = rt.getURL.bind(rt);
+    var base = "";
+    try { base = orig("/") || orig("manifest.json").replace(/manifest\.json[^/]*$/, "") || ""; } catch (e) {}
+    if (!base) { try { base = (location && location.origin ? location.origin + "/" : ""); } catch (e) {} }
+    base = lowerHost(base);
+    function wrapped(p) {
+      var r = null;
+      try { r = orig(p == null ? "" : p); } catch (e) {}
+      if (r) return lowerHost(r);
+      // Safari gave us nothing usable: build from the base.
+      var path = (p == null ? "" : String(p)).replace(/^\.?\//, "");
+      return base + path;
+    }
+    try { rt.getURL = wrapped; rt.__c2sGetURL = true; } catch (e) {
+      try { Object.defineProperty(rt, "getURL", { value: wrapped, writable: true, configurable: true }); rt.__c2sGetURL = true; } catch (e2) {}
+    }
+  }
+  // A FROZEN Safari chrome.runtime blocks the getURL wrap (assignment + defineProperty
+  // both fail on a frozen object), so getURL("") keeps returning ""/undefined and
+  // uBlock's vAPI.getURL("").slice crashes. Swap in a mutable runtime clone (native
+  // methods stay bound to the original) so the wrap lands. Then re-run the runtime
+  // event/enum backfill on the now-mutable namespace too.
+  if (hasChrome) { var __crt = mutableNamespace(chrome, "runtime"); patchGetURL(__crt); backfillRuntimeEvents(__crt); }
+  if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) { var __brt = mutableNamespace(browser, "runtime"); patchGetURL(__brt); backfillRuntimeEvents(__brt); }
+  if (api && api !== __browser && !(hasChrome && api === chrome)) { var __art = mutableNamespace(api, "runtime"); patchGetURL(__art); backfillRuntimeEvents(__art); }
+
+  // runtime.connect() wake-the-background. Safari THROWS synchronously
+  // "Invalid call to runtime.connect(). No runtime.onConnect listeners found." when
+  // the non-persistent background page is suspended at connect() time — Chrome would
+  // queue the port and wake the worker. Every converted popup hits this on open
+  // (uBlock/Bitwarden/Grammarly: blank popup). MV3-on-Safari forbids a persistent
+  // background, so we can't keep it awake; instead wrap connect() to return a proxy
+  // Port that buffers, pings the background via sendMessage to wake it, and retries
+  // the real connect() until onConnect is live — then flushes through.
+  function wrapConnect(rt) {
+    if (!rt || typeof rt.connect !== "function" || rt.__c2sConnect) return;
+    var nativeConnect = rt.connect; // already bound to the real runtime by mutableNamespace
+    var nativeSend = (typeof rt.sendMessage === "function") ? rt.sendMessage : null;
+    function makeProxyPort(connectArgs) {
+      var real = null;            // the real Port once connect() succeeds
+      var queued = [];            // postMessage payloads buffered pre-connect
+      var msgListeners = [];      // onMessage listeners to forward
+      var discListeners = [];     // onDisconnect listeners to forward
+      var closed = false;
+      var name = "";
+      try { name = (connectArgs[0] && typeof connectArgs[0] === "object") ? (connectArgs[0].name || "") : (typeof connectArgs[0] === "string" ? connectArgs[0] : ""); } catch (e) {}
+      function wireReal(p) {
+        real = p;
+        try { for (var i = 0; i < msgListeners.length; i++) p.onMessage.addListener(msgListeners[i]); } catch (e) {}
+        try { for (var j = 0; j < discListeners.length; j++) p.onDisconnect.addListener(discListeners[j]); } catch (e) {}
+        try { for (var k = 0; k < queued.length; k++) p.postMessage(queued[k]); } catch (e) {}
+        queued = [];
+      }
+      var attempts = 0;
+      function tryConnect() {
+        if (real || closed) return;
+        if (++attempts > 40) return; // ~6s ceiling; give up quietly
+        // Wake the background page; a one-shot message forces Safari to spin it up.
+        if (nativeSend) { try { var r = nativeSend({ __c2s_wake__: 1 }); if (r && typeof r.then === "function") r.then(function () {}, function () {}); } catch (e) {} }
+        var p = null;
+        try { p = nativeConnect.apply(rt, connectArgs); } catch (e) { p = null; }
+        if (p) { wireReal(p); return; }
+        setTimeout(tryConnect, 150);
+      }
+      tryConnect();
+      // The proxy Port: same shape as a real Port, forwards to `real` once available.
+      return {
+        name: name,
+        postMessage: function (m) { if (real) { try { return real.postMessage(m); } catch (e) {} } else if (!closed) queued.push(m); },
+        disconnect: function () { closed = true; if (real) { try { return real.disconnect(); } catch (e) {} } },
+        onMessage: {
+          addListener: function (f) { if (typeof f !== "function") return; msgListeners.push(f); if (real) { try { real.onMessage.addListener(f); } catch (e) {} } },
+          removeListener: function (f) { var i = msgListeners.indexOf(f); if (i >= 0) msgListeners.splice(i, 1); if (real) { try { real.onMessage.removeListener(f); } catch (e) {} } },
+          hasListener: function (f) { return msgListeners.indexOf(f) >= 0; },
+        },
+        onDisconnect: {
+          addListener: function (f) { if (typeof f !== "function") return; discListeners.push(f); if (real) { try { real.onDisconnect.addListener(f); } catch (e) {} } },
+          removeListener: function (f) { var i = discListeners.indexOf(f); if (i >= 0) discListeners.splice(i, 1); if (real) { try { real.onDisconnect.removeListener(f); } catch (e) {} } },
+          hasListener: function (f) { return discListeners.indexOf(f) >= 0; },
+        },
+      };
+    }
+    function wrapped() {
+      var args = Array.prototype.slice.call(arguments);
+      // Fast path: if a listener is already live, the native call succeeds — use it
+      // directly so we add zero overhead to the common (background-awake) case.
+      try { return nativeConnect.apply(rt, args); }
+      catch (e) {
+        // The "no onConnect listeners" throw → background asleep. Return a proxy that
+        // wakes it and connects for real. Any other error: re-throw (real bug).
+        var msg = (e && e.message) ? e.message : "";
+        if (/onConnect|disconnected|not? *found|listener/i.test(msg)) return makeProxyPort(args);
+        throw e;
+      }
+    }
+    try { rt.connect = wrapped; rt.__c2sConnect = true; } catch (e) {
+      try { Object.defineProperty(rt, "connect", { value: wrapped, writable: true, configurable: true }); rt.__c2sConnect = true; } catch (e2) {}
+    }
+  }
+  if (hasChrome) wrapConnect(mutableNamespace(chrome, "runtime"));
+  if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) wrapConnect(mutableNamespace(browser, "runtime"));
+  if (api && api !== __browser && !(hasChrome && api === chrome)) wrapConnect(mutableNamespace(api, "runtime"));
+
+  // onConnect/onMessage sender.origin CASE MISMATCH (Safari). Live-proven: Safari
+  // reports the extension UUID LOWERCASED in `sender.origin`
+  //   safari-web-extension://c16b51b5-…   (origin, lowercase)
+  // but UPPERCASED in `sender.url` and in `runtime.getURL()`
+  //   safari-web-extension://C16B51B5-…/popup.html   (url + getURL, uppercase).
+  // Extensions privilege-gate their own pages by comparing sender.origin to a base
+  // derived from getURL (uBlock: PRIVILEGED_ORIGIN = getURL('').slice(0,-1), then
+  // `origin === PRIVILEGED_ORIGIN`). The case mismatch makes that equality FALSE, so
+  // the popup's port is treated as unprivileged → privileged channels (getPopupData)
+  // go unhandled → the popup gets no reply → popupData null → blank popup. Fix: when
+  // a sender's origin is our own extension origin case-insensitively, rewrite it to
+  // the exact casing getURL() uses so the bundle's `===` succeeds.
+  function canonicalOrigin(rt) {
+    try {
+      var u = rt && typeof rt.getURL === "function" ? rt.getURL("") : "";
+      if (!u) return "";
+      return u.replace(/\/+$/, ""); // drop trailing slash → matches slice(0,-1)
+    } catch (e) { return ""; }
+  }
+  // Best-effort: on browsers where sender.origin IS mutable, align it to the canonical
+  // (lowercased) getURL origin so a bundle's `sender.origin === getURL-derived` check
+  // passes. On Safari this is a no-op (sender is an exotic fresh-object getter — proven
+  // live), which is fine: the real fix is patchGetURL lowercasing the host so both
+  // sides are already lowercase and equal.
+  function fixSenderOrigin(sender, canon) {
+    if (!sender || !canon) return;
+    try {
+      var o = sender.origin;
+      if (typeof o === "string" && o && o !== canon && o.toLowerCase() === canon.toLowerCase()) {
+        try { sender.origin = canon; } catch (e) {
+          try { Object.defineProperty(sender, "origin", { value: canon, configurable: true, writable: true, enumerable: true }); } catch (e2) {}
+        }
+      }
+    } catch (e) {}
+  }
+  function wrapOnConnect(rt) {
+    if (!rt || rt.__c2sOnConnect) return;
+    var canon = canonicalOrigin(rt);
+    if (!canon) return;
+    var oc = rt.onConnect;
+    if (!oc || typeof oc.addListener !== "function" || oc.__c2sWrapped) return;
+    var nativeAdd = oc.addListener.bind(oc);
+    oc.addListener = function (fn) {
+      if (typeof fn !== "function") return nativeAdd(fn);
+      return nativeAdd(function (port) {
+        try { if (port) fixSenderOrigin(port.sender, canon); } catch (e) {}
+        return fn.apply(this, arguments);
+      });
+    };
+    // Same mismatch hits onMessage-based privileged checks.
+    var om = rt.onMessage;
+    if (om && typeof om.addListener === "function" && !om.__c2sWrapped) {
+      var nativeAddM = om.addListener.bind(om);
+      om.addListener = function (fn) {
+        if (typeof fn !== "function") return nativeAddM(fn);
+        return nativeAddM(function (msg, sender, reply) {
+          try { fixSenderOrigin(sender, canon); } catch (e) {}
+          return fn.apply(this, arguments);
+        });
+      };
+      try { om.__c2sWrapped = true; } catch (e) {}
+    }
+    try { oc.__c2sWrapped = true; rt.__c2sOnConnect = true; } catch (e) {}
+  }
+  if (hasChrome) wrapOnConnect(mutableNamespace(chrome, "runtime"));
+  if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) wrapOnConnect(mutableNamespace(browser, "runtime"));
+  if (api && api !== __browser && !(hasChrome && api === chrome)) wrapOnConnect(mutableNamespace(api, "runtime"));
 
   // Safari's action popup (default_popup) is a POPOVER, not a side panel sharing
   // the browser window. So tabs.query({active:true,currentWindow:true}) resolves
@@ -245,7 +602,11 @@ var __C2S_DEBUG__ = false;
   // that exposes a real, working storage.sync.
   if (api.storage && api.storage.local &&
       (!api.storage.sync || typeof api.storage.sync.get !== "function")) {
-    var local = api.storage.local;
+    // Safari's storage namespace is frozen — a raw `api.storage.sync = {…}` throws
+    // and (pre-guard) aborted the whole shim. Swap in an extensible clone first so
+    // the assignment lands. local is read off the original (preserved by the clone).
+    var __stg = mutableNamespace(api, "storage") || api.storage;
+    var local = __stg.local;
     // Bridge Chrome's callback form. When api is the webextension-polyfill
     // browser object, local.get/set/... are promise-ONLY and ignore a trailing
     // callback — so chrome.storage.sync.get(keys, cb) would never fire cb. Strip a
@@ -260,7 +621,7 @@ var __C2S_DEBUG__ = false;
         return p;
       };
     };
-    api.storage.sync = {
+    __stg.sync = {
       get: syncFwd(local.get),
       set: syncFwd(local.set),
       remove: syncFwd(local.remove),
@@ -269,7 +630,7 @@ var __C2S_DEBUG__ = false;
       // Bundles read storage.sync.onChanged.addListener at module-eval; a stub
       // without it throws and aborts evaluation. storage.onChanged (Chrome's real
       // location — there is no storage.local.onChanged) fires for local writes too.
-      onChanged: (api.storage.onChanged) || event(),
+      onChanged: (__stg.onChanged) || event(),
     };
   }
 
@@ -1043,12 +1404,21 @@ var __C2S_DEBUG__ = false;
       var alarmReg = Object.create(null);
       var alarmList = [];
       var alarmInfo = function (a) { return { name: a.name, scheduledTime: a.when, periodInMinutes: a.period || undefined }; };
+      // setTimeout's delay is a 32-bit int: anything over 2^31-1 ms (~24.8 days)
+      // overflows and fires immediately. Chrome alarms can be scheduled months out
+      // (delayInMinutes), so chain shorter hops until the real deadline arrives.
+      var MAX_DELAY = 2147483647;
       var armAlarm = function (a) {
+        var remaining = a.when - Date.now();
+        if (remaining > MAX_DELAY) {
+          a.t = setTimeout(function () { armAlarm(a); }, MAX_DELAY);
+          return;
+        }
         a.t = setTimeout(function () {
           if (a.period) { a.when = Date.now() + a.period * 60000; armAlarm(a); }
           else delete alarmReg[a.name];
           for (var i = 0; i < alarmList.length; i++) { try { alarmList[i](alarmInfo(a)); } catch (e) {} }
-        }, Math.max(0, a.when - Date.now()));
+        }, Math.max(0, remaining));
       };
       chrome.alarms = {
         create: function (name, info, cb) {
@@ -1071,10 +1441,92 @@ var __C2S_DEBUG__ = false;
         },
       };
     }
+    // Safari's NATIVE alarms.create is stricter than Chrome's: it throws "The 'info'
+    // value is invalid, because an object is expected." when called as create(name)
+    // or create() with no info object. Chrome treats a missing info as {}. uBlock
+    // calls create(name) → the throw aborts its alarm setup. Wrap the native impl to
+    // always pass an object. (Only when alarms is native — the polyfill above already
+    // normalizes its own args.)
+    try {
+      if (chrome.alarms && typeof chrome.alarms.create === "function" && !chrome.alarms.__c2sCreate) {
+        var __alarmCreate = chrome.alarms.create.bind(chrome.alarms);
+        var __wrapAlarmCreate = function (name, info, cb) {
+          // Shift args: create(info), create(name, info), create(name).
+          if (typeof name === "object" && name !== null) { cb = info; info = name; name = ""; }
+          if (typeof info === "function") { cb = info; info = undefined; }
+          if (info == null || typeof info !== "object") info = {};
+          try { return __alarmCreate(name == null ? "" : name, info, cb); }
+          catch (e) { try { return __alarmCreate(name == null ? "" : name, info); } catch (e2) {} }
+        };
+        try { chrome.alarms.create = __wrapAlarmCreate; chrome.alarms.__c2sCreate = true; } catch (e) {
+          try { Object.defineProperty(chrome.alarms, "create", { value: __wrapAlarmCreate, writable: true, configurable: true }); chrome.alarms.__c2sCreate = true; } catch (e2) {}
+        }
+      }
+    } catch (e) {}
+
+    // Safari's NATIVE contextMenus/menus.create rejects URL match patterns with a
+    // scheme it doesn't recognize ("'abp:*' is not a valid pattern") and throws,
+    // aborting the caller. Chrome silently ignores unknown patterns. uBlock registers
+    // an "abp:*" targetUrlPattern. Wrap create to drop patterns that don't parse as a
+    // standard http/https/file/ftp/* match so the menu item still registers.
+    try {
+      var __menuNs = chrome.contextMenus || chrome.menus;
+      if (__menuNs && typeof __menuNs.create === "function" && !__menuNs.__c2sCreate) {
+        var __menuCreate = __menuNs.create.bind(__menuNs);
+        var __okPattern = function (p) {
+          return typeof p === "string" && (p === "<all_urls>" || /^(\*|https?|file|ftp):\/\//i.test(p));
+        };
+        var __sanitizePatterns = function (arr) {
+          if (!Array.isArray(arr)) return arr;
+          var out = arr.filter(__okPattern);
+          return out.length ? out : undefined; // empty array would itself be invalid
+        };
+        var __wrapMenuCreate = function (props, cb) {
+          if (props && typeof props === "object") {
+            try {
+              if ("targetUrlPatterns" in props) props.targetUrlPatterns = __sanitizePatterns(props.targetUrlPatterns);
+              if ("documentUrlPatterns" in props) props.documentUrlPatterns = __sanitizePatterns(props.documentUrlPatterns);
+              if (props.targetUrlPatterns === undefined) delete props.targetUrlPatterns;
+              if (props.documentUrlPatterns === undefined) delete props.documentUrlPatterns;
+            } catch (e) {}
+          }
+          try { return __menuCreate(props, cb); } catch (e) { try { return __menuCreate(props); } catch (e2) {} }
+        };
+        try { __menuNs.create = __wrapMenuCreate; __menuNs.__c2sCreate = true; } catch (e) {
+          try { Object.defineProperty(__menuNs, "create", { value: __wrapMenuCreate, writable: true, configurable: true }); __menuNs.__c2sCreate = true; } catch (e2) {}
+        }
+      }
+    } catch (e) {}
+
+    // Safari's NATIVE tabs.query throws "The 'windowId' value is invalid, because
+    // '-1' is not a window identifier." Chrome accepts windowId:-1 (WINDOW_ID_NONE /
+    // CURRENT) and just returns no/relevant tabs. Grammarly queries with windowId:-1.
+    // Wrap query to strip an invalid negative windowId rather than throw.
+    try {
+      if (chrome.tabs && typeof chrome.tabs.query === "function" && !chrome.tabs.__c2sQuery) {
+        var __tabsQuery = chrome.tabs.query.bind(chrome.tabs);
+        var __wrapTabsQuery = function (info, cb) {
+          if (info && typeof info === "object" && typeof info.windowId === "number" && info.windowId < 0) {
+            try { var c = {}; for (var k in info) c[k] = info[k]; delete c.windowId; info = c; } catch (e) {}
+          }
+          try { return __tabsQuery(info, cb); }
+          catch (e) { try { return __tabsQuery({}, cb); } catch (e2) { return dual([], cb); } }
+        };
+        try { chrome.tabs.query = __wrapTabsQuery; chrome.tabs.__c2sQuery = true; } catch (e) {
+          try { Object.defineProperty(chrome.tabs, "query", { value: __wrapTabsQuery, writable: true, configurable: true }); chrome.tabs.__c2sQuery = true; } catch (e2) {}
+        }
+      }
+    } catch (e) {}
+
+    // Safari can expose chrome.storage as a FROZEN native object, so session/managed
+    // backfills below can't attach (→ Grammarly's managed.get is undefined and its
+    // popup times out forever). mutableNamespace swaps in an extensible clone that
+    // keeps the real local/sync and accepts our additions.
+    var stg = chrome.storage ? mutableNamespace(chrome, "storage") : null;
 
     // storage.session (Safari < 16.4 lacks it) — in-memory map, correct get() key
     // semantics (string | array | object-with-defaults | null = everything).
-    if (chrome.storage && !chrome.storage.session) {
+    if (stg && !stg.session) {
       var sessMem = Object.create(null);
       var sessGet = function (keys) {
         var out = {};
@@ -1084,7 +1536,7 @@ var __C2S_DEBUG__ = false;
         for (var d in keys) out[d] = (d in sessMem) ? sessMem[d] : keys[d];
         return out;
       };
-      chrome.storage.session = {
+      setIfMissing(stg, "session", {
         get: function (keys, cb) { if (typeof keys === "function") { cb = keys; keys = null; } return dual(sessGet(keys), cb); },
         set: function (items, cb) { for (var k in items) sessMem[k] = items[k]; return dual(undefined, cb); },
         remove: function (keys, cb) { if (typeof keys === "string") keys = [keys]; if (Array.isArray(keys)) { for (var i = 0; i < keys.length; i++) delete sessMem[keys[i]]; } return dual(undefined, cb); },
@@ -1092,22 +1544,24 @@ var __C2S_DEBUG__ = false;
         getBytesInUse: function (k, cb) { if (typeof k === "function") { cb = k; } return dual(0, cb); },
         setAccessLevel: function (o, cb) { return dual(undefined, cb); },
         onChanged: event(),
-      };
+      });
     }
-    // storage.managed — no MDM-policy surface; reads come back empty.
-    if (chrome.storage && !chrome.storage.managed) {
-      chrome.storage.managed = {
+    // storage.managed — no MDM-policy surface; reads come back empty. Grammarly
+    // blocks popup init waiting on managed.get; if it's undefined Grammarly times out.
+    if (stg && !stg.managed) {
+      setIfMissing(stg, "managed", {
         get: function (keys, cb) { if (typeof keys === "function") { cb = keys; } return dual({}, cb); },
         getBytesInUse: function (k, cb) { if (typeof k === "function") { cb = k; } return dual(0, cb); },
         onChanged: event(),
-      };
+      });
     }
     // Mirror managed onto the RESOLVED namespace too: Tampermonkey/Grammarly read
     // browser.storage.managed.get (the native namespace, distinct from chrome here),
     // which Safari omits → "undefined is not an object". Patch api.storage.managed
     // when it differs from the chrome one we just stubbed.
-    if (api.storage && api.storage !== chrome.storage && !api.storage.managed) {
-      api.storage.managed = chrome.storage.managed;
+    if (api.storage && stg && api.storage !== stg && !api.storage.managed) {
+      var apiStg = mutableNamespace(api, "storage");
+      if (apiStg) { setIfMissing(apiStg, "managed", stg.managed); setIfMissing(apiStg, "session", stg.session); }
     }
 
     // chrome.idle — derive state from page visibility where a document exists;
@@ -1794,6 +2248,31 @@ var __C2S_DEBUG__ = false;
         return dual(res, cb);
       },
     });
+    // Safari's NATIVE i18n.getMessage throws "The 'name' value is invalid, because
+    // it cannot be empty." for an empty/invalid key — Chrome just returns "". uBlock
+    // calls getMessage("") in its popup and the throw kills popup init. Wrap the
+    // native impl to return "" on a falsy key and to never throw. (fill() above only
+    // backfills when ABSENT, so Safari's throwing native is still in place — wrap it.)
+    try {
+      var __nativeGetMsg = chrome.i18n && chrome.i18n.getMessage;
+      if (typeof __nativeGetMsg === "function" && !chrome.i18n.__c2sGetMsg) {
+        var __gm = function (key, subs) {
+          if (key == null || key === "") return "";
+          try { return __nativeGetMsg.call(chrome.i18n, key, subs); }
+          catch (e) {
+            var s = Array.isArray(subs) ? subs : (subs != null ? [subs] : []);
+            return String(key).replace(/\$(\d+)/g, function (_, d) { return s[d - 1] != null ? s[d - 1] : ""; });
+          }
+        };
+        try { chrome.i18n.getMessage = __gm; chrome.i18n.__c2sGetMsg = true; } catch (e) {
+          try { Object.defineProperty(chrome.i18n, "getMessage", { value: __gm, writable: true, configurable: true }); chrome.i18n.__c2sGetMsg = true; } catch (e2) {}
+        }
+        // Mirror onto the resolved namespace if it carries its own throwing copy.
+        if (api.i18n && api.i18n !== chrome.i18n && api.i18n.getMessage && !api.i18n.__c2sGetMsg) {
+          try { api.i18n.getMessage = __gm; api.i18n.__c2sGetMsg = true; } catch (e) {}
+        }
+      }
+    } catch (e) {}
 
     // ChromeOS / enterprise / kiosk tail — every remaining chrome.* namespace gets
     // an inert object so feature probes and module-eval reads can't crash.
@@ -2212,5 +2691,12 @@ var __C2S_DEBUG__ = false;
         // unrelated app code the injected tabId.
       }
     } catch (e) { /* ignore */ }
+  }
+
+  } catch (__shimErr) {
+    // A block threw despite its own guards (almost always a write to a frozen
+    // Safari native). Swallow so the prepended host script still runs; surface in
+    // the Inspector only when debugging.
+    if (__C2S_DEBUG__) { try { console.warn("[c2s] shim aborted early:", __shimErr); } catch (e) {} }
   }
 })();

@@ -94,6 +94,24 @@ export function deriveProxyHosts(manifest: Manifest): string[] {
   return [...hosts];
 }
 
+/**
+ * Index just past the first REAL `<head ...>` tag, skipping any `<head>` that
+ * sits inside an HTML comment (`<!-- <head> -->`). Injecting a <script> after a
+ * commented-out head buries it inside the comment → it never runs (blank popup /
+ * dead page). Returns -1 when there's no usable head tag.
+ */
+function headInsertIndex(html: string): number {
+  const re = /<head[^>]*>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    // Inside a comment if the last "<!--" before this point has no "-->" after it.
+    const open = html.lastIndexOf("<!--", m.index);
+    if (open !== -1 && html.indexOf("-->", open) > m.index) continue;
+    return m.index + m[0].length;
+  }
+  return -1;
+}
+
 function walkHtmlFiles(dir: string, acc: string[] = []): string[] {
   let entries;
   try {
@@ -130,9 +148,8 @@ export function injectShimIntoHtmlPages(dir: string, polyfillFile?: string): num
     const missing = [polyTag, shimTag].filter((t) => t && !html.includes(t));
     if (missing.length === 0) continue;
     const toInsert = missing.join("\n    ");
-    const headMatch = html.match(/<head[^>]*>/i);
-    if (headMatch) {
-      const at = headMatch.index! + headMatch[0].length;
+    const at = headInsertIndex(html);
+    if (at >= 0) {
       html = html.slice(0, at) + "\n    " + toInsert + html.slice(at);
     } else {
       html = toInsert + "\n" + html;
@@ -185,9 +202,8 @@ export function injectPopupSizing(dir: string, popupFile: string, fullHeight = f
     ? `html,body{margin:0!important;height:600px!important;min-width:380px;}`
     : `html,body{margin:0!important;}body{min-width:320px;min-height:160px;}`;
   const style = `<style id="${marker}">:root{color-scheme:light dark;}${sizeFloor}</style>`;
-  const headMatch = html.match(/<head[^>]*>/i);
-  if (headMatch) {
-    const at = headMatch.index! + headMatch[0].length;
+  const at = headInsertIndex(html);
+  if (at >= 0) {
     html = html.slice(0, at) + "\n    " + style + html.slice(at);
   } else {
     html = style + "\n" + html;
@@ -223,9 +239,17 @@ export function convertServiceWorkerToBackgroundPage(dir: string, manifest: Mani
   // so the now-undefined global is never invoked. CSP-safe and generic.
   const importTags = hoistImportScripts(dir, sw);
 
+  // manifest.name is raw (may be unresolved "__MSG_*__" or contain <,>,& — e.g.
+  // "Save to Notion <Beta>"). Escape it so a stray "<" / "</title>" can't break
+  // out of the title and corrupt the background page's HTML.
+  const title = String(manifest.name ?? "Extension")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
   const html = `<!DOCTYPE html>
 <meta charset="utf-8">
-<title>${manifest.name ?? "Extension"} background</title>
+<title>${title} background</title>
 ${polyTag}${shimTag}${importTags}<script type="module" src="${sw}"></script>
 `;
   writeFileSync(join(dir, BACKGROUND_PAGE_FILENAME), html, "utf-8");
