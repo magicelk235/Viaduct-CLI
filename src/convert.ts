@@ -5,7 +5,7 @@ import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
 import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
-import { stageExtension, stripDanglingSourcemaps } from "./input/stage.js";
+import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums } from "./input/stage.js";
 import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, deriveProxyHosts } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
@@ -90,6 +90,14 @@ export function convert(opts: ConvertOptions): ConvertResult {
     const stageDir = join(outputDir, "staged_extension");
     info("Staging clean extension assets …");
     stageExtension(extPath, stageDir, collectReferencedPaths(manifest));
+
+    // Safari's chrome.scripting is an immutable host slot — the shim can't add the
+    // ExecutionWorld/RegistrationWorld enums, so bundles reading
+    // chrome.scripting.ExecutionWorld.ISOLATED hit `undefined.ISOLATED`. Inline those
+    // reads to their literal string values in the staged source (the shim handles the
+    // mutable-namespace cases; this covers the immutable ones).
+    const inlined = inlineImmutableEnums(stageDir);
+    if (inlined > 0) ok(`Inlined immutable scripting enums in ${inlined} script(s)`);
 
     let shimFile: string | undefined;
     let polyfillFile: string | undefined;

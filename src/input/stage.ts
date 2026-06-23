@@ -129,3 +129,50 @@ export function stripDanglingSourcemaps(stageDir: string): number {
   }
   return modified;
 }
+
+// Safari's `chrome.scripting` (and `chrome.runtime` etc.) are EXOTIC, IMMUTABLE host
+// slots: the shim cannot install the `ExecutionWorld`/`RegistrationWorld` enum objects
+// onto them (assign/defineProperty are silent no-ops, delete re-materializes the empty
+// native slot — proven live). Bundles read e.g. `chrome.scripting.ExecutionWorld.ISOLATED`
+// at runtime and get `undefined.ISOLATED` → TypeError that aborts the call (Bitwarden:
+// "undefined is not an object (evaluating 'chrome.scripting.ExecutionWorld.ISOLATED')").
+// Since the enum members are fixed string constants, rewrite the reads to their literal
+// values directly in the staged source. Covers chrome|browser, dot or ["bracket"] access
+// for the namespace step, and the two enums Safari omits. Returns files modified.
+//
+// ponytail: literal-substitution, not a JS parser. These enums are only ever read as
+// `.ExecutionWorld.<MEMBER>` member chains in real bundles (verified across the corpus);
+// a regex is enough and can't mangle unrelated code. If a bundle ever aliased the enum
+// object itself (`const W = chrome.scripting.ExecutionWorld`) we'd need AST work — add
+// then.
+const ENUM_VALUES: Record<string, Record<string, string>> = {
+  ExecutionWorld: { ISOLATED: "ISOLATED", MAIN: "MAIN" },
+  RegistrationWorld: { ISOLATED: "ISOLATED", MAIN: "MAIN" },
+};
+// e.g.  chrome.scripting.ExecutionWorld.ISOLATED  |  browser["scripting"].RegistrationWorld.MAIN
+const ENUM_RE =
+  /\b(?:chrome|browser)\s*(?:\.\s*scripting|\[\s*["']scripting["']\s*\])\s*\.\s*(ExecutionWorld|RegistrationWorld)\s*\.\s*([A-Z_]+)\b/g;
+
+export function inlineImmutableEnums(stageDir: string): number {
+  let modified = 0;
+  for (const file of walkScripts(stageDir)) {
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    let changed = false;
+    const next = content.replace(ENUM_RE, (whole, enumName: string, member: string) => {
+      const val = ENUM_VALUES[enumName]?.[member];
+      if (val == null) return whole; // unknown member — leave it untouched
+      changed = true;
+      return JSON.stringify(val); // "ISOLATED"
+    });
+    if (changed) {
+      writeFileSync(file, next, "utf-8");
+      modified++;
+    }
+  }
+  return modified;
+}

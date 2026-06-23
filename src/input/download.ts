@@ -1,4 +1,5 @@
-import { get } from "node:https";
+import { get as httpsGet } from "node:https";
+import { get as httpGetPlain } from "node:http";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -58,6 +59,16 @@ function httpGet(url: string, redirectsLeft = MAX_REDIRECTS): Promise<HttpResult
     // fire, and whichever lands second is a silent no-op. Settle exactly once.
     let settled = false;
     const done = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
+    // isUrl() permits http:// too; https.get throws ERR_INVALID_PROTOCOL on it
+    // synchronously. Pick the matching agent so an http:// input downloads (or
+    // fails) gracefully instead of with a cryptic internal TypeError.
+    let get: typeof httpsGet;
+    try {
+      get = new URL(url).protocol === "http:" ? httpGetPlain : httpsGet;
+    } catch {
+      reject(new Error(`Invalid URL: ${url}`));
+      return;
+    }
     const req = get(url, (res) => {
       const status = res.statusCode ?? 0;
 
