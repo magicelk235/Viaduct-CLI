@@ -37,6 +37,19 @@ test("popup sizing: margin reset is !important, size floor is NOT", () => {
   assert.ok(out.indexOf("c2s-popup-size") < out.indexOf("style.css"));
 });
 
+test("popup sizing: anchors a flex :root to the start (uBlock right-shift fix)", () => {
+  // uBlock's :root.desktop is `display:flex;justify-content:flex-end`; Safari's
+  // wider-than-content popover lets that flex-end shove the popup right. The inject
+  // must force start alignment so the popup hugs the left edge.
+  const out = size('<!doctype html><html><head></head><body></body></html>');
+  const style = out.match(/<style id="c2s-popup-size">([^<]*)<\/style>/)[1];
+  assert.match(style, /justify-content:flex-start!important/);
+  assert.match(style, /align-items:flex-start!important/);
+  // selector must out-specify uBlock's `:root.desktop` (0,2,0) or the override loses
+  // the specificity tiebreak even though both are !important.
+  assert.match(style, /:root:root:root\{[^}]*justify-content:flex-start/);
+});
+
 test("popup sizing: side-panel page gets an explicit height so 100% layout fills", () => {
   // Claude's sidepanel.html — height:100% collapses in a popover without this.
   const out = size('<head></head><body></body>', true);
