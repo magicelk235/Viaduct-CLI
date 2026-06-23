@@ -208,3 +208,38 @@ test("fill: a falsy native member is preserved, not clobbered by the stub", () =
   assert.equal(typeof chrome.contextMenus.removeAll, "function", "missing member added");
   assert.ok(chrome.contextMenus.onClicked, "missing event added");
 });
+
+// ---- cookies.onChanged: Safari fires a NULL changeInfo (Grammarly bg crash) ----
+// Safari exposes chrome.cookies.onChanged but emits null. A listener doing
+// `const {cookie} = changeInfo` throws; unhandled in the bg page it kills the bg
+// (Grammarly: bg.unhandledException → popup init times out). The shim wraps
+// addListener to drop null events before they reach the listener.
+test("cookies.onChanged: null events are swallowed, real events pass through", () => {
+  // Native onChanged with real listener storage + a way to fire arbitrary payloads.
+  const listeners = [];
+  const nativeCookies = {
+    get: () => {}, getAll: () => {}, set: () => {}, remove: () => {},
+    onChanged: {
+      addListener(f) { listeners.push(f); },
+      removeListener() {}, hasListener() { return false; },
+      _fire(payload) { for (const f of listeners.slice()) f(payload); },
+    },
+  };
+  const chrome = setup(makeStore(), { cookies: nativeCookies });
+
+  const seen = [];
+  // Grammarly-style listener that destructures the event.
+  chrome.cookies.onChanged.addListener((changeInfo) => {
+    const { cookie } = changeInfo; // throws if changeInfo is null and unguarded
+    seen.push(cookie && cookie.name);
+  });
+
+  // Safari delivers null first — must NOT throw and must NOT reach the listener.
+  assert.doesNotThrow(() => nativeCookies.onChanged._fire(null));
+  assert.doesNotThrow(() => nativeCookies.onChanged._fire(undefined));
+  assert.deepEqual(seen, [], "null/undefined events dropped before the listener");
+
+  // A real event still flows through.
+  nativeCookies.onChanged._fire({ cookie: { name: "sid" }, cause: "explicit" });
+  assert.deepEqual(seen, ["sid"], "real change events still delivered");
+});
