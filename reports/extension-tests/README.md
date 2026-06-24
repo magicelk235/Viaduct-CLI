@@ -8,7 +8,7 @@ and tested in Safari with the bg-page Web Inspector.
 |-----------|--------|-----------------|
 | [uBlock Origin](./uBlock-Origin.md) | ✅ Working | Popup loads, live block stats render |
 | [Bitwarden](./Bitwarden.md) | ⚠️ Partial | UI loads; WASM SDK + passkey are platform limits |
-| [Grammarly](./Grammarly.md) | ⚠️ Three fixes landed | bg init no longer hangs on `storage.session.setAccessLevel` (the real `posted:0` → "starting…" cause) + port routing case fix + proxy carries httpOnly cookie; retest pending |
+| [Grammarly](./Grammarly.md) | ✅ Working | Popup renders, account loads. Took a 5-fix chain; the unblocker was a conversion-time rewrite stripping the `runtime.id +` prefix from the popup port-routing regex (Safari's `runtime.id` is the bundle id, not the URL-host UUID, and the slot is unfixable at runtime) |
 
 ## Cross-cutting root causes found this round
 All pinned with **live diagnostics** (debug flag → `chrome.storage.local` → read from
@@ -22,16 +22,24 @@ the reliable background-page console), not by guessing from pasted errors.
    no-ops, `delete` re-materializes it. ExecutionWorld/RegistrationWorld can't be
    installed. → converter inlines the enum reads to string literals
    (`inlineImmutableEnums`).
-3. **Extension UUID case mismatch.** `getURL()`/`sender.url` UPPERCASE, `sender.origin`
-   + `chrome.runtime.id` lowercase. Two breakages, same root:
-   (a) `sender.origin === getURL('').slice(0,-1)` privileged checks fail → blank popups
-   → lowercase the extension host in `getURL()` output (authority case-insensitive per
-   RFC 3986).
-   (b) port routing via `new RegExp(runtime.id + "/src/popup.html").test(sender.url)`
-   fails (lower id vs UPPER url) → popup port unrouted → bg posts no reply → popup hangs
-   (Grammarly "starting…"). `sender.url` is an exotic frozen getter (unpatchable) →
-   `wrapOnConnect`/onMessage pass the bundle a port/sender clone with a lowercased
-   `sender.url` host, methods still forwarding to the real port.
+3. **Extension UUID case mismatch.** `getURL()`/`sender.url` UPPERCASE the UUID host,
+   `sender.origin` lowercases it → `sender.origin === getURL('').slice(0,-1)` privileged
+   checks fail → blank popups. Fix: lowercase the extension host in `getURL()` output
+   (authority case-insensitive per RFC 3986); the onConnect/onMessage wrappers also hand
+   the bundle a sender clone with the host lowercased for the same equality checks.
+3b. **`chrome.runtime.id` ≠ URL-host UUID (Grammarly's popup blocker).** Distinct from the
+   case mismatch above: on Safari `runtime.id` is the App-Extension **bundle id**
+   (`com.…Extension (TEAM)`), while every extension URL's host is the per-install **UUID**.
+   Bundles that route the popup/side-panel port by
+   `new RegExp(runtime.id + "/src/popup.html").test(sender.url)` therefore never match →
+   port unrouted → bg posts no reply → popup hangs ("starting…"). `runtime.id` is a frozen
+   exotic slot (assignment + `defineProperty` no-op; `chrome.runtime` itself unreplaceable —
+   all proven live), so it can't be fixed in the shim → the converter strips the
+   `runtime.id +` prefix at staging (`rewriteRuntimeIdUrlMatchers`), making the matcher
+   host-agnostic and tolerant of Safari's `?tabId=N` popover query. The native event wrap
+   it relies on needs `installOverride` (Safari `addListener` is `{w:false,c:true}`), and
+   the port clone must forward methods **bound to the real port** (native `postMessage`
+   brand-checks `this`).
 4. **getURL("") on a frozen runtime** returned ""/undefined (uBlock crash) → wrap via a
    mutable runtime clone with native methods bound.
 5. **runtime.connect to a suspended bg throws** → proxy Port that wakes the bg and

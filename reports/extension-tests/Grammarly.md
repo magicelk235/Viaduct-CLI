@@ -1,22 +1,49 @@
 # Grammarly — Safari conversion test report
 
-**Status: ⚠️ THREE ROOT-CAUSE FIXES LANDED (retest pending).** The popup ("Grammarly
-is starting…" forever) was blocked by **three distinct converter bugs**, all now fixed:
+**Status: ✅ WORKING (popup renders, account loads — live-confirmed in Safari).** The
+popup ("Grammarly is starting…" forever) was blocked by a **chain** of distinct Safari
+issues; the extension only works once ALL of them are fixed. In the order they had to be
+solved:
 
-1. **bg init hung on `chrome.storage.session.setAccessLevel`** (THE PRIMARY, PROVEN
-   blocker) — Safari ships `storage.session` without `setAccessLevel`; Grammarly
-   `await`s it through a callback-only promise with no timeout, so bg init stalled
-   before registering its RPC listener → every popup RPC queued, bg posted no replies
-   (`posted:0`).
-2. **Popup↔background port routing by `sender.url` case** — a correct general fix for
-   extensions that route ports by `runtime.id`-vs-`sender.url`; not the bug Grammarly
-   actually tripped on (its popup detector is case-insensitive), but kept.
-3. **Auth proxy couldn't carry the httpOnly session cookie** — the native-host proxy
-   forwarded `document.cookie` (which can't see `grauth`), so authenticated calls
-   stayed `401 user_not_authorized`. Needed for auth once the popup runs.
+1. **bg init hung on `chrome.storage.session.setAccessLevel`** — Safari ships
+   `storage.session` without `setAccessLevel`; Grammarly `await`s it through a
+   callback-only promise with no timeout, so bg init stalled before registering its RPC
+   listener. Fixed by backfilling `setAccessLevel` (also clears stale `lastError` so the
+   bundle's resolver can't reject). Commits `63171d5`, `fe4f89b`.
+2. **Auth proxy couldn't carry the httpOnly session cookie** — the native-host proxy
+   forwarded `document.cookie` (can't see the httpOnly `grauth`), so authed calls stayed
+   `401`. Fixed by sourcing the Cookie from `chrome.cookies.getAll` (Safari's real jar,
+   httpOnly included) and stopping URLSession clobbering it. Commit `c4a4947`.
+3. **The shim's onConnect/onMessage wrap never installed on Safari** — it swapped
+   `addListener` by bare assignment, but Safari's native events expose `addListener` as
+   `{writable:false, configurable:true}`, so the assignment threw and the wrap silently
+   no-op'd. Fixed with `installOverride` (assign → verify → `defineProperty` fallback).
+   Commit `061c913`.
+4. **The cloned port broke the bg→popup reply** — the sender-url clone used
+   `Object.create(port)`, so `clone.postMessage` ran Safari's native `postMessage` with
+   `this`=clone, which brand-checks its receiver and threw "Can only be called on a Port
+   object" → every reply silently lost. Fixed by forwarding `postMessage`/`disconnect`
+   bound to the real port. Commit `ad11045`.
+5. **THE port-routing blocker (`runtime.id` ≠ URL host).** Grammarly routes the popup
+   port by `new RegExp(chrome.runtime.id + "/src/popup.html").test(sender.url)`. On
+   Chrome `runtime.id` IS the URL host; on Safari `runtime.id` is the App-Extension
+   **bundle id** (`com.…Extension (TEAM)`) while `sender.url`'s host is the per-install
+   **UUID** — two different strings, so the regex never matches → the port is never
+   stored → the bg posts no reply → `getPageConfig` never resolves → "starting…" forever.
+   `runtime.id` is a **frozen exotic slot** (assignment + `defineProperty` both no-op,
+   and `chrome.runtime` itself can't be replaced — all proven live), so it can't be fixed
+   in the shim. Fixed at **conversion time**: `rewriteRuntimeIdUrlMatchers` strips the
+   `runtime.id +` prefix → `new RegExp("/src/popup.html")`, which is host-agnostic and
+   tolerant of Safari's `?tabId=N` popover query. Commit `0705b23`. (An earlier attempt
+   to override `runtime.id` in the shim, `87237df`, is superseded — it could not work
+   against the frozen slot.)
 
 Plus an earlier fix this round: a Safari `chrome.cookies.onChanged` null-event crash
-that took down the background page.
+that took down the background page (`c14b167`, hardened by `installOverride` in `061c913`).
+
+The earlier "port routing by `sender.url` case" fix (`481d3a7`) was a partial step on the
+same problem; it's subsumed by #5 (the sender-url lowering it added is retained for
+origin-equality checks, but routing is what #5 actually fixes).
 
 Source: `test extensions/Grammarly.zip` (MV3, service worker → background page).
 Bundle id: `com.viaduct.GrammarlyAIWritingAssistantandGrammarCheckerApp`.
@@ -155,16 +182,32 @@ frozen native session so init can't hang" (reproduces Grammarly's promise verbat
 a `Object.freeze`d Safari-style session; **verified anti-vacuous** — fails/hangs with the
 fix neutered).
 
-### #1 vs #3 — which actually unblocks Grammarly
-Both are real Safari converter bugs, but the **proven** `posted:0` cause is **#3** (init
-hang → no `listen()`). #1 (sender.url routing) does **not** change Grammarly's outcome:
-its only Safari-active port detector (`Oa`) matches the UUID host with `.*`
-(case-insensitive), and `_initPortListener` wires `port.onMessage` and the reply
-`port.postMessage` **unconditionally** (outside the port-id `if`), so a mis-resolved
-sender.url cannot suppress replies. #1 is kept as a correct general fix for extensions
-that route ports by `runtime.id`-vs-`sender.url` (it would otherwise bite them), but #3
-is Grammarly's blocker. #2 (cookie) is needed for auth to *succeed* once the popup runs,
-not for the popup to render.
+### CORRECTION — the port-routing analysis above was wrong; live tracing fixed it
+The forensic write-ups in "Root cause #1" were drafted from a decompile and got two
+things wrong, both corrected by a **live storage-backed bg trace** (the console buffer
+drops early shim-eval logs, so traces were ring-buffered to `chrome.storage.local` and
+read back):
+
+- **`chrome.runtime.id` is NOT the lowercase UUID.** On Safari it is the App-Extension
+  **bundle id** (`com.…Extension (V8K8L3ZSD5)`) — a completely different string from the
+  `sender.url` host (the UUID). So `Oa`'s Chrome-branch regex
+  `new RegExp(runtime.id + "/src/popup.html")` can never match, regardless of case. The
+  sender.url *lowering* fix (`481d3a7`) therefore did nothing for routing — it only ever
+  helped the separate `sender.origin` equality checks.
+- **The reply path IS gated on routing.** The popup port is only stored in `_tabPorts`
+  when `Oa(sender.url)` resolves an id; unresolved → `portIdNotFound` → never stored →
+  the RPC reply (`getPageConfig`) is never delivered. The live trace showed exactly this:
+  port reached the bundle, popup→bg RPCs arrived, **zero** bg→popup replies, and a route
+  check logging `matchPopup=FALSE` with `runtime.id`=bundle-id.
+
+`runtime.id` is a frozen exotic slot (override probes returned `replaceInstalled=false`,
+descriptor `{w:false,c:true}` that still no-ops `defineProperty`; `chrome.runtime` itself
+can't be replaced). So the real fix is **#5 at conversion time** — strip the `runtime.id +`
+prefix from the matcher (`rewriteRuntimeIdUrlMatchers`, commit `0705b23`). With that, the
+popup renders (live-confirmed). #1 (bg setAccessLevel hang) and #4 (port brand-check) and
+#3 (onConnect wrap installing) were all genuine prerequisites — the popup couldn't render
+until every one was fixed — but **#5 is what finally unblocked routing**. #2 (cookie) is
+what lets auth succeed once the popup runs.
 
 ## Verified NOT additional converter bugs (audited this round)
 - **chrome.storage.managed**: shim stub resolves `{}` for both `chrome.*` and `browser.*`;
@@ -180,23 +223,32 @@ not for the popup to render.
   error listener is in the bg, not a popup throw).
 - **Font CSP refusals**: cosmetic; fallback fonts render.
 
-## What's left
-- **Retest in Safari** with the new build (reinstall cycle + quit/reopen Safari; verify
-  the new shim reached the installed `.appex`). Expect: bg bootstrap now passes
-  `allowCStoUseSessionStorage` (milestone log continues past "Migration completed"),
-  reaches `RB`, registers the `cs-to-bg-rpc` listener, drains the queued RPCs →
-  `posted:N>0`, `getPageConfig` resolves, the popup renders. Quick confirm from the bg
-  console: `typeof chrome.storage.session.setAccessLevel` should now be `"function"`.
-  Then `C2S_USERINFO` should flip `401 → 200` once signed in (fix #2).
-- **Residual platform risk (not converter):** if `auth.grammarly.com` additionally
-  requires a CSRF token bound to the session, or the user isn't signed in, auth may still
-  fail — but that's backend policy / login state, not the converter.
+## Confirmed working
+Live in Safari: the popup renders and the account loads. bg bootstrap passes
+`allowCStoUseSessionStorage` (past "Migration completed"), reaches `RB`, registers the
+`cs-to-bg-rpc` listener; the popup port now **routes** (matcher rewrite), the bg posts
+replies, `getPageConfig` resolves, render runs. `typeof chrome.storage.session
+.setAccessLevel === "function"`, userinfo `200` (signed in).
+
+## Residual console errors — NOT converter bugs
+These appear on a healthy, working install (they fire on Chrome too):
+- **`Manage storage timeout to get "GrammarlyExtensionMode"/"GrammarlyEnrollmentToken"`**
+  — `chrome.storage.managed` (enterprise MDM policy). Safari has no managed storage; the
+  shim stub resolves empty after a short timeout. These keys are only set by an
+  enterprise policy; a personal install never has them → the timeout is expected and
+  Grammarly falls back to defaults.
+- **`User institution id is not defined`** — personal account, not part of a Grammarly
+  for Education/Business org. Grammarly-internal graceful path.
+- **Font CSP refusals** — cosmetic; fallback fonts render.
 
 ## Verdict
-Three real converter bugs were found and fixed. The **primary** popup blocker is #3: bg
-init hung forever on `chrome.storage.session.setAccessLevel` (undefined on Safari, no
-timeout), so the bg never registered its RPC listener and posted no replies (`posted:0` →
-"starting…" forever). #1 (port routing by `sender.url` case) is a correct general fix but
-is not what Grammarly tripped on. #2 (httpOnly session cookie via `chrome.cookies`) lets
-auth succeed once the popup runs. Each fix has an anti-vacuous regression test; the full
-suite (223) passes. Pending a Safari retest to confirm end to end.
+A **chain** of distinct Safari issues blocked the popup; the extension works only once
+all are fixed (see the numbered list at the top). The final unblocker (#5) was the
+port-routing matcher: `new RegExp(chrome.runtime.id + "/src/popup.html")` can never match
+on Safari because `runtime.id` is the bundle id, not the URL-host UUID, and that slot is a
+frozen exotic that the shim cannot rewrite — so the converter strips the `runtime.id +`
+prefix at staging time (`rewriteRuntimeIdUrlMatchers`). The prerequisites (#1 setAccessLevel
+backfill, #3 `installOverride` for the read-only native event wrap, #4 bound-port forwarding
+through Safari's `postMessage` brand check) were each necessary; #2 (httpOnly cookie via
+`chrome.cookies`) makes auth succeed. Every fix has an anti-vacuous regression test; the
+full suite (227) passes. **Live-confirmed: popup renders, account loads.**
