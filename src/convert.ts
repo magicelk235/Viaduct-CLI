@@ -293,8 +293,16 @@ export function convert(opts: ConvertOptions): ConvertResult {
         ok(`Installed → ${inst.installedAppPath}`);
       } else {
         const stableApp = join(outputDir, basename(builtApp));
-        if (moveBundle(builtApp, stableApp)) result.appPath = stableApp;
-        warn(`Install did not complete; the built app is at ${result.appPath ?? builtApp}.`);
+        if (moveBundle(builtApp, stableApp)) {
+          result.appPath = stableApp;
+        } else {
+          // Relocation failed: the only copy is still inside derivedDir, which the
+          // finally-cleanup would delete. Keep it by sparing derivedDir, and point
+          // the user at the path that will actually survive.
+          derivedDir = undefined;
+          result.appPath = builtApp;
+        }
+        warn(`Install did not complete; the built app is at ${result.appPath}.`);
       }
     } else {
       // No install: relocate the signed product out of the throwaway build dir to a
@@ -304,7 +312,10 @@ export function convert(opts: ConvertOptions): ConvertResult {
         result.appPath = stableApp;
         ok(`Built app → ${stableApp}`);
       } else {
-        warn("Could not relocate the built app out of the temporary build dir.");
+        // Spare derivedDir from cleanup so the only built copy isn't deleted.
+        derivedDir = undefined;
+        result.appPath = builtApp;
+        warn(`Could not relocate the built app; it remains at ${builtApp}.`);
       }
     }
 

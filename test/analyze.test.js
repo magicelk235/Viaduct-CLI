@@ -93,6 +93,18 @@ test("scanExtension warns on importScripts() with a dynamic argument (can't hois
   assert.equal(m.severity, "warning");
 });
 
+test("scanExtension warns on importScripts() whose arg contains a quote but isn't a bare literal (getURL/concat can't hoist)", () => {
+  // The old check classified any arg containing a quote as a hoistable static
+  // literal, falsely reassuring on importScripts(getURL("x.js")) / base + "a.js".
+  for (const arg of ['chrome.runtime.getURL("lib.js")', '"./" + name', 'base + "a.js"']) {
+    const dir = fixture({ "bg.js": `importScripts(${arg});` });
+    const issues = scanExtension(dir, { manifest_version: 3, background: { service_worker: "bg.js" } }, "macos");
+    const m = issues.find((i) => /importScripts/.test(i.message));
+    assert.ok(m, `expected an importScripts issue for ${arg}`);
+    assert.equal(m.severity, "warning", `dynamic importScripts(${arg}) must warn, not info`);
+  }
+});
+
 test("scanExtension warns (not fatal) on blocking webRequest so the extension still converts", () => {
   // Bitwarden/LastPass/Honey/uBlock all use blocking webRequest. Safari ignores
   // the blocking return but the extension loads and works — so this must NOT be a

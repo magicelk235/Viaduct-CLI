@@ -356,7 +356,7 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
       issues.push({
         severity: "warning",
         category: "manifest",
-        message: `version "${m.version}" has a non-numeric part ("${cutPart}"); Apple requires integer parts, so the version is truncated at the first non-numeric part (becoming "${shipped.slice(0, shipped.indexOf(cutPart)).join(".") || "1.0.0"}").`,
+        message: `version "${m.version}" has a non-numeric part ("${cutPart}"); Apple requires integer parts, so the version is truncated at the first non-numeric part (becoming "${shipped.slice(0, shipped.indexOf(cutPart)).map((p) => String(Math.min(Number(p), 65535))).join(".") || "1.0.0"}").`,
         file: "manifest.json",
         fix: 'Use a numeric dotted version like "1.2.3" (no suffixes such as -rc1 or +build).',
         autoFixed: true,
