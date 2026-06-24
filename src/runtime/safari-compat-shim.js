@@ -571,6 +571,19 @@ var __C2S_DEBUG__ = false;
       return clone;
     } catch (e) { return port; }
   }
+  // Replace obj[name] with `fn`, returning true only if the swap actually took.
+  // CRITICAL for Safari: chrome.runtime.onConnect/onMessage are native events whose
+  // `addListener` is { writable:false, configurable:true } (proven live). A bare
+  // assignment THROWS in strict mode (and is a silent no-op in sloppy) — leaving the
+  // bundle bound to the ORIGINAL addListener, so our port-clone wrapper never runs and
+  // the popup-routing fix below silently does nothing. defineProperty succeeds where
+  // assignment fails on that descriptor, so try assignment first (cheap, works when the
+  // slot is writable) and fall back to defineProperty, verifying each took.
+  function installOverride(obj, name, fn) {
+    try { obj[name] = fn; if (obj[name] === fn) return true; } catch (e) {}
+    try { Object.defineProperty(obj, name, { value: fn, writable: true, configurable: true }); if (obj[name] === fn) return true; } catch (e) {}
+    return false;
+  }
   function wrapOnConnect(rt) {
     if (!rt || rt.__c2sOnConnect) return;
     // canon (for the origin-equality fix) is best-effort; the sender.url ROUTING fix
@@ -580,7 +593,7 @@ var __C2S_DEBUG__ = false;
     var oc = rt.onConnect;
     if (!oc || typeof oc.addListener !== "function" || oc.__c2sWrapped) return;
     var nativeAdd = oc.addListener.bind(oc);
-    oc.addListener = function (fn) {
+    var ocTook = installOverride(oc, "addListener", function (fn) {
       if (typeof fn !== "function") return nativeAdd(fn);
       return nativeAdd(function (port) {
         try { if (port) fixSenderOrigin(port.sender, canon); } catch (e) {}
@@ -593,12 +606,12 @@ var __C2S_DEBUG__ = false;
         try { p = portWithLoweredSenderUrl(port); } catch (e) { p = port; }
         return fn.call(this, p);
       });
-    };
+    });
     // Same mismatch hits onMessage-based privileged checks.
     var om = rt.onMessage;
     if (om && typeof om.addListener === "function" && !om.__c2sWrapped) {
       var nativeAddM = om.addListener.bind(om);
-      om.addListener = function (fn) {
+      var omTook = installOverride(om, "addListener", function (fn) {
         if (typeof fn !== "function") return nativeAddM(fn);
         return nativeAddM(function (msg, sender, reply) {
           try { fixSenderOrigin(sender, canon); } catch (e) {}
@@ -609,10 +622,11 @@ var __C2S_DEBUG__ = false;
           try { s = senderWithLoweredUrlHost(sender); } catch (e) { s = sender; }
           return fn.call(this, msg, s, reply);
         });
-      };
-      try { om.__c2sWrapped = true; } catch (e) {}
+      });
+      if (omTook) { try { om.__c2sWrapped = true; } catch (e) {} }
     }
-    try { oc.__c2sWrapped = true; rt.__c2sOnConnect = true; } catch (e) {}
+    if (ocTook) { try { oc.__c2sWrapped = true; } catch (e) {} }
+    try { rt.__c2sOnConnect = true; } catch (e) {}
   }
   if (hasChrome) wrapOnConnect(mutableNamespace(chrome, "runtime"));
   if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) wrapOnConnect(mutableNamespace(browser, "runtime"));
@@ -2193,14 +2207,17 @@ var __C2S_DEBUG__ = false;
       var __co = chrome.cookies.onChanged;
       if (__co && typeof __co.addListener === "function" && !__co.__c2sGuarded) {
         var __realAdd = __co.addListener.bind(__co);
-        __co.addListener = function (fn) {
+        // installOverride (not bare =): onChanged is a native event whose addListener
+        // is non-writable on Safari, so a plain assignment would silently fail and the
+        // bg-killing null event would reach the bundle's listener anyway.
+        var __coTook = installOverride(__co, "addListener", function (fn) {
           if (typeof fn !== "function") return __realAdd(fn);
           return __realAdd(function (changeInfo) {
             if (changeInfo == null) return; // Safari delivers null — drop it
             return fn.apply(this, arguments);
           });
-        };
-        try { __co.__c2sGuarded = true; } catch (e) {}
+        });
+        if (__coTook) { try { __co.__c2sGuarded = true; } catch (e) {} }
       }
     } catch (e) {}
 
