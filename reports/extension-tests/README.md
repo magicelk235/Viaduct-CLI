@@ -8,7 +8,7 @@ and tested in Safari with the bg-page Web Inspector.
 |-----------|--------|-----------------|
 | [uBlock Origin](./uBlock-Origin.md) | ✅ Working | Popup loads, live block stats render |
 | [Bitwarden](./Bitwarden.md) | ⚠️ Partial | UI loads; WASM SDK + passkey are platform limits |
-| [Grammarly](./Grammarly.md) | ⚠️ Two fixes landed | popup port now routed (runtime.id-vs-sender.url case fix; was posted:0 → "starting…" hang) + proxy carries httpOnly cookie; retest pending |
+| [Grammarly](./Grammarly.md) | ⚠️ Three fixes landed | bg init no longer hangs on `storage.session.setAccessLevel` (the real `posted:0` → "starting…" cause) + port routing case fix + proxy carries httpOnly cookie; retest pending |
 
 ## Cross-cutting root causes found this round
 All pinned with **live diagnostics** (debug flag → `chrome.storage.local` → read from
