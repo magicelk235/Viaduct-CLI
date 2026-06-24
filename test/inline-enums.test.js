@@ -8,13 +8,23 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { inlineImmutableEnums } from "../dist/input/stage.js";
+import { inlineImmutableEnums, rewriteRuntimeIdUrlMatchers } from "../dist/input/stage.js";
 
 function run(src) {
   const dir = mkdtempSync(join(tmpdir(), "c2s-enum-"));
   const file = join(dir, "background.js");
   writeFileSync(file, src);
   const n = inlineImmutableEnums(dir);
+  const out = readFileSync(file, "utf-8");
+  rmSync(dir, { recursive: true, force: true });
+  return { out, n };
+}
+
+function runRewrite(src) {
+  const dir = mkdtempSync(join(tmpdir(), "c2s-rid-"));
+  const file = join(dir, "background.js");
+  writeFileSync(file, src);
+  const n = rewriteRuntimeIdUrlMatchers(dir);
   const out = readFileSync(file, "utf-8");
   rmSync(dir, { recursive: true, force: true });
   return { out, n };
@@ -48,5 +58,44 @@ test("leaves unrelated code and unknown members untouched", () => {
 
 test("no-op when there is nothing to inline", () => {
   const { n } = run(`console.log("hello");`);
+  assert.equal(n, 0);
+});
+
+// Safari's chrome.runtime.id is the bundle id, not the URL-host UUID, so a port matcher
+// `new RegExp(chrome.runtime.id + "/src/popup.html").test(sender.url)` never matches (and
+// runtime.id is a frozen exotic slot the shim can't fix). The converter strips the
+// `runtime.id +` prefix so the matcher is host-agnostic and matches the real Safari URL.
+test("strips runtime.id+ prefix from port-routing RegExp so it matches any host", () => {
+  const { out, n } = runRewrite(
+    `if (new RegExp(chrome.runtime.id + "/src/popup.html").test(p.sender.url)) route();`
+  );
+  assert.equal(n, 1, "one file modified");
+  assert.match(out, /new RegExp\("\/src\/popup\.html"\)/, "prefix dropped → host-agnostic matcher");
+  assert.doesNotMatch(out, /runtime\.id\s*\+/, "no residual runtime.id concat");
+  // The rewritten matcher must hit the real Safari popup URL (UPPER host + ?tabId query)
+  // and reject a content-script URL.
+  const re = new RegExp(out.match(/new RegExp\("([^"]+)"\)/)[1]);
+  assert.equal(re.test("safari-web-extension://ABC-123/src/popup.html?tabId=7"), true, "matches UUID host + query");
+  assert.equal(re.test("https://example.com/page"), false, "does not match a content-script URL");
+});
+
+test("rewrites browser.runtime.id and bracket runtime.id matchers too", () => {
+  const { out } = runRewrite(
+    `a(new RegExp(browser.runtime.id + "/src/sidePanel.html")); b(new RegExp(self.chrome.runtime.id + "/src/devtoolsPanel.html"));`
+  );
+  assert.match(out, /a\(new RegExp\("\/src\/sidePanel\.html"\)\)/);
+  assert.match(out, /b\(new RegExp\("\/src\/devtoolsPanel\.html"\)\)/);
+});
+
+test("leaves a non-path runtime.id concat alone (only URL-path matchers are rewritten)", () => {
+  // e.g. building a storage key or log tag from runtime.id — not a port URL matcher.
+  const src = `var k = new RegExp(chrome.runtime.id + "-cache");`;
+  const { out, n } = runRewrite(src);
+  assert.equal(n, 0, "non-path concat is not rewritten");
+  assert.match(out, /chrome\.runtime\.id \+ "-cache"/, "left untouched");
+});
+
+test("rewrite is a no-op when there is no runtime.id matcher", () => {
+  const { n } = runRewrite(`console.log("hi");`);
   assert.equal(n, 0);
 });
