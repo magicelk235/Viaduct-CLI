@@ -12,6 +12,7 @@ and tested in Safari with the bg-page Web Inspector.
 | [LastPass](./LastPass.md) | ✅ Working | Clean first-try: popup renders, login round-trips to LastPass servers (real "check your master password" response). Smoke test only — no account. Full vault/autofill flow unverified |
 | [Loom](./Loom.md) | ⚠️ Loads | Shim intact (scripting present, no abort); popup blank in logged-out state (opens web signup by design). `tabCapture`/`desktopCapture` dropped → recording is a platform limit. Logged-in flow unverified (no account) |
 | [Dark Reader](./Dark-Reader.md) | ✅ Working | Page restyled dark (verified on Google Translate), popup + controls render. Popup "loading" hung on first click then self-resolved (cold SW / permission grant); no code change needed |
+| [Honey](./Honey.md) | ⚠️ Partial | bg runs + network works; fixed a real `setBadgeText` init-abort (general bug). Popup still empty — `stores:action` gets no reply on Safari (multi-transport messaging; likely the async-response drop), unresolved |
 
 ## Cross-cutting root causes found this round
 All pinned with **live diagnostics** (debug flag → `chrome.storage.local` → read from

@@ -8,6 +8,7 @@ var __C2S_DEBUG__ = false;
   var api = typeof browser !== "undefined" ? browser : (typeof chrome !== "undefined" ? chrome : null);
   if (!api) return;
 
+
   // Publish a global `chrome` aliased to `browser` BEFORE anything else. Safari
   // exposes `browser` in extension pages/content scripts/background, but `chrome`
   // is frequently absent (it is not guaranteed, and browser-polyfill's aliasing
@@ -1533,6 +1534,52 @@ var __C2S_DEBUG__ = false;
       if (typeof cb === "function") { try { cb(value); } catch (e) {} return; }
       return Promise.resolve(value);
     };
+
+    // chrome.action badge/title/icon setters REJECT on Safari with "Tab not found"
+    // when called from the background with a tabId that no longer maps to a live tab
+    // (or, for some Safari builds, any tabId at all). On Chrome these are no-ops/global
+    // updates and never reject. The danger: a bundle that does
+    // `await chrome.action.setBadgeText({text, tabId})` in its init chain (Honey,
+    // h0.js) has that promise reject → an UNHANDLED REJECTION aborts the init chain →
+    // later message handlers (Honey's stores:action) never register → the popup's
+    // request finds no listener → blank popup (live-proven). A badge update failing is
+    // cosmetic and must NEVER break init. Wrap the setters so a "tab not found" reject
+    // is swallowed (resolve undefined); retry tabId-less first so the global badge
+    // still updates when only the per-tab call was rejected.
+    if (chrome.action) {
+      var TAB_GONE_RE = /tab not found|no tab|invalid tab/i;
+      var wrapActionSetter = function (name) {
+        var orig = chrome.action[name];
+        if (typeof orig !== "function" || chrome.action["__c2s_" + name]) return;
+        chrome.action["__c2s_" + name] = true;
+        chrome.action[name] = function (details, cb) {
+          var self = this;
+          var call = function (d) {
+            try {
+              var r = orig.call(self, d);
+              return (r && typeof r.then === "function") ? r : Promise.resolve(r);
+            } catch (e) { return Promise.reject(e); }
+          };
+          var p = call(details).catch(function (err) {
+            // Per-tab call rejected because the tab is gone: retry without tabId so the
+            // global badge/title still updates; if THAT also rejects, give up quietly.
+            if (details && "tabId" in details && err && TAB_GONE_RE.test(String(err && err.message || err))) {
+              var d2 = Object.assign({}, details); delete d2.tabId;
+              return call(d2).catch(function () {});
+            }
+            // Any other reject (incl. tabId-less "tab not found"): swallow — a badge
+            // failure must not surface as an unhandled rejection that kills init.
+            return undefined;
+          });
+          if (typeof cb === "function") { p.then(function (v) { try { cb(v); } catch (e) {} }); return; }
+          return p;
+        };
+      };
+      wrapActionSetter("setBadgeText");
+      wrapActionSetter("setBadgeBackgroundColor");
+      wrapActionSetter("setTitle");
+      wrapActionSetter("setIcon");
+    }
 
     // MV2 aliases: browserAction/pageAction code running on an MV3/Safari manifest.
     // Point both at chrome.action so setBadgeText/setIcon/onClicked keep working.
