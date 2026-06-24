@@ -162,6 +162,33 @@ var __C2S_DEBUG__ = false;
   var __c2sUid = 0;
   function uid(prefix) { return (prefix || "") + Date.now() + "-" + (++__c2sUid); }
 
+  // Popover open/closed flag, shared between the bg (sidePanel.open toggle) and the
+  // popover doc (marks open on load / closed on pagehide). Kept in storage.session so
+  // it survives the bg service worker suspending between shortcut presses (a module
+  // var would reset to "closed" and re-open instead of toggling). Both helpers no-op
+  // when storage.session is absent (Safari < 16.4), degrading to open-only.
+  var C2S_PANEL_OPEN_KEY = "__c2sPanelOpen";
+  function c2sSession() {
+    try { return (typeof chrome !== "undefined" && chrome.storage && chrome.storage.session) || null; } catch (e) { return null; }
+  }
+  function c2sGetPanelOpen() {
+    return new Promise(function (resolve) {
+      var ss = c2sSession();
+      if (!ss || typeof ss.get !== "function") { resolve(false); return; }
+      var done = function (o) { resolve(!!(o && o[C2S_PANEL_OPEN_KEY])); };
+      try {
+        var r = ss.get(C2S_PANEL_OPEN_KEY, done);
+        if (r && typeof r.then === "function") r.then(done, function () { resolve(false); });
+      } catch (e) { resolve(false); }
+    });
+  }
+  function c2sSetPanelOpen(v) {
+    var ss = c2sSession();
+    if (!ss || typeof ss.set !== "function") return;
+    var o = {}; o[C2S_PANEL_OPEN_KEY] = !!v;
+    try { var r = ss.set(o); if (r && typeof r.then === "function") r.catch(function () {}); } catch (e) {}
+  }
+
   // Inert event stub so module-eval code that reads .addListener on a missing API does not throw.
   function event() {
     return { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } };
@@ -767,24 +794,39 @@ var __C2S_DEBUG__ = false;
       open: function (opts) {
         rememberPath(opts);
         // The panel HTML is wired as Safari's action popover (default_popup). A
-        // command/shortcut handler that calls sidePanel.open() means "show me the
-        // panel" — open the popover, not a tab. Safari 17.4+ exposes
-        // action.openPopup() for exactly this. Only fall back to a tab when the
-        // popover can't be opened (older Safari, or openPopup rejects because no
-        // window is focused). ponytail: tab fallback is the known-bad path the
-        // shortcut used to always take.
-        if (chrome.action && typeof chrome.action.openPopup === "function") {
+        // command/shortcut handler that calls sidePanel.open() means "toggle the
+        // panel". Safari has no action.closePopup and no popover-state query, and its
+        // port.onDisconnect doesn't fire on popover close, so we toggle cooperatively
+        // with the popover doc (see the panel-doc side below): a shared storage.session
+        // flag tracks open/closed; closed → action.openPopup() (Safari 17.4+) shows it;
+        // open → broadcast {__c2sClosePanel} so the popover window.close()s itself.
+        // Fall back to a tab only when openPopup is wholly absent (older Safari).
+        var canPopover = chrome.action && typeof chrome.action.openPopup === "function";
+        if (!canPopover) {
+          return chrome.tabs.create({ url: chrome.runtime.getURL(panelPath) });
+        }
+        return c2sGetPanelOpen().then(function (isOpen) {
+          if (isOpen) {
+            // Already open → close it. Tell the popover doc to self-close; clear the
+            // flag optimistically (the doc's pagehide will also clear it).
+            try {
+              var m = chrome.runtime && chrome.runtime.sendMessage;
+              if (m) { var r = chrome.runtime.sendMessage({ __c2sClosePanel: true }); if (r && typeof r.then === "function") r.catch(function () {}); }
+            } catch (e) {}
+            c2sSetPanelOpen(false);
+            return;
+          }
+          // Closed → open it. The popover doc marks the flag open on load; also set it
+          // here so a rapid second press toggles even before the doc's load fires.
           try {
             var p = chrome.action.openPopup();
-            if (p && typeof p.then === "function") {
-              return p.catch(function () {
-                return chrome.tabs.create({ url: chrome.runtime.getURL(panelPath) });
-              });
-            }
+            c2sSetPanelOpen(true);
+            // A reject here ("no gesture"/already-open race) must NOT spawn a tab —
+            // re-pressing is a no-op. Roll back the flag so state stays truthful.
+            if (p && typeof p.then === "function") return p.catch(function () { c2sSetPanelOpen(false); });
             return Promise.resolve(p);
-          } catch (e) {}
-        }
-        return chrome.tabs.create({ url: chrome.runtime.getURL(panelPath) });
+          } catch (e) { c2sSetPanelOpen(false); return Promise.resolve(); }
+        });
       },
       setOptions: function (opts) { rememberPath(opts); return Promise.resolve(); },
       getOptions: function () { return Promise.resolve({ path: panelPath, enabled: true }); },
@@ -2920,6 +2962,29 @@ var __C2S_DEBUG__ = false;
         // deliberately do NOT monkeypatch URLSearchParams.prototype.get — doing so
         // would clobber a native method for every instance in the document, feeding
         // unrelated app code the injected tabId.
+      }
+    } catch (e) { /* ignore */ }
+
+    // Popover-toggle, panel-doc side (pairs with sidePanel.open's bg side above, using
+    // the shared c2sSetPanelOpen flag). Mark the flag OPEN on load and CLOSED on
+    // pagehide (covers the user dismissing via the icon/click-away — Safari's
+    // port.onDisconnect won't tell the bg), and self-close when the bg broadcasts
+    // {__c2sClosePanel} on a toggle re-press. NOT { once:true } on pagehide: a doc
+    // restored from bfcache shows again, and the flag must re-track each visibility.
+    try {
+      c2sSetPanelOpen(true);
+      window.addEventListener("pagehide", function () { c2sSetPanelOpen(false); });
+      window.addEventListener("pageshow", function () { c2sSetPanelOpen(true); });
+      if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.onMessage &&
+          typeof chrome.runtime.onMessage.addListener === "function") {
+        chrome.runtime.onMessage.addListener(function (msg) {
+          if (msg && msg.__c2sClosePanel === true) {
+            c2sSetPanelOpen(false);
+            // window.close() is blocked after history.pushState (DOMWindow::canClose);
+            // our panel doc uses replaceState only, so this is safe here.
+            try { window.close(); } catch (e) {}
+          }
+        });
       }
     } catch (e) { /* ignore */ }
   }

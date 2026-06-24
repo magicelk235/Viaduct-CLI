@@ -1,6 +1,6 @@
 # Safari conversion test reports
 
-Live-testing of the three most complex extensions in `test extensions/` (per the
+Live-testing of the most complex extensions in `test extensions/` (per the
 `rating` file), converted with `node dist/cli.js <input> --install --force --clean`
 and tested in Safari with the bg-page Web Inspector.
 
@@ -9,6 +9,9 @@ and tested in Safari with the bg-page Web Inspector.
 | [uBlock Origin](./uBlock-Origin.md) | ✅ Working | Popup loads, live block stats render |
 | [Bitwarden](./Bitwarden.md) | ⚠️ Partial | UI loads; WASM SDK + passkey are platform limits |
 | [Grammarly](./Grammarly.md) | ✅ Working | Popup renders, account loads. Took a 5-fix chain; the unblocker was a conversion-time rewrite stripping the `runtime.id +` prefix from the popup port-routing regex (Safari's `runtime.id` is the bundle id, not the URL-host UUID, and the slot is unfixable at runtime) |
+| [LastPass](./LastPass.md) | ✅ Working | Clean first-try: popup renders, login round-trips to LastPass servers (real "check your master password" response). Smoke test only — no account. Full vault/autofill flow unverified |
+| [Loom](./Loom.md) | ⚠️ Loads | Shim intact (scripting present, no abort); popup blank in logged-out state (opens web signup by design). `tabCapture`/`desktopCapture` dropped → recording is a platform limit. Logged-in flow unverified (no account) |
+| [Dark Reader](./Dark-Reader.md) | ✅ Working | Page restyled dark (verified on Google Translate), popup + controls render. Popup "loading" hung on first click then self-resolved (cold SW / permission grant); no code change needed |
 
 ## Cross-cutting root causes found this round
 All pinned with **live diagnostics** (debug flag → `chrome.storage.local` → read from
