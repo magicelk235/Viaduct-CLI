@@ -5,7 +5,7 @@ import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
 import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
-import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums } from "./input/stage.js";
+import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers } from "./input/stage.js";
 import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, deriveProxyHosts } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
@@ -98,6 +98,14 @@ export function convert(opts: ConvertOptions): ConvertResult {
     // mutable-namespace cases; this covers the immutable ones).
     const inlined = inlineImmutableEnums(stageDir);
     if (inlined > 0) ok(`Inlined immutable scripting enums in ${inlined} script(s)`);
+
+    // Safari's chrome.runtime.id is the bundle id, not the URL-host UUID, so bundles that
+    // route extension-page ports via `new RegExp(runtime.id + "/src/popup.html").test(
+    // sender.url)` never match → popup/side-panel ports go unrouted and their init RPCs
+    // hang. runtime.id is a frozen exotic slot the shim can't rewrite, so strip the
+    // `runtime.id +` prefix here, making the matcher host-agnostic + query-tolerant.
+    const rerouted = rewriteRuntimeIdUrlMatchers(stageDir);
+    if (rerouted > 0) ok(`Rewrote runtime.id-based port matchers in ${rerouted} script(s)`);
 
     let shimFile: string | undefined;
     let polyfillFile: string | undefined;
