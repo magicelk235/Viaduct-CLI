@@ -243,3 +243,48 @@ test("cookies.onChanged: null events are swallowed, real events pass through", (
   nativeCookies.onChanged._fire({ cookie: { name: "sid" }, cause: "explicit" });
   assert.deepEqual(seen, ["sid"], "real change events still delivered");
 });
+
+// Safari ships chrome.storage.session WITHOUT setAccessLevel (a Chrome-MV3-only API).
+// Grammarly's bg bootstrap does `await new Promise((res,rej)=>session.setAccessLevel(
+// lvl, ()=>lastError?rej():res()))` — the promise ONLY settles inside the callback. If
+// the method is undefined the call short-circuits, the callback never runs, the promise
+// never resolves, and (with no timeout) bg init hangs before registering its message
+// listeners → popup RPCs queue forever → popup stuck "starting…". The shim must backfill
+// setAccessLevel on the EXISTING (frozen) native session so the callback fires.
+test("storage.session.setAccessLevel: backfilled on a frozen native session so init can't hang", async () => {
+  // Safari-style storage: real local + a FROZEN native session with get/set but NO
+  // setAccessLevel (exactly what Safari exposes). Object.freeze mirrors Safari's
+  // non-extensible native namespace — setIfMissing alone can't attach to it.
+  const sessionData = {};
+  const nativeSession = Object.freeze({
+    get: (keys, cb) => { Promise.resolve().then(() => cb({})); },
+    set: (obj, cb) => { Object.assign(sessionData, obj); Promise.resolve().then(() => cb && cb()); },
+    remove: (k, cb) => { Promise.resolve().then(() => cb && cb()); },
+    // NOTE: no setAccessLevel — this is the Safari gap.
+  });
+  const store = makeStore();
+  store.session = nativeSession;
+  const chrome = setup(store, {});
+
+  // setAccessLevel must now exist and must invoke the callback (the whole point).
+  assert.equal(typeof chrome.storage.session.setAccessLevel, "function",
+    "setAccessLevel backfilled onto the frozen native session");
+
+  // Reproduce Grammarly's allowCStoUseSessionStorage promise verbatim and assert it
+  // RESOLVES (would hang forever before the fix). Race against a short timer so a
+  // regression fails loudly instead of hanging the suite.
+  const settled = await Promise.race([
+    new Promise((res, rej) => {
+      const lvl = { accessLevel: "TRUSTED_AND_UNTRUSTED_CONTEXTS" };
+      chrome.storage.session.setAccessLevel(lvl, () => {
+        chrome.runtime.lastError ? rej(chrome.runtime.lastError) : res("resolved");
+      });
+    }),
+    new Promise((r) => setTimeout(() => r("HUNG"), 200)),
+  ]);
+  assert.equal(settled, "resolved", "setAccessLevel invoked its callback (init proceeds)");
+
+  // The real native methods must still work through the (now-mutable) session clone.
+  await new Promise((res) => chrome.storage.session.set({ k: 1 }, res));
+  assert.equal(sessionData.k, 1, "native session.set still reaches the real backing store");
+});

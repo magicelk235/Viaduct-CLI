@@ -1,16 +1,19 @@
 # Grammarly — Safari conversion test report
 
-**Status: ⚠️ TWO ROOT-CAUSE FIXES LANDED (retest pending).** The popup ("Grammarly
-is starting…" forever) was blocked by **two distinct converter bugs**, both now
-fixed:
+**Status: ⚠️ THREE ROOT-CAUSE FIXES LANDED (retest pending).** The popup ("Grammarly
+is starting…" forever) was blocked by **three distinct converter bugs**, all now fixed:
 
-1. **Popup↔background port never routed** (the primary popup blocker) — the bg
-   rejected the popup's port because of a UUID case mismatch between
-   `chrome.runtime.id` and `sender.url`, so it posted no replies and every popup-init
-   RPC timed out.
-2. **Auth proxy couldn't carry the httpOnly session cookie** — the native-host
-   proxy forwarded `document.cookie` (which can't see `grauth`), so authenticated
-   calls stayed `401 user_not_authorized`.
+1. **bg init hung on `chrome.storage.session.setAccessLevel`** (THE PRIMARY, PROVEN
+   blocker) — Safari ships `storage.session` without `setAccessLevel`; Grammarly
+   `await`s it through a callback-only promise with no timeout, so bg init stalled
+   before registering its RPC listener → every popup RPC queued, bg posted no replies
+   (`posted:0`).
+2. **Popup↔background port routing by `sender.url` case** — a correct general fix for
+   extensions that route ports by `runtime.id`-vs-`sender.url`; not the bug Grammarly
+   actually tripped on (its popup detector is case-insensitive), but kept.
+3. **Auth proxy couldn't carry the httpOnly session cookie** — the native-host proxy
+   forwarded `document.cookie` (which can't see `grauth`), so authenticated calls
+   stayed `401 user_not_authorized`. Needed for auth once the popup runs.
 
 Plus an earlier fix this round: a Safari `chrome.cookies.onChanged` null-event crash
 that took down the background page.
@@ -112,12 +115,66 @@ URLSession cookie handling (`httpShouldHandleCookies`/`httpShouldSetCookies = fa
 its empty appex jar can't clobber the forwarded header. Regression in
 `test/proxy.test.js` + `test/native-proxy-handler.test.js`.
 
+## Root cause #3 — bg init hangs on `storage.session.setAccessLevel` (the PROVEN `posted:0`)
+A deeper audit of the *exact* `posted:0` mechanism found the real, primary blocker —
+upstream of #1. Traced link by link in `Grammarly-bg.js`:
+- The bg only replies to a port RPC if a `listen("cs-to-bg-rpc-1557421403805", …)` is
+  registered. That registration happens when the RPC dispatcher (`class wp`) subscribes
+  to its transport (`class vp` → `_message.on(name,…)` → `messageHelper.listen`, draining
+  the queued RPCs). `wp` is constructed synchronously at the top of `RB` (legacy bg start).
+- `RB` is reached only after a serial `await` chain in the bg bootstrap:
+  ```
+  await this._migration                               // "Migration completed"
+  "chrome-mv3"===sessionStorage.kind &&
+     await sessionStorage.allowCStoUseSessionStorage() // ← HANGS HERE (no timeout)
+  await this._withTimeout(authSuccessTracker…)          // timeout-guarded
+  await (experimentClient init)
+  const ue = await RB(…)                                // registers the cs-to-bg-rpc listen()
+  ```
+- `allowCStoUseSessionStorage` is `new Promise((res,rej)=>chrome.storage.session
+  .setAccessLevel?.(lvl, ()=>lastError?rej():res()))` — it settles **only inside the
+  callback**. Safari (16.4+) **ships `chrome.storage.session` but WITHOUT `setAccessLevel`**
+  (a Chrome-MV3-only API). The optional-chain call short-circuits to `undefined`, the
+  callback never fires, the promise **never resolves**, and **no `_withTimeout` guards
+  this await** (the very next one does; this one doesn't). Bootstrap stalls before `RB`
+  → no `listen()` → all popup RPCs sit in the queue → **got:18, posted:0** → "starting…"
+  forever. Exact signature match.
+- **The shim gap:** `setAccessLevel` was provisioned only in the *session-wholly-absent*
+  branch (`if (!stg.session) {…}`). Safari HAS `session`, so the branch was skipped and
+  `setAccessLevel` stayed `undefined`. Same failure class the shim already handled for
+  `managed.get`, but missed for `setAccessLevel` on an *existing* session object.
+
+### Fix #3 (`safari-compat-shim.js`)
+Backfill a no-op, callback-honoring `setAccessLevel` onto the **existing** Safari
+`chrome.storage.session` (and the resolved `browser.storage.session` mirror). The native
+session is frozen, so route through `mutableNamespace` to get an extensible clone (it
+keeps the real `get`/`set`/`remove` bound) before attaching the method. Generic: any
+extension that `await`s `session.setAccessLevel` on Safari would otherwise hang identically.
+Regression: `test/emulated-apis.test.js` — "storage.session.setAccessLevel: backfilled on a
+frozen native session so init can't hang" (reproduces Grammarly's promise verbatim against
+a `Object.freeze`d Safari-style session; **verified anti-vacuous** — fails/hangs with the
+fix neutered).
+
+### #1 vs #3 — which actually unblocks Grammarly
+Both are real Safari converter bugs, but the **proven** `posted:0` cause is **#3** (init
+hang → no `listen()`). #1 (sender.url routing) does **not** change Grammarly's outcome:
+its only Safari-active port detector (`Oa`) matches the UUID host with `.*`
+(case-insensitive), and `_initPortListener` wires `port.onMessage` and the reply
+`port.postMessage` **unconditionally** (outside the port-id `if`), so a mis-resolved
+sender.url cannot suppress replies. #1 is kept as a correct general fix for extensions
+that route ports by `runtime.id`-vs-`sender.url` (it would otherwise bite them), but #3
+is Grammarly's blocker. #2 (cookie) is needed for auth to *succeed* once the popup runs,
+not for the popup to render.
+
 ## Verified NOT additional converter bugs (audited this round)
 - **chrome.storage.managed**: shim stub resolves `{}` for both `chrome.*` and `browser.*`;
   Grammarly's own "Manage storage timeout" resolves (not rejects) and is non-fatal.
 - **tabId / panel-doc backfill**: `c2sIsPanelDoc` DOES match Grammarly's popup
   (`action.default_popup === "src/popup.html"`), and the init path has an `activeTab`
   fallback, so a missing popover tabId doesn't stall init.
+- **experiments/treatments fetch timeout**: `getExperimentTreatment` is self-swallowed
+  after 3 s ("continuing without") and render does **not** depend on it; render is gated on
+  the port RPCs (fixed by #3/#1), so the treatments fetch race is non-fatal.
 - **`User institution id is not defined` / `[idpoly] GLOBAL ERROR`**: Grammarly-internal,
   non-fatal (graceful early-return for accounts without an institution; the idpoly global
   error listener is in the bg, not a popup throw).
@@ -125,16 +182,21 @@ its empty appex jar can't clobber the forwarded header. Regression in
 
 ## What's left
 - **Retest in Safari** with the new build (reinstall cycle + quit/reopen Safari; verify
-  the new shim reached the installed `.appex`). Expect: bg now stores the popup port
-  (`_tabPorts["popup"]` non-empty), `posted:N>0`, `getPageConfig` resolves, the popup
-  renders. Then `C2S_USERINFO` should flip `401 → 200` once signed in.
+  the new shim reached the installed `.appex`). Expect: bg bootstrap now passes
+  `allowCStoUseSessionStorage` (milestone log continues past "Migration completed"),
+  reaches `RB`, registers the `cs-to-bg-rpc` listener, drains the queued RPCs →
+  `posted:N>0`, `getPageConfig` resolves, the popup renders. Quick confirm from the bg
+  console: `typeof chrome.storage.session.setAccessLevel` should now be `"function"`.
+  Then `C2S_USERINFO` should flip `401 → 200` once signed in (fix #2).
 - **Residual platform risk (not converter):** if `auth.grammarly.com` additionally
   requires a CSRF token bound to the session, or the user isn't signed in, auth may still
   fail — but that's backend policy / login state, not the converter.
 
 ## Verdict
-Two real converter bugs blocked Grammarly's popup, both fixed: the popup↔bg port is now
-routed (the bug that caused `posted:0` and the indefinite "starting…" hang), and the
-auth proxy now carries the httpOnly session cookie. Audited the rest of the init path and
-found no further converter-fixable blockers. Pending a Safari retest to confirm end to
-end.
+Three real converter bugs were found and fixed. The **primary** popup blocker is #3: bg
+init hung forever on `chrome.storage.session.setAccessLevel` (undefined on Safari, no
+timeout), so the bg never registered its RPC listener and posted no replies (`posted:0` →
+"starting…" forever). #1 (port routing by `sender.url` case) is a correct general fix but
+is not what Grammarly tripped on. #2 (httpOnly session cookie via `chrome.cookies`) lets
+auth succeed once the popup runs. Each fix has an anti-vacuous regression test; the full
+suite (223) passes. Pending a Safari retest to confirm end to end.
