@@ -399,3 +399,43 @@ test("wrapOnConnect installs on Safari's read-only onConnect.addListener (instal
 });
 
 
+
+// Regression (Honey): chrome.action.setBadgeText({tabId}) REJECTS on Safari with
+// "Tab not found" when the tab is gone — on Chrome it's a no-op. A bundle that awaits
+// it in its init chain (Honey h0.js) gets an unhandled rejection that aborts init, so
+// later message handlers never register → blank popup. The shim must swallow the reject
+// (retry tabId-less, then give up) so a cosmetic badge failure never breaks init.
+test("action.setBadgeText swallows Safari's 'Tab not found' reject (retries tabId-less)", async () => {
+  const calls = [];
+  let failTabbed = true;
+  const chrome = {
+    runtime: { id: "x", getManifest: () => ({}) },
+    scripting: {},
+    action: {
+      setBadgeText: (d) => {
+        calls.push(d);
+        if (failTabbed && d && "tabId" in d) return Promise.reject(new Error("Invalid call to action.setBadgeText(). Tab not found."));
+        return Promise.resolve();
+      },
+    },
+  };
+  const fn = new Function("chrome", "self", "window", "globalThis", shimSource());
+  fn(chrome, { addEventListener() {} }, undefined, { chrome });
+
+  // Per-tab call rejects → must NOT throw, must retry without tabId.
+  await assert.doesNotReject(() => chrome.action.setBadgeText({ text: "5", tabId: 999 }),
+    "setBadgeText with a dead tabId must resolve, not reject");
+  assert.equal(calls.length, 2, "should retry once without tabId");
+  assert.ok(!("tabId" in calls[1]), "the retry must drop tabId so the global badge updates");
+
+  // A call that ALWAYS rejects (even tabId-less) must also be swallowed — fresh mock.
+  const chrome2 = {
+    runtime: { id: "x", getManifest: () => ({}) },
+    scripting: {},
+    action: { setBadgeText: () => Promise.reject(new Error("Tab not found.")) },
+  };
+  const fn2 = new Function("chrome", "self", "window", "globalThis", shimSource());
+  fn2(chrome2, { addEventListener() {} }, undefined, { chrome: chrome2 });
+  await assert.doesNotReject(() => chrome2.action.setBadgeText({ text: "" }),
+    "a hard-rejecting setBadgeText must still resolve quietly");
+});
