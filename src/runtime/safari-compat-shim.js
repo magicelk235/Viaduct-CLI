@@ -724,10 +724,25 @@ var __C2S_DEBUG__ = false;
       remove: syncFwd(local.remove),
       clear: syncFwd(local.clear),
       getBytesInUse: local.getBytesInUse ? syncFwd(local.getBytesInUse) : function () { return Promise.resolve(0); },
-      // Bundles read storage.sync.onChanged.addListener at module-eval; a stub
-      // without it throws and aborts evaluation. storage.onChanged (Chrome's real
-      // location — there is no storage.local.onChanged) fires for local writes too.
-      onChanged: (__stg.onChanged) || event(),
+      // Bundles read storage.sync.onChanged.addListener at module-eval; a bare stub
+      // would silently never fire. sync is backed by local here, so relay the global
+      // storage.onChanged but only for the backing "local" area, and pass just
+      // (changes) — a real .sync.onChanged listener must not see other areas' writes
+      // (Chrome's .sync.onChanged is area-scoped and single-arg).
+      onChanged: (function () {
+        var subs = [];
+        if (__stg.onChanged && typeof __stg.onChanged.addListener === "function") {
+          __stg.onChanged.addListener(function (changes, areaName) {
+            if (areaName !== "local") return;
+            subs.slice().forEach(function (fn) { try { fn(changes); } catch (e) {} });
+          });
+        }
+        return {
+          addListener: function (fn) { if (typeof fn === "function" && subs.indexOf(fn) < 0) subs.push(fn); },
+          removeListener: function (fn) { var i = subs.indexOf(fn); if (i >= 0) subs.splice(i, 1); },
+          hasListener: function (fn) { return subs.indexOf(fn) >= 0; },
+        };
+      })(),
     };
   }
 
@@ -981,8 +996,11 @@ var __C2S_DEBUG__ = false;
 
     var emitCdp = function (tabId, method, params) {
       var src = { tabId: tabId };
-      for (var i = 0; i < dbgEvtList.length; i++) {
-        try { dbgEvtList[i](src, method, params || {}); } catch (e) {}
+      // Snapshot: a listener that removes itself (or another) during dispatch must
+      // not shift the cursor and skip the next one.
+      var snap = dbgEvtList.slice();
+      for (var i = 0; i < snap.length; i++) {
+        try { snap[i](src, method, params || {}); } catch (e) {}
       }
     };
 
@@ -1012,8 +1030,9 @@ var __C2S_DEBUG__ = false;
           if (!dbgAttached[tabId]) return;
           delete dbgAttached[tabId];
           var src = { tabId: tabId };
-          for (var i = 0; i < dbgDetList.length; i++) {
-            try { dbgDetList[i](src, "target_closed"); } catch (e) {}
+          var snap = dbgDetList.slice(); // snapshot — see emitCdp
+          for (var i = 0; i < snap.length; i++) {
+            try { snap[i](src, "target_closed"); } catch (e) {}
           }
         });
       }
@@ -1516,7 +1535,8 @@ var __C2S_DEBUG__ = false;
         a.t = setTimeout(function () {
           if (a.period) { a.when = Date.now() + a.period * 60000; armAlarm(a); }
           else delete alarmReg[a.name];
-          for (var i = 0; i < alarmList.length; i++) { try { alarmList[i](alarmInfo(a)); } catch (e) {} }
+          var asnap = alarmList.slice(); // snapshot: a one-shot listener that unregisters itself mustn't skip the next
+          for (var i = 0; i < asnap.length; i++) { try { asnap[i](alarmInfo(a)); } catch (e) {} }
         }, Math.max(0, remaining));
       };
       chrome.alarms = {
@@ -1717,7 +1737,8 @@ var __C2S_DEBUG__ = false;
     if (typeof document !== "undefined" && document.addEventListener) {
       document.addEventListener("visibilitychange", function () {
         var s = __idleState();
-        for (var i = 0; i < __idleListeners.length; i++) { try { __idleListeners[i](s); } catch (e) {} }
+        var isnap = __idleListeners.slice(); // snapshot — self-removing listener mustn't skip the next
+        for (var i = 0; i < isnap.length; i++) { try { isnap[i](s); } catch (e) {} }
       });
     }
     fill(chrome.idle, {
@@ -1748,11 +1769,16 @@ var __C2S_DEBUG__ = false;
       var nowIso = function () { try { return new Date().toISOString(); } catch (e) { return ""; } };
       var matchItem = function (it, q) {
         if (!q) return true;
-        if (q.id != null && it.id !== q.id) return false;
+        // id can be a scalar or an array of ids; check the array form first, else the
+        // scalar !== compare below rejects every item (number !== array) and the array
+        // branch never ran.
+        if (q.id != null) {
+          if (Array.isArray(q.id)) { if (q.id.indexOf(it.id) < 0) return false; }
+          else if (it.id !== q.id) return false;
+        }
         if (q.url != null && it.url !== q.url) return false;
         if (q.state != null && it.state !== q.state) return false;
         if (q.filename != null && it.filename !== q.filename) return false;
-        if (Array.isArray(q.id)) return q.id.indexOf(it.id) >= 0;
         return true;
       };
       fill(chrome.downloads, {

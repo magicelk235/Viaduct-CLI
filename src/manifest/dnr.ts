@@ -24,10 +24,10 @@ interface DnrRule {
   condition?: { regexFilter?: unknown };
 }
 
-// Safari guarantees far fewer enabled static DNR rules than Chrome. Chrome's
-// guaranteed minimum is 30,000; Safari's is much lower in practice — rules past
-// the cap are silently dropped at load. Warn (not strip) past this conservative
-// threshold so the author can split/trim rather than ship a half-applied ruleset.
+// WebKit caps enabled static DNR rules per extension at 30,000 (same as Chrome's
+// guaranteed minimum); rules past the cap are silently dropped at load. Warn (not
+// strip) past this threshold so the author can split/trim rather than ship a
+// half-applied ruleset.
 const SAFARI_STATIC_RULE_GUIDELINE = 30000;
 
 /**

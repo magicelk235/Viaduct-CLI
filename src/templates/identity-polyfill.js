@@ -180,13 +180,20 @@
     // must land here — else extListeners stays empty and bridged page messages
     // have nowhere to go ("no external listener captured"). Also forward to the
     // native event so genuine external messages still work.
+    var forwarded = [];
     function capture(l) {
       if (typeof l !== "function") return;
       if (extListeners.indexOf(l) < 0) {
         extListeners.push(l);
         DBG("[idpoly] captured onMessageExternal listener; total", extListeners.length);
       }
-      if (nativeAdd) { try { nativeAdd(l); } catch (e) { /* native may reject */ } }
+      // capture can be reached via both the defineProperty shadow and the native
+      // in-place wrap for the same listener; dedupe the native forward too, or the
+      // native event fires the listener twice for genuine external messages.
+      if (nativeAdd && forwarded.indexOf(l) < 0) {
+        forwarded.push(l);
+        try { nativeAdd(l); } catch (e) { /* native may reject */ }
+      }
     }
     var controlled = {
       addListener: capture,

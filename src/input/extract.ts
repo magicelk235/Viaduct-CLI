@@ -77,8 +77,10 @@ function crxToZip(crxPath: string): Buffer {
   } else {
     throw new Error(`Unsupported CRX version: ${version}`);
   }
-  if (!Number.isFinite(zipStart) || zipStart < 0 || zipStart > buf.length) {
-    throw new Error(`Invalid CRX file (header points past end of file): ${crxPath}`);
+  if (!Number.isFinite(zipStart) || zipStart < 0 || zipStart >= buf.length) {
+    // >= : a header that fills the whole file leaves a 0-byte ZIP, which would
+    // fail later with a vague unzip error instead of this CRX-specific one.
+    throw new Error(`Invalid CRX file (no ZIP payload after header): ${crxPath}`);
   }
   return buf.subarray(zipStart);
 }

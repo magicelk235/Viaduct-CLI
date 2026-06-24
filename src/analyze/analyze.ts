@@ -199,7 +199,12 @@ function scanJsContent(content: string, rel: string, issues: Issue[]): void {
   const is = IMPORT_SCRIPTS_RE.exec(content);
   if (is) {
     const argList = /\bimportScripts\s*\(([^)]*)\)/.exec(content.slice(is.index))?.[1] ?? "";
-    const dynamic = argList.trim() !== "" && !/["']/.test(argList);
+    // Static only when every arg is a bare string literal we can hoist verbatim
+    // (e.g. "a.js", 'b.js', "a.js", "b.js"). Anything else — a variable, a
+    // concat (base + "a.js"), a getURL("x") call — can't be statically hoisted
+    // and silently loses its imported code, so it must warn, not reassure.
+    const STATIC_LITERAL_LIST = /^\s*(?:(["'])[^"']*\1\s*,\s*)*(["'])[^"']*\2\s*$/;
+    const dynamic = argList.trim() !== "" && !STATIC_LITERAL_LIST.test(argList);
     issues.push(dynamic ? {
       severity: "warning",
       category: "background",
