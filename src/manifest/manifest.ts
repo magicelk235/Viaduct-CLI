@@ -342,21 +342,30 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
     // non-negative integers, each 0–65535. A part like "beta" or "1-rc1" loads
     // in Chrome from an unpacked dir but fails the Xcode build with an opaque
     // error, so surface it up front.
+    // Mirror transformManifest's actual rewrite: it keeps leading numeric parts,
+    // clamps each to 65535, stops at the first non-numeric part, and caps at 3. So a
+    // non-numeric part only changes the shipped version if it's within the first 3
+    // (transform cuts it); a >65535 part is silently clamped, not a build failure;
+    // and parts past the 3rd are dropped. Warn for what actually changes, not for a
+    // part that gets truncated away anyway — the old check flagged discarded parts and
+    // wrongly claimed the build would fail.
     const parts = m.version.split(".");
-    const badPart = parts.find((p) => !/^\d+$/.test(p) || Number(p) > 65535);
-    if (badPart !== undefined) {
+    const shipped = parts.slice(0, 3);
+    const cutPart = shipped.find((p) => !/^\d+$/.test(p));
+    if (cutPart !== undefined) {
       issues.push({
         severity: "warning",
         category: "manifest",
-        message: `version "${m.version}" has a non-numeric/out-of-range part ("${badPart}"); Apple requires integer parts (0–65535) and the build will fail.`,
+        message: `version "${m.version}" has a non-numeric part ("${cutPart}"); Apple requires integer parts, so the version is truncated at the first non-numeric part (becoming "${shipped.slice(0, shipped.indexOf(cutPart)).join(".") || "1.0.0"}").`,
         file: "manifest.json",
         fix: 'Use a numeric dotted version like "1.2.3" (no suffixes such as -rc1 or +build).',
+        autoFixed: true,
       });
-    } else if (parts.length > 3) {
+    } else if (parts.length > 3 || shipped.some((p) => Number(p) > 65535)) {
       issues.push({
         severity: "info",
         category: "manifest",
-        message: `4-part version "${m.version}" exceeds Apple's 3-part CFBundleShortVersionString; truncating.`,
+        message: `version "${m.version}" exceeds Apple's CFBundleShortVersionString limits (3 parts, each ≤65535); truncating/clamping.`,
         file: "manifest.json",
         autoFixed: true,
       });
