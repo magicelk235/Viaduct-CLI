@@ -7,6 +7,7 @@ import {
   analyzeManifest,
   transformManifest,
   collectReferencedPaths,
+  addSelfToConnectSrc,
 } from "../dist/manifest/manifest.js";
 
 // transformManifest probes extPath for popup candidates; a path that doesn't
@@ -289,4 +290,47 @@ test("analyzeManifest does not flag a real host_permissions entry as misplaced",
     host_permissions: ["https://api.foo.com/*"],
   });
   assert.equal(issues.filter((i) => /ignored and grants no host access/.test(i.message)).length, 0);
+});
+
+// ---- connect-src 'self' injection (Safari refuses same-origin fetch otherwise) ----
+test("addSelfToConnectSrc: injects 'self' into a connect-src that lacks it", () => {
+  const out = addSelfToConnectSrc("default-src 'none'; connect-src https://api.x.com wss://s.x.com");
+  assert.match(out, /connect-src 'self' https:\/\/api\.x\.com wss:\/\/s\.x\.com/);
+});
+test("addSelfToConnectSrc: leaves a connect-src that already has 'self' untouched", () => {
+  const csp = "connect-src 'self' https://api.x.com";
+  assert.equal(addSelfToConnectSrc(csp), csp);
+});
+test("addSelfToConnectSrc: does not loosen connect-src 'none'", () => {
+  const csp = "connect-src 'none'";
+  assert.equal(addSelfToConnectSrc(csp), csp);
+});
+test("addSelfToConnectSrc: no connect-src directive → unchanged (default-src covers 'self')", () => {
+  const csp = "default-src 'self'; script-src 'self'";
+  assert.equal(addSelfToConnectSrc(csp), csp);
+});
+test("addSelfToConnectSrc: handles the MV3 object form across keys", () => {
+  const out = addSelfToConnectSrc({
+    extension_pages: "connect-src https://a.com",
+    sandbox: "connect-src https://b.com",
+  });
+  assert.match(out.extension_pages, /connect-src 'self' https:\/\/a\.com/);
+  assert.match(out.sandbox, /connect-src 'self' https:\/\/b\.com/);
+});
+test("addSelfToConnectSrc: undefined passes through", () => {
+  assert.equal(addSelfToConnectSrc(undefined), undefined);
+});
+
+test("transformManifest injects 'self' into the extension_pages connect-src", () => {
+  const out = transformManifest(
+    {
+      manifest_version: 3,
+      version: "1.0.0",
+      content_security_policy: { extension_pages: "default-src 'none'; connect-src https://api.x.com; script-src 'self'" },
+    },
+    [],
+    NO_EXT,
+    XF,
+  );
+  assert.match(out.content_security_policy.extension_pages, /connect-src 'self' https:\/\/api\.x\.com/);
 });

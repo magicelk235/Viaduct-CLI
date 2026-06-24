@@ -102,6 +102,31 @@ test("shim backfills survive FROZEN chrome.scripting / chrome.storage (Safari)",
   assert.ok(chrome.runtime.getURL("").length > 0, "getURL('') must yield a usable base URL");
 });
 
+// Regression (Grammarly): Safari's resource server is CASE-SENSITIVE on the UUID host
+// for fetch()/XHR, but reports the host LOWERCASE in sender.origin. We lowercase the
+// host ONLY for origin-derivation calls (getURL("")/"/"), and keep Safari's REAL host
+// case for actual resource paths — else fetch(getURL("manifest.json")) 404s and an
+// extension that loads its own bundled assets (Grammarly bg init) silently breaks.
+test("getURL lowercases host for root arg only; keeps real case for resource paths", () => {
+  const chrome = {
+    runtime: {
+      id: "x", getManifest: () => ({}),
+      // Safari hands back an UPPERCASE UUID host.
+      getURL: (p) => "safari-web-extension://F7737B2B-3F47/" + String(p || "").replace(/^\//, ""),
+    },
+    scripting: {}, storage: { local: {}, sync: {} }, tabs: {},
+  };
+  const fn = new Function("chrome", "self", "window", "globalThis", "setTimeout", "clearTimeout", shimSource());
+  fn(chrome, { addEventListener() {} }, undefined, { chrome }, () => 0, () => {});
+
+  // Origin-derivation: host lowercased so `sender.origin === getURL('').slice(0,-1)` holds.
+  assert.match(chrome.runtime.getURL(""), /^safari-web-extension:\/\/f7737b2b-3f47\//, "root arg → lowercase host");
+  assert.match(chrome.runtime.getURL("/"), /^safari-web-extension:\/\/f7737b2b-3f47\//, "'/' → lowercase host");
+  // Resource paths: REAL (uppercase) host preserved so Safari serves the file.
+  assert.match(chrome.runtime.getURL("manifest.json"), /^safari-web-extension:\/\/F7737B2B-3F47\/manifest\.json$/, "resource path keeps real host case");
+  assert.match(chrome.runtime.getURL("src/css/x.css"), /\/\/F7737B2B-3F47\/src\/css\/x\.css$/, "nested resource path keeps real host case");
+});
+
 // Regression: Safari's NATIVE i18n.getMessage throws "name value is invalid" for an
 // empty key; Chrome returns "". uBlock calls getMessage("") in its popup → the throw
 // killed popup init. The shim must wrap the throwing native to return "" instead.
@@ -310,9 +335,11 @@ test("getURL lowercases the extension host so origin === getURL-derived passes (
   // getURL('') host must now be lowercase → matches the lowercase sender.origin.
   const privilegedOrigin = vm.runInContext("chrome.runtime.getURL('').replace(/\\/+$/,'')", ctx);
   assert.equal(privilegedOrigin, lower, "getURL-derived privileged origin must be lowercase");
-  // A real resource path's CASE must be preserved (only the host is lowercased).
+  // A real RESOURCE path must keep Safari's REAL host case (UPPER) — Safari's resource
+  // server is case-sensitive on the host for fetch()/XHR; lowercasing it 404s the load
+  // (live-proven on Grammarly). Only the empty/root origin-derivation call is lowercased.
   const res = vm.runInContext("chrome.runtime.getURL('js/POPUP-Fenix.js')", ctx);
-  assert.equal(res, lower + "/js/POPUP-Fenix.js", "path case preserved; only host lowercased");
+  assert.equal(res, UPPER + "/js/POPUP-Fenix.js", "resource path keeps real (upper) host case + path case");
   // The bundle's check: sender.origin (lowercase) === PRIVILEGED_ORIGIN (now lowercase).
   assert.equal(lower, privilegedOrigin, "lowercase sender.origin now equals the privileged origin");
 });
