@@ -344,26 +344,17 @@ test("getURL lowercases the extension host so origin === getURL-derived passes (
   assert.equal(lower, privilegedOrigin, "lowercase sender.origin now equals the privileged origin");
 });
 
-// ROOT CAUSE #4 (Grammarly popup stuck "Grammarly is starting…" — posted:0). The bg
-// routes the popup PORT by matching sender.url against a regex built from
-// chrome.runtime.id: `new RegExp(chrome.runtime.id + "/src/popup.html").test(sender.url)`.
-// On Safari chrome.runtime.id is the LOWERCASE uuid but sender.url carries the UPPERCASE
-// host → no match → the port is never stored in the bg's port table → the bg posts no
-// reply → every popup-init RPC (getPageConfig/getExperimentTreatment) times out → the
-// popup hangs forever. The shim must hand the bundle's onConnect listener a port whose
-// sender.url host is lowercased to match runtime.id, WITHOUT breaking the reply path
-// (the bg replies via that same port's postMessage). sender.url itself is unpatchable
-// on Safari (frozen exotic getter — emulated here with a frozen sender), so the shim
-// passes a shallow clone that forwards postMessage to the real port.
-test("onConnect: sender.url host is lowercased for runtime.id routing, replies still reach the real port (Safari)", () => {
+// wrapOnConnect canonicalizes sender.origin on incoming connections. Its wrapper must
+// install on Safari's native onConnect, whose addListener is { writable:false,
+// configurable:true } — a bare assignment throws, so the shim uses installOverride
+// (defineProperty fallback). Model that exact descriptor; a plain writable method would
+// let an assignment-only regression pass while silently failing on real Safari.
+// (Port ROUTING by runtime.id-vs-sender.url is NOT done here — runtime.id is a frozen
+// slot the shim can't fix, so it's rewritten at conversion time; see
+// rewriteRuntimeIdUrlMatchers in test/inline-enums.test.js.)
+test("wrapOnConnect installs on Safari's read-only onConnect.addListener (installOverride)", () => {
   const UPPER = "safari-web-extension://C16B51B5-85C1-41D4-A8F6-1C3DAD4D1098";
-  const RUNTIME_ID = "c16b51b5-85c1-41d4-a8f6-1c3dad4d1098"; // Safari runtime.id: lowercase uuid
   let captured = null; // the wrapped listener the shim installed
-  // CRITICAL: Safari's native onConnect is an event object whose addListener is
-  // { writable:false, configurable:true } (proven live). A bare `oc.addListener = …`
-  // THROWS in strict mode here, so the shim must use defineProperty to install its
-  // wrapper. Model that exact descriptor — a plain writable method would let a broken
-  // (assignment-only) shim pass while silently failing on real Safari.
   const nativeEvent = (capture) => {
     const ev = {};
     Object.defineProperty(ev, "addListener", {
@@ -373,13 +364,15 @@ test("onConnect: sender.url host is lowercased for runtime.id routing, replies s
     ev.hasListener = () => false;
     return ev;
   };
+  const onConnectEv = nativeEvent((fn) => { captured = fn; });
+  const nativeAddListener = onConnectEv.addListener; // the locked native fn, pre-shim
   const chrome = {
     runtime: {
-      id: RUNTIME_ID, getManifest: () => ({}),
+      id: "x", getManifest: () => ({}),
       getURL: (p) => UPPER + "/" + (p == null ? "" : p),
       connect() { throw new Error("noop"); },
       sendMessage() { return Promise.resolve(); },
-      onConnect: nativeEvent((fn) => { captured = fn; }),
+      onConnect: onConnectEv,
       onMessage: nativeEvent(() => {}),
     },
     storage: { local: { get() {}, set() {} }, sync: { get() {} } },
@@ -390,112 +383,19 @@ test("onConnect: sender.url host is lowercased for runtime.id routing, replies s
   vm.createContext(ctx);
   vm.runInContext(shimSource(), ctx);
 
-  // The bg registers its port router (mirrors Grammarly's Oa()-gated _initPortListener).
-  const popupRe = new RegExp(chrome.runtime.id + "/src/popup.html");
-  const tabPorts = {};
-  let routedId = undefined;
-  chrome.runtime.onConnect.addListener(function (port) {
-    // Route by sender.url, exactly like Grammarly's Oa(): popover has no sender.tab.
-    routedId = popupRe.test(port.sender.url) ? "popup" : undefined;
-    if (routedId) {
-      (tabPorts[routedId] = tabPorts[routedId] || []).push(port);
-      // The reply path: the bg posts back on the SAME port.
-      port.postMessage({ rpc: "reply", ok: true });
-    }
-  });
-  assert.equal(typeof captured, "function", "shim must wrap onConnect.addListener");
+  // The wrap installed despite the read-only descriptor: addListener was replaced (it
+  // would be identical to the native fn if a bare-assign regression silently failed).
+  assert.notEqual(chrome.runtime.onConnect.addListener, nativeAddListener,
+    "shim must replace onConnect.addListener via defineProperty (read-only slot)");
 
-  // Simulate Safari delivering a FROZEN exotic port: sender.url via getter (UPPER host),
-  // sender + port frozen so direct mutation can't work — only a clone can normalize.
-  const replies = [];
-  const sender = {};
-  Object.defineProperty(sender, "url", { get() { return UPPER + "/src/popup.html"; }, enumerable: true, configurable: false });
-  Object.defineProperty(sender, "origin", { get() { return UPPER.toLowerCase(); }, enumerable: true, configurable: false });
-  Object.freeze(sender);
-  // CRITICAL: Safari's native Port.postMessage BRAND-CHECKS its receiver — called with a
-  // `this` that isn't the real native port it throws "Can only be called on a Port
-  // object". Model that here with a WeakMap-backed private slot only realPort has, so a
-  // wrapper built with Object.create(realPort) (this === clone) would FAIL to deliver the
-  // reply, while a wrapper that forwards bound to realPort succeeds. (Without this brand
-  // check the test passes even for a broken Object.create clone — which is exactly how the
-  // bug shipped: bg routed the port but every reply silently threw → popup stuck.)
-  const slot = new WeakMap();
-  const brand = (fn) => function (...a) {
-    if (!slot.has(this)) throw new TypeError("postMessage: Can only be called on a Port object");
-    return fn.apply(this, a);
-  };
-  const realPort = {
-    name: "message:to-priv",
-    sender,
-    postMessage: brand(function (m) { replies.push(m); }),
-    disconnect: brand(function () {}),
-    onMessage: { addListener() {}, removeListener() {}, hasListener() { return false; } },
-    onDisconnect: { addListener() {}, removeListener() {}, hasListener() { return false; } },
-  };
-  slot.set(realPort, true); // only the real port is branded
-  Object.freeze(realPort);
-
-  // Fire the shim-wrapped listener with the frozen Safari port.
+  // And the wrapper is transparent: the bundle's listener receives the REAL port unchanged
+  // (no clone — routing is fixed at conversion time, not by cloning the port here).
+  let got = null;
+  chrome.runtime.onConnect.addListener((port) => { got = port; });
+  assert.equal(typeof captured, "function", "wrapper forwards registration to the native addListener");
+  const realPort = { name: "message:to-priv", sender: { url: UPPER + "/src/popup.html" }, postMessage() {} };
   captured(realPort);
-
-  // 1) Routing now succeeds: the bundle saw a lowercased sender.url → port stored as "popup".
-  assert.equal(routedId, "popup", "runtime.id-vs-sender.url routing must match after host lowercasing");
-  assert.equal((tabPorts.popup || []).length, 1, "popup port must be stored in the bg port table");
-  // 2) The reply the bg posted reached the REAL port — and did NOT throw despite the
-  //    native brand check, proving the wrapper forwards postMessage bound to the real port.
-  assert.deepEqual(replies, [{ rpc: "reply", ok: true }], "bg reply must reach the real popup port without a brand-check throw");
+  assert.equal(got, realPort, "bundle listener receives the real port (no clone)");
 });
 
-// Same routing fix for one-shot messages (onMessage): some backgrounds run the
-// runtime.id-vs-sender.url match on onMessage senders too. The wrapped listener must
-// observe a lowercased sender.url host while sendResponse still works.
-test("onMessage: sender.url host is lowercased for runtime.id routing (Safari)", () => {
-  const UPPER = "safari-web-extension://C16B51B5-85C1-41D4-A8F6-1C3DAD4D1098";
-  const RUNTIME_ID = "c16b51b5-85c1-41d4-a8f6-1c3dad4d1098";
-  let capturedMsg = null;
-  // Safari native event: addListener non-writable (see onConnect test above). The shim
-  // must defineProperty its wrapper, not assign it.
-  const nativeEvent = (capture) => {
-    const ev = {};
-    Object.defineProperty(ev, "addListener", { value: capture, writable: false, enumerable: true, configurable: true });
-    ev.removeListener = () => {};
-    ev.hasListener = () => false;
-    return ev;
-  };
-  const chrome = {
-    runtime: {
-      id: RUNTIME_ID, getManifest: () => ({}),
-      getURL: (p) => UPPER + "/" + (p == null ? "" : p),
-      connect() { throw new Error("noop"); }, sendMessage() { return Promise.resolve(); },
-      onConnect: nativeEvent(() => {}),
-      onMessage: nativeEvent((fn) => { capturedMsg = fn; }),
-    },
-    storage: { local: { get() {}, set() {} }, sync: { get() {} } },
-    scripting: {}, tabs: {},
-  };
-  const ctx = { chrome, self: { addEventListener() {} }, setTimeout: () => 0, clearTimeout() {}, console };
-  ctx.globalThis = ctx;
-  vm.createContext(ctx);
-  vm.runInContext(shimSource(), ctx);
-
-  const popupRe = new RegExp(chrome.runtime.id + "/src/popup.html");
-  let seenUrl = null, matched = false;
-  chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
-    seenUrl = sender.url;
-    matched = popupRe.test(sender.url);
-    sendResponse({ ok: true });
-    return true;
-  });
-  assert.equal(typeof capturedMsg, "function", "shim must wrap onMessage.addListener");
-
-  const sender = {};
-  Object.defineProperty(sender, "url", { get() { return UPPER + "/src/popup.html"; }, enumerable: true, configurable: false });
-  Object.freeze(sender);
-  let responded = null;
-  capturedMsg({ type: "x" }, sender, (r) => { responded = r; });
-
-  assert.equal(seenUrl, UPPER.toLowerCase() + "/src/popup.html", "listener must see a lowercased sender.url host");
-  assert.equal(matched, true, "runtime.id-vs-sender.url match must succeed");
-  assert.deepEqual(responded, { ok: true }, "sendResponse must still work through the wrapper");
-});
 

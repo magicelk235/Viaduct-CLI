@@ -545,70 +545,6 @@ var __C2S_DEBUG__ = false;
     } catch (e) {}
   }
 
-  // The SAME UUID case mismatch also breaks port ROUTING (live-proven on Grammarly).
-  // Some backgrounds key the popup/side-panel/devtools port by matching `sender.url`
-  // against a regex built from chrome.runtime.id, e.g.:
-  //   new RegExp(chrome.runtime.id + "/src/popup.html").test(sender.url)
-  // On Safari `chrome.runtime.id` is the LOWERCASE uuid but `sender.url` carries the
-  // UPPERCASE host (safari-web-extension://C16B51B5-…/src/popup.html), so the test
-  // fails → the port is judged "unknown" and never stored in the bg's port table →
-  // the bg posts no reply to the popup's RPCs (posted:0) → every popup-init RPC
-  // (getPageConfig / getExperimentTreatment) times out → "Grammarly is starting…"
-  // hangs forever. fixSenderOrigin can't help: it only touches sender.origin, and the
-  // routing reads sender.url. We also can't mutate sender.url itself — on Safari the
-  // sender is a frozen exotic object with a getter (proven live: assignment +
-  // defineProperty both silently fail). So hand the bundle's listener a shallow CLONE
-  // of the sender whose `url` host is lowercased to match chrome.runtime.id, leaving
-  // the real (frozen) sender untouched. Generic: any extension routing ports by
-  // runtime.id-vs-sender.url is fixed; for others it's a harmless host-case rewrite of
-  // a value that is itself case-insensitive as an origin.
-  function senderWithLoweredUrlHost(sender) {
-    if (!sender) return sender;
-    try {
-      var u = sender.url;
-      if (typeof u !== "string" || !u) return sender;
-      var low = lowerHost(u); // lowercases scheme://host only; keeps the case-sensitive path
-      if (low === u) return sender; // already aligned → no clone needed
-      var clone = Object.create(sender); // inherits every other getter (id, tab, frameId, origin…)
-      try { Object.defineProperty(clone, "url", { value: low, enumerable: true, configurable: true }); }
-      catch (e) { try { clone.url = low; } catch (e2) { return sender; } }
-      return clone;
-    } catch (e) { return sender; }
-  }
-  // A port whose .sender.url host is lowercased, with every method/event still backed
-  // by the REAL port. The bg routes on this object AND replies through it
-  // (port.postMessage), so the wrapper must be transparent in both directions.
-  //
-  // We must NOT use Object.create(port): a method inherited via the prototype runs with
-  // `this` === the clone, and Safari's native Port.postMessage / .disconnect / event
-  // .addListener BRAND-CHECK their receiver — invoked on a foreign `this` they throw
-  // "Can only be called on a Port object" (proven live: the bg matched the port but every
-  // getPageConfig/treatments reply silently threw → popup got zero replies → stuck on
-  // "starting…"). Instead return a plain object that overrides only sender/name and
-  // forwards postMessage/disconnect as closures that call the REAL port (correct `this`),
-  // handing back the real onMessage/onDisconnect event objects unchanged so their native
-  // addListener also runs on the real receiver.
-  function portWithLoweredSenderUrl(port) {
-    if (!port) return port;
-    try {
-      var s = port.sender;
-      var s2 = senderWithLoweredUrlHost(s);
-      if (s2 === s) return port; // nothing to change
-      var w = {};
-      try { Object.defineProperty(w, "sender", { value: s2, enumerable: true, configurable: true }); }
-      catch (e) { try { w.sender = s2; } catch (e2) { return port; } }
-      try { Object.defineProperty(w, "name", { value: port.name, enumerable: true, configurable: true }); }
-      catch (e) { try { w.name = port.name; } catch (e2) {} }
-      // Methods bound to the real port so native brand checks on `this` pass.
-      if (typeof port.postMessage === "function") w.postMessage = function (m) { return port.postMessage(m); };
-      if (typeof port.disconnect === "function") w.disconnect = function () { return port.disconnect(); };
-      // Hand back the REAL event objects (don't re-wrap): the bundle calls
-      // port.onMessage.addListener(fn), which must run on the native event receiver.
-      try { if (port.onMessage) w.onMessage = port.onMessage; } catch (e) {}
-      try { if (port.onDisconnect) w.onDisconnect = port.onDisconnect; } catch (e) {}
-      return w;
-    } catch (e) { return port; }
-  }
   // Replace obj[name] with `fn`, returning true only if the swap actually took.
   // CRITICAL for Safari: chrome.runtime.onConnect/onMessage are native events whose
   // `addListener` is { writable:false, configurable:true } (proven live). A bare
@@ -622,33 +558,32 @@ var __C2S_DEBUG__ = false;
     try { Object.defineProperty(obj, name, { value: fn, writable: true, configurable: true }); if (obj[name] === fn) return true; } catch (e) {}
     return false;
   }
+  // Canonicalize sender.origin on incoming connections/messages. Some extensions
+  // privilege-gate their own pages with `sender.origin === getURL('').slice(0,-1)`; on a
+  // mutable-sender browser where the case mismatches, align it. On Safari this is a no-op
+  // (sender is a frozen exotic getter — proven live), which is fine: patchGetURL already
+  // lowercases the getURL host so both sides are lowercase and equal. (Port ROUTING by
+  // runtime.id-vs-sender.url is handled separately, at conversion time, by
+  // rewriteRuntimeIdUrlMatchers — runtime.id is a frozen slot the shim can't touch.)
+  // installOverride, not bare `=`: Safari's onConnect/onMessage expose addListener as
+  // { writable:false, configurable:true }, so an assignment would throw and the wrap
+  // would silently not take.
   function wrapOnConnect(rt) {
     if (!rt || rt.__c2sOnConnect) return;
-    // canon (for the origin-equality fix) is best-effort; the sender.url ROUTING fix
-    // below doesn't need it, so don't bail when getURL("") is momentarily empty —
-    // that would skip the routing fix that actually unblocks the popup.
     var canon = canonicalOrigin(rt);
+    if (!canon) return; // nothing to canonicalize against → skip (don't wrap for nothing)
     var oc = rt.onConnect;
-    if (!oc || typeof oc.addListener !== "function" || oc.__c2sWrapped) return;
-    var nativeAdd = oc.addListener.bind(oc);
-    var ocTook = installOverride(oc, "addListener", function (fn) {
-      if (typeof fn !== "function") return nativeAdd(fn);
-      return nativeAdd(function (port) {
-        try { if (port) fixSenderOrigin(port.sender, canon); } catch (e) {}
-        // Hand the bundle a port whose sender.url host is lowercased, so any check that
-        // compares sender.url to a lowercase origin/host (Safari reports the UUID host
-        // UPPERCASE in sender.url but lowercase in sender.origin / chrome.runtime.id) sees
-        // a consistent value. The wrapper forwards postMessage/onMessage BOUND to the real
-        // port (native Port methods brand-check `this`), so the bg's replies still reach
-        // the popup. The runtime.id-vs-sender.url ROUTING regex itself is fixed at
-        // conversion time (rewriteRuntimeIdUrlMatchers drops the `runtime.id +` prefix);
-        // this lowering covers the origin-equality checks the same UUID-case mismatch hits.
-        var p = port;
-        try { p = portWithLoweredSenderUrl(port); } catch (e) { p = port; }
-        return fn.call(this, p);
+    if (oc && typeof oc.addListener === "function" && !oc.__c2sWrapped) {
+      var nativeAdd = oc.addListener.bind(oc);
+      var ocTook = installOverride(oc, "addListener", function (fn) {
+        if (typeof fn !== "function") return nativeAdd(fn);
+        return nativeAdd(function (port) {
+          try { if (port) fixSenderOrigin(port.sender, canon); } catch (e) {}
+          return fn.call(this, port);
+        });
       });
-    });
-    // Same mismatch hits onMessage-based privileged checks.
+      if (ocTook) { try { oc.__c2sWrapped = true; } catch (e) {} }
+    }
     var om = rt.onMessage;
     if (om && typeof om.addListener === "function" && !om.__c2sWrapped) {
       var nativeAddM = om.addListener.bind(om);
@@ -656,17 +591,11 @@ var __C2S_DEBUG__ = false;
         if (typeof fn !== "function") return nativeAddM(fn);
         return nativeAddM(function (msg, sender, reply) {
           try { fixSenderOrigin(sender, canon); } catch (e) {}
-          // Same route-by-sender.url fix for one-shot messages: hand the bundle a
-          // sender clone with a lowercased url host (some backgrounds run the same
-          // runtime.id-vs-sender.url match on onMessage senders).
-          var s = sender;
-          try { s = senderWithLoweredUrlHost(sender); } catch (e) { s = sender; }
-          return fn.call(this, msg, s, reply);
+          return fn.call(this, msg, sender, reply);
         });
       });
       if (omTook) { try { om.__c2sWrapped = true; } catch (e) {} }
     }
-    if (ocTook) { try { oc.__c2sWrapped = true; } catch (e) {} }
     try { rt.__c2sOnConnect = true; } catch (e) {}
   }
   if (hasChrome) wrapOnConnect(mutableNamespace(chrome, "runtime"));
