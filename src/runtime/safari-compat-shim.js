@@ -1654,9 +1654,19 @@ var __C2S_DEBUG__ = false;
     // may be frozen, so go through mutableNamespace to get an extensible clone (it keeps
     // the real get/set/remove bound) before attaching. Generic: any extension that awaits
     // session.setAccessLevel on Safari would otherwise hang the same way.
+    // Honor the callback/promise contract AND clear runtime.lastError first. The
+    // caller's resolver typically reads lastError to choose resolve-vs-reject
+    // (Grammarly: `()=>chrome.runtime.lastError ? reject(lastError) : resolve()`).
+    // A stale truthy lastError left by an earlier shim callback would make that
+    // resolver REJECT — and since the setAccessLevel await is unguarded, the
+    // rejection still breaks bg init. Clearing it guarantees the success path.
+    var c2sSetAccessLevel = function (o, cb) {
+      try { if (chrome.runtime) chrome.runtime.lastError = null; } catch (e) {}
+      return dual(undefined, cb);
+    };
     var sess = stg ? mutableNamespace(stg, "session") : null;
     if (sess && typeof sess.setAccessLevel !== "function") {
-      setIfMissing(sess, "setAccessLevel", function (o, cb) { return dual(undefined, cb); });
+      setIfMissing(sess, "setAccessLevel", c2sSetAccessLevel);
     }
     // storage.managed — no MDM-policy surface; reads come back empty. Grammarly
     // blocks popup init waiting on managed.get; if it's undefined Grammarly times out.
@@ -1683,7 +1693,7 @@ var __C2S_DEBUG__ = false;
         } else {
           var apiSess = mutableNamespace(apiStg, "session");
           if (apiSess && typeof apiSess.setAccessLevel !== "function") {
-            setIfMissing(apiSess, "setAccessLevel", function (o, cb) { return dual(undefined, cb); });
+            setIfMissing(apiSess, "setAccessLevel", c2sSetAccessLevel);
           }
         }
       }
