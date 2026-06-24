@@ -284,6 +284,21 @@ test("storage.session.setAccessLevel: backfilled on a frozen native session so i
   ]);
   assert.equal(settled, "resolved", "setAccessLevel invoked its callback (init proceeds)");
 
+  // A STALE truthy lastError (left by some earlier shim callback) must not make the
+  // caller's `lastError ? rej : res` resolver reject — the setAccessLevel await is
+  // unguarded, so a rejection would still break bg init. The backfill clears
+  // lastError before the callback, so this resolves regardless of prior state.
+  chrome.runtime.lastError = { message: "stale error from a previous call" };
+  const settled2 = await Promise.race([
+    new Promise((res, rej) => {
+      chrome.storage.session.setAccessLevel({ accessLevel: "TRUSTED_AND_UNTRUSTED_CONTEXTS" }, () => {
+        chrome.runtime.lastError ? rej(chrome.runtime.lastError) : res("resolved");
+      });
+    }),
+    new Promise((r) => setTimeout(() => r("HUNG"), 200)),
+  ]);
+  assert.equal(settled2, "resolved", "stale lastError is cleared so the resolver doesn't reject");
+
   // The real native methods must still work through the (now-mutable) session clone.
   await new Promise((res) => chrome.storage.session.set({ k: 1 }, res));
   assert.equal(sessionData.k, 1, "native session.set still reaches the real backing store");
