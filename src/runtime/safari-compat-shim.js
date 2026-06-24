@@ -340,10 +340,19 @@ var __C2S_DEBUG__ = false;
   // that equality is always false on Safari (lower !== UPPER) → the popup's port is
   // judged unprivileged → privileged messages (uBlock getPopupData) go unanswered →
   // blank popup. We can't fix sender.origin (it's an exotic getter returning a fresh
-  // object each read — mutation doesn't stick). The authority/host of a URL is
-  // case-insensitive per RFC 3986, so the FIX that makes both sides match without
-  // breaking resource loads is to LOWERCASE the safari-web-extension://<host> authority
-  // in getURL()'s output. Then getURL-derived origins equal the lowercase sender.origin.
+  // object each read — mutation doesn't stick).
+  //
+  // CAUTION (live-proven on Grammarly): Safari's resource server is CASE-SENSITIVE on
+  // the UUID host for fetch()/XHR/<link>. Lowercasing the host in EVERY getURL output
+  // makes `fetch(getURL("manifest.json"))` and module/config loads 404 ("TypeError:
+  // Load failed"), which silently breaks any extension that loads its own bundled
+  // assets at runtime (Grammarly's bg init stalls → popup never initializes).
+  //
+  // The two consumers want opposite cases, but they ask with different args:
+  //   • origin-derivation uses getURL("") / getURL("/")  → needs LOWERCASE (match origin)
+  //   • resource loads use getURL("some/path")           → needs the REAL case (fetch)
+  // So lowercase the host ONLY for the empty/root path; return the genuine Safari
+  // casing for every real resource path. Threads both needs.
   function lowerHost(u) {
     if (typeof u !== "string") return u;
     // Lowercase only the scheme://authority prefix; leave the case-sensitive path.
@@ -351,20 +360,27 @@ var __C2S_DEBUG__ = false;
       return scheme.toLowerCase() + "://" + host.toLowerCase();
     });
   }
+  // Is this getURL arg an origin-derivation call (empty / root) rather than a real
+  // resource path? Those are the only ones we lowercase.
+  function isRootArg(p) {
+    if (p == null) return true;
+    var s = String(p);
+    return s === "" || s === "/" || s === "./" || s === ".";
+  }
   function patchGetURL(rt) {
     if (!rt || typeof rt.getURL !== "function" || rt.__c2sGetURL) return;
     var orig = rt.getURL.bind(rt);
     var base = "";
     try { base = orig("/") || orig("manifest.json").replace(/manifest\.json[^/]*$/, "") || ""; } catch (e) {}
     if (!base) { try { base = (location && location.origin ? location.origin + "/" : ""); } catch (e) {} }
-    base = lowerHost(base);
     function wrapped(p) {
+      var root = isRootArg(p);
       var r = null;
       try { r = orig(p == null ? "" : p); } catch (e) {}
-      if (r) return lowerHost(r);
-      // Safari gave us nothing usable: build from the base.
+      if (r) return root ? lowerHost(r) : r; // real resource paths keep Safari's real host case
+      // Safari gave us nothing usable: build from the base (only the root case hits this).
       var path = (p == null ? "" : String(p)).replace(/^\.?\//, "");
-      return base + path;
+      return (root ? lowerHost(base) : base) + path;
     }
     try { rt.getURL = wrapped; rt.__c2sGetURL = true; } catch (e) {
       try { Object.defineProperty(rt, "getURL", { value: wrapped, writable: true, configurable: true }); rt.__c2sGetURL = true; } catch (e2) {}

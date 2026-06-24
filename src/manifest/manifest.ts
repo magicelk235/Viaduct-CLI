@@ -626,6 +626,29 @@ export function collectReferencedPaths(m: Manifest): Set<string> {
   return paths;
 }
 
+/**
+ * Add `'self'` to a CSP's connect-src so Safari allows same-origin fetch/XHR of
+ * bundled resources (Chrome implies this; Safari enforces connect-src strictly).
+ * Only touches a connect-src that EXISTS but lacks 'self' — a policy with no
+ * connect-src already falls back to default-src/'self'. Leaves every other
+ * directive untouched. Accepts the MV3 object form, the bare MV2 string, or
+ * undefined, and returns the same shape.
+ */
+export function addSelfToConnectSrc<T extends string | Record<string, string> | undefined>(csp: T): T {
+  const fixOne = (policy: string): string =>
+    policy.replace(/(^|;)\s*connect-src\s+([^;]*)/i, (full, sep: string, sources: string) => {
+      const tokens = sources.trim().split(/\s+/).filter(Boolean);
+      // 'none' means "block everything" — don't loosen it; 'self' already present → no-op.
+      if (tokens.includes("'none'") || tokens.includes("'self'")) return full;
+      return `${sep} connect-src 'self' ${tokens.join(" ")}`;
+    });
+  if (csp == null) return csp;
+  if (typeof csp === "string") return fixOne(csp) as T;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(csp)) out[k] = typeof v === "string" ? fixOne(v) : v;
+  return out as T;
+}
+
 /** Produce the Safari-ready manifest. Pure: does not write to disk. */
 export function transformManifest(
   m: Manifest,
@@ -685,6 +708,17 @@ export function transformManifest(
   if (mv === 3 && typeof out.content_security_policy === "string") {
     out.content_security_policy = { extension_pages: out.content_security_policy };
   }
+
+  // Chrome implicitly allows an extension page to fetch/connect to its OWN bundled
+  // resources (same-origin) regardless of connect-src; Safari enforces connect-src
+  // strictly, so a policy that declares connect-src but omits 'self' makes Safari
+  // REFUSE same-origin fetch()/XHR of bundled assets ("Refused to connect to
+  // safari-web-extension://… because it does not appear in the connect-src
+  // directive"). Live-proven on Grammarly: its bg fetches its own fonts/*.css and
+  // the missing 'self' silently breaks init. Inject 'self' into connect-src (only
+  // when the directive exists but lacks it — if there's no connect-src, the default
+  // covers 'self' already). Applies to every CSP key (extension_pages, sandbox).
+  out.content_security_policy = addSelfToConnectSrc(out.content_security_policy);
 
   // MV3 requires web_accessible_resources to be an array of {resources, matches}
   // objects. A bare MV2 string[] makes Safari reject the manifest at load. Wrap
