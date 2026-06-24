@@ -176,3 +176,52 @@ export function inlineImmutableEnums(stageDir: string): number {
   }
   return modified;
 }
+
+// Bundles route extension-page ports (popup / side panel / devtools) by testing the
+// sender's URL against a RegExp built from chrome.runtime.id:
+//   new RegExp(chrome.runtime.id + "/src/popup.html").test(port.sender.url)
+// On Chrome that works because runtime.id IS the host of every extension URL. On Safari
+// it CANNOT: runtime.id is the App-Extension BUNDLE id ("com.x.Extension (TEAM)"), while
+// sender.url's host is the per-install UUID — two different strings, and the bundle id even
+// contains regex metacharacters. Safari exposes chrome.runtime.id as a frozen/exotic slot
+// (assignment AND defineProperty silently no-op, and chrome.runtime itself can't be replaced
+// — all proven live), so the shim cannot fix runtime.id at runtime. The port is never
+// routed → the bg posts no reply → the popup's init RPC never resolves (e.g. Grammarly hangs
+// on "starting…").
+//
+// Fix at conversion time: drop the `runtime.id +` prefix so the matcher becomes
+//   new RegExp("/src/popup.html").test(sender.url)
+// which is host-agnostic and matches the real Safari URL (any UUID host, and tolerant of
+// Safari's "?tabId=N" query — the path substring still matches). It stays path-specific, so
+// popup/sidePanel/devtools matchers remain distinct and content-script URLs don't match.
+//
+// ponytail: literal substitution, not a JS parser. Targets the exact, common shape
+// `new RegExp(<chrome|browser>[.|["..."]]runtime.id + "<path>")`. A bundle that built the
+// pattern some other way (string concat into a var first) would need AST work — add then.
+const RUNTIME_ID_URL_RE =
+  /new\s+RegExp\s*\(\s*(?:chrome|browser|self|globalThis)?\s*(?:\.\s*chrome|\.\s*browser)?\s*\.\s*runtime\s*\.\s*id\s*\+\s*(["'])((?:\\.|(?!\1).)*)\1\s*\)/g;
+
+export function rewriteRuntimeIdUrlMatchers(stageDir: string): number {
+  let modified = 0;
+  for (const file of walkScripts(stageDir)) {
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    let changed = false;
+    const next = content.replace(RUNTIME_ID_URL_RE, (whole, quote: string, path: string) => {
+      // Only rewrite when the appended literal looks like a URL path (starts with "/").
+      // That's the port-routing idiom; anything else we leave alone to stay conservative.
+      if (!path.startsWith("/")) return whole;
+      changed = true;
+      return "new RegExp(" + quote + path + quote + ")";
+    });
+    if (changed) {
+      writeFileSync(file, next, "utf-8");
+      modified++;
+    }
+  }
+  return modified;
+}

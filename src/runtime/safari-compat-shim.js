@@ -415,32 +415,22 @@ var __C2S_DEBUG__ = false;
   // host (lowercased — patchGetURL already lowercases the root-arg host, and the companion
   // wrapOnConnect fix lowercases sender.url's host, so both sides of the regex agree).
   // No-op if the host can't be derived; never throws.
-  function uuidFromGetURL(rt) {
-    try {
-      var u = (typeof rt.getURL === "function") ? rt.getURL("") : "";
-      var m = /^(?:safari-web-extension|chrome-extension|moz-extension):\/\/([^/]+)/i.exec(u || "");
-      return m ? m[1] : "";
-    } catch (e) { return ""; }
-  }
-  function patchRuntimeId(rt) {
-    if (!rt || rt.__c2sId) return;
-    var uuid = uuidFromGetURL(rt);
-    if (!uuid) return; // can't derive — leave native id untouched
-    var cur; try { cur = rt.id; } catch (e) { cur = undefined; }
-    if (cur === uuid) { rt.__c2sId = true; return; } // already the UUID (real Chrome / future Safari)
-    var took = false;
-    try { rt.id = uuid; took = (rt.id === uuid); } catch (e) {}
-    if (!took) { try { Object.defineProperty(rt, "id", { value: uuid, writable: true, configurable: true, enumerable: true }); took = (rt.id === uuid); } catch (e) {} }
-    if (took) rt.__c2sId = true;
-  }
   // A FROZEN Safari chrome.runtime blocks the getURL wrap (assignment + defineProperty
   // both fail on a frozen object), so getURL("") keeps returning ""/undefined and
   // uBlock's vAPI.getURL("").slice crashes. Swap in a mutable runtime clone (native
   // methods stay bound to the original) so the wrap lands. Then re-run the runtime
   // event/enum backfill on the now-mutable namespace too.
-  if (hasChrome) { var __crt = mutableNamespace(chrome, "runtime"); patchGetURL(__crt); patchRuntimeId(__crt); backfillRuntimeEvents(__crt); }
-  if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) { var __brt = mutableNamespace(browser, "runtime"); patchGetURL(__brt); patchRuntimeId(__brt); backfillRuntimeEvents(__brt); }
-  if (api && api !== __browser && !(hasChrome && api === chrome)) { var __art = mutableNamespace(api, "runtime"); patchGetURL(__art); patchRuntimeId(__art); backfillRuntimeEvents(__art); }
+  //
+  // NOTE on chrome.runtime.id: Safari reports it as the App-Extension BUNDLE id, not the
+  // URL-host UUID, which breaks bundles that route ports via
+  // `new RegExp(runtime.id + "/src/popup.html").test(sender.url)`. The shim canNOT fix
+  // that here — chrome.runtime.id is a frozen exotic slot (assignment + defineProperty
+  // both silently no-op, and chrome.runtime itself can't be replaced; all proven live).
+  // It's fixed at conversion time instead (rewriteRuntimeIdUrlMatchers in stage.ts strips
+  // the `runtime.id +` prefix so the matcher is host-agnostic).
+  if (hasChrome) { var __crt = mutableNamespace(chrome, "runtime"); patchGetURL(__crt); backfillRuntimeEvents(__crt); }
+  if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) { var __brt = mutableNamespace(browser, "runtime"); patchGetURL(__brt); backfillRuntimeEvents(__brt); }
+  if (api && api !== __browser && !(hasChrome && api === chrome)) { var __art = mutableNamespace(api, "runtime"); patchGetURL(__art); backfillRuntimeEvents(__art); }
 
   // runtime.connect() wake-the-background. Safari THROWS synchronously
   // "Invalid call to runtime.connect(). No runtime.onConnect listeners found." when
@@ -645,12 +635,14 @@ var __C2S_DEBUG__ = false;
       if (typeof fn !== "function") return nativeAdd(fn);
       return nativeAdd(function (port) {
         try { if (port) fixSenderOrigin(port.sender, canon); } catch (e) {}
-        // Route-by-sender.url fix: give the bundle a port clone whose sender.url host
-        // is lowercased to match the (now UUID, also lowercased) chrome.runtime.id, so
-        // runtime.id-based port routing recognizes the popup/panel and the bg can post
-        // replies back. The clone forwards postMessage/onMessage bound to the real port,
-        // so replies still reach the popup. (Pairs with patchRuntimeId above: the id had
-        // to become the UUID first, or the two strings could never match.)
+        // Hand the bundle a port whose sender.url host is lowercased, so any check that
+        // compares sender.url to a lowercase origin/host (Safari reports the UUID host
+        // UPPERCASE in sender.url but lowercase in sender.origin / chrome.runtime.id) sees
+        // a consistent value. The wrapper forwards postMessage/onMessage BOUND to the real
+        // port (native Port methods brand-check `this`), so the bg's replies still reach
+        // the popup. The runtime.id-vs-sender.url ROUTING regex itself is fixed at
+        // conversion time (rewriteRuntimeIdUrlMatchers drops the `runtime.id +` prefix);
+        // this lowering covers the origin-equality checks the same UUID-case mismatch hits.
         var p = port;
         try { p = portWithLoweredSenderUrl(port); } catch (e) { p = port; }
         return fn.call(this, p);
