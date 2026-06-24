@@ -39,3 +39,9 @@ extension-extract/
 
 # Generated conversion output
 *_Safari/
+
+# Local test-extension corpus (large binaries; not source)
+test extensions/
+
+# Editor / local MCP config
+.vscode/
