@@ -8,7 +8,7 @@ and tested in Safari with the bg-page Web Inspector.
 |-----------|--------|-----------------|
 | [uBlock Origin](./uBlock-Origin.md) | ✅ Working | Popup loads, live block stats render |
 | [Bitwarden](./Bitwarden.md) | ⚠️ Partial | UI loads; WASM SDK + passkey are platform limits |
-| [Grammarly](./Grammarly.md) | ⚠️ Auth fix landed | proxy now carries httpOnly session cookie via chrome.cookies (was 401 user_not_authorized); retest pending |
+| [Grammarly](./Grammarly.md) | ⚠️ Two fixes landed | popup port now routed (runtime.id-vs-sender.url case fix; was posted:0 → "starting…" hang) + proxy carries httpOnly cookie; retest pending |
 
 ## Cross-cutting root causes found this round
 All pinned with **live diagnostics** (debug flag → `chrome.storage.local` → read from
@@ -23,10 +23,15 @@ the reliable background-page console), not by guessing from pasted errors.
    installed. → converter inlines the enum reads to string literals
    (`inlineImmutableEnums`).
 3. **Extension UUID case mismatch.** `getURL()`/`sender.url` UPPERCASE, `sender.origin`
-   lowercase. Breaks `sender.origin === getURL('').slice(0,-1)` privileged checks →
-   blank popups. `sender.origin` is an exotic fresh-object getter (unpatchable). →
-   lowercase the extension host in `getURL()` output (authority case-insensitive per
+   + `chrome.runtime.id` lowercase. Two breakages, same root:
+   (a) `sender.origin === getURL('').slice(0,-1)` privileged checks fail → blank popups
+   → lowercase the extension host in `getURL()` output (authority case-insensitive per
    RFC 3986).
+   (b) port routing via `new RegExp(runtime.id + "/src/popup.html").test(sender.url)`
+   fails (lower id vs UPPER url) → popup port unrouted → bg posts no reply → popup hangs
+   (Grammarly "starting…"). `sender.url` is an exotic frozen getter (unpatchable) →
+   `wrapOnConnect`/onMessage pass the bundle a port/sender clone with a lowercased
+   `sender.url` host, methods still forwarding to the real port.
 4. **getURL("") on a frozen runtime** returned ""/undefined (uBlock crash) → wrap via a
    mutable runtime clone with native methods bound.
 5. **runtime.connect to a suspended bg throws** → proxy Port that wakes the bg and
