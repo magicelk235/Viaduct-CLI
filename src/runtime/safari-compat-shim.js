@@ -2546,9 +2546,10 @@ var __C2S_DEBUG__ = false;
     function headersToObj(h) {
       var o = {};
       // Forbidden request headers the browser would have set itself; replaying
-      // them server-side is wrong or ignored. Cookie is intentionally dropped —
-      // the native host attaches the shared cookie jar; a stale JS-visible Cookie
-      // value (httpOnly cookies aren't even here) would only mislead it.
+      // them server-side is wrong or ignored. Cookie is dropped HERE because the
+      // proxy carries it separately via the message's `cookie` field (sourced from
+      // chrome.cookies — httpOnly included); letting a caller-supplied Cookie header
+      // through too would duplicate or fight that authoritative value.
       var forbidden = { "host": 1, "cookie": 1, "content-length": 1, "connection": 1,
                         "origin": 1, "referer": 1 };
       try { if (h && typeof h.forEach === "function") h.forEach(function (v, k) {
@@ -2581,15 +2582,52 @@ var __C2S_DEBUG__ = false;
         }); } catch (e) { reject(e); }
       });
     }
+    // Build the Cookie header value the proxied request needs to authenticate.
+    // Safari treats the safari-web-extension://<uuid> origin as third-party to the
+    // backend, so an in-browser `credentials:"include"` fetch is stripped of the
+    // site's cookies (ITP) → the backend answers 401. The native-host retry could
+    // carry them, BUT a session cookie (e.g. Grammarly's `grauth`) is httpOnly and
+    // therefore INVISIBLE to `document.cookie` — forwarding document.cookie alone
+    // never includes it, so the proxy retry stayed 401 too. `chrome.cookies`,
+    // however, reads Safari's REAL cookie jar including httpOnly cookies (and works
+    // from the popup/bg, both of which hold the "cookies" permission). So source the
+    // cookie header from chrome.cookies.getAll({url}) and fall back to document.cookie
+    // only when the cookies API is unavailable. Returns a Promise<string>.
+    function gatherCookieHeader(url) {
+      var ck = (typeof chrome !== "undefined" && chrome.cookies) ? chrome.cookies
+             : (api && api.cookies) ? api.cookies : null;
+      var fallback = "";
+      try { if (typeof document !== "undefined" && document.cookie) fallback = document.cookie; } catch (e) {}
+      if (!ck || typeof ck.getAll !== "function") return Promise.resolve(fallback);
+      return new Promise(function (resolve) {
+        var done = false;
+        var finish = function (list) {
+          if (done) return; done = true;
+          try {
+            if (list && list.length) {
+              var parts = [];
+              for (var i = 0; i < list.length; i++) {
+                var c = list[i];
+                if (c && c.name != null) parts.push(c.name + "=" + (c.value == null ? "" : c.value));
+              }
+              resolve(parts.length ? parts.join("; ") : fallback);
+              return;
+            }
+          } catch (e) {}
+          resolve(fallback);
+        };
+        try {
+          // chrome.cookies.getAll is promise-based on Safari, callback-based on Chrome.
+          var p = ck.getAll({ url: url }, finish);
+          if (p && typeof p.then === "function") p.then(finish, function () { finish(null); });
+        } catch (e) { finish(null); }
+      });
+    }
     // Resolve to a real Response built from the host's reply, or reject so the
     // caller sees a normal failure. Body is base64 to survive JSON transport.
     function proxyFetch(url, method, headers, body) {
-      // Forward JS-visible cookies so the host can authenticate the request.
-      // httpOnly cookies are invisible here and cannot be carried — see the Swift
-      // handler's note. Only sent from a document context (SW has no document).
-      var cookie = "";
-      try { if (typeof document !== "undefined" && document.cookie) cookie = document.cookie; } catch (e) {}
-      var msg = { __c2sProxy: true, url: url, method: method || "GET", headers: headers || {}, body: body || null, cookie: cookie };
+      return gatherCookieHeader(url).then(function (cookie) {
+      var msg = { __c2sProxy: true, url: url, method: method || "GET", headers: headers || {}, body: body || null, cookie: cookie || "" };
       return sendToHost(msg).then(function (r) {
         if (!r || r.error) throw new Error((r && r.error) || "native host: empty reply");
         var bytes = null;
@@ -2603,6 +2641,7 @@ var __C2S_DEBUG__ = false;
         if (st < 200 || st > 599) st = 502; // out-of-range (incl. 0) → Bad Gateway
         if (st === 204 || st === 205 || st === 304) bytes = null;
         return new Response(bytes, { status: st, statusText: r.statusText || "", headers: r.headers || {} });
+      });
       });
     }
 

@@ -192,23 +192,24 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
         if !Self.chromeOrigin.isEmpty {
             req.setValue(Self.chromeOrigin, forHTTPHeaderField: "Origin")
         }
-        // Auth: the shim forwards JS-visible (non-httpOnly) cookies as a "cookie"
-        // field, because URLSession does NOT share Safari's cookie jar. NOTE: an
-        // httpOnly session cookie is invisible to JS and therefore CANNOT be
-        // carried here — if the backend authenticates via an httpOnly cookie, this
-        // proxy will still get 401 and a native cookie-sharing strategy (app group
-        // + WKHTTPCookieStore export) is required instead.
+        // Auth: the shim forwards the request's cookies as a "cookie" field, read
+        // from chrome.cookies (Safari's real jar, httpOnly INCLUDED) — not from
+        // document.cookie, which can't see an httpOnly session cookie. URLSession
+        // does not share Safari's cookie jar, so this forwarded header is the only
+        // way the backend sees the session. We must therefore stop URLSession from
+        // applying/overwriting cookies from its own (empty) shared storage, or it
+        // would clobber our explicit Cookie header and the backend would 401.
         if let cookie = dict["cookie"] as? String, !cookie.isEmpty {
             req.setValue(cookie, forHTTPHeaderField: "Cookie")
         }
+        req.httpShouldHandleCookies = false
         if let body = dict["body"] as? String { req.httpBody = body.data(using: .utf8) }
 
-        // Use the shared cookie storage and let it apply/collect cookies so a login
-        // performed once via the proxy persists for later proxied calls.
+        // Don't let the (empty) shared storage inject/replace cookies — the request
+        // already carries the authenticated Cookie header built from chrome.cookies.
         let cfg = URLSessionConfiguration.default
-        cfg.httpCookieStorage = HTTPCookieStorage.shared
-        cfg.httpShouldSetCookies = true
-        cfg.httpCookieAcceptPolicy = .always
+        cfg.httpShouldSetCookies = false
+        cfg.httpCookieAcceptPolicy = .never
         let session = URLSession(configuration: cfg)
         let task = session.dataTask(with: req) { data, response, error in
             if let error = error {

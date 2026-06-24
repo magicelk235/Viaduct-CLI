@@ -37,10 +37,43 @@ test("shimSource with no hosts emits an inert proxy config", () => {
 
 test("shim proxy hardening: cookie forwarding, forbidden-header filter, SW relay", () => {
   const src = shimSource({ chromeOrigin: "chrome-extension://abc", proxyHosts: ["api.foo.com"] });
-  assert.match(src, /document\.cookie/, "forwards JS-visible cookies");
+  // The proxy sources cookies from chrome.cookies (Safari's real jar, httpOnly
+  // included), with document.cookie only as a fallback — a session cookie like
+  // Grammarly's httpOnly `grauth` is invisible to document.cookie, so forwarding
+  // it alone left the proxy retry stuck at 401.
+  assert.match(src, /gatherCookieHeader/, "cookie header is gathered for the proxy");
+  assert.match(src, /chrome\.cookies/, "sources cookies from chrome.cookies (httpOnly included)");
+  assert.match(src, /ck\.getAll\(\{ url: url \}/, "reads cookies scoped to the request URL");
+  assert.match(src, /document\.cookie/, "document.cookie remains as a fallback");
   assert.match(src, /__c2sProxyRelay/, "page→SW relay path exists");
   assert.match(src, /"cookie": 1/, "Cookie is in the forbidden-header drop list");
   assert.match(src, /"origin": 1/, "Origin is in the forbidden-header drop list");
+});
+
+// The core of the auth fix: the proxy must build a Cookie header that INCLUDES
+// the httpOnly session cookie, which only chrome.cookies exposes. This replays
+// gatherCookieHeader's builder against a fake chrome.cookies and asserts the
+// httpOnly cookie makes it into the header (document.cookie never could).
+test("proxy cookie sourcing: httpOnly cookie from chrome.cookies lands in the header", async () => {
+  // Mirror of gatherCookieHeader's list→header reduction (shim.ts).
+  function buildHeader(list, fallback) {
+    if (list && list.length) {
+      const parts = [];
+      for (const c of list) if (c && c.name != null) parts.push(c.name + "=" + (c.value == null ? "" : c.value));
+      if (parts.length) return parts.join("; ");
+    }
+    return fallback;
+  }
+  const jar = [
+    { name: "grauth", value: "SECRET", httpOnly: true }, // invisible to document.cookie
+    { name: "gnar_containerId", value: "abc" },
+  ];
+  const header = buildHeader(jar, "only_visible=1");
+  assert.equal(header, "grauth=SECRET; gnar_containerId=abc");
+  // Empty jar → falls back to the document.cookie value.
+  assert.equal(buildHeader([], "only_visible=1"), "only_visible=1");
+  // And the shim wires getAll promise-or-callback (Safari is promise-based).
+  assert.match(shimSource({ proxyHosts: ["x.com"] }), /p\.then\(finish/);
 });
 
 // proxyFetch builds a Response from the native host's reply. Response() only
