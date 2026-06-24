@@ -412,14 +412,28 @@ test("onConnect: sender.url host is lowercased for runtime.id routing, replies s
   Object.defineProperty(sender, "url", { get() { return UPPER + "/src/popup.html"; }, enumerable: true, configurable: false });
   Object.defineProperty(sender, "origin", { get() { return UPPER.toLowerCase(); }, enumerable: true, configurable: false });
   Object.freeze(sender);
-  const realPort = Object.freeze({
+  // CRITICAL: Safari's native Port.postMessage BRAND-CHECKS its receiver — called with a
+  // `this` that isn't the real native port it throws "Can only be called on a Port
+  // object". Model that here with a WeakMap-backed private slot only realPort has, so a
+  // wrapper built with Object.create(realPort) (this === clone) would FAIL to deliver the
+  // reply, while a wrapper that forwards bound to realPort succeeds. (Without this brand
+  // check the test passes even for a broken Object.create clone — which is exactly how the
+  // bug shipped: bg routed the port but every reply silently threw → popup stuck.)
+  const slot = new WeakMap();
+  const brand = (fn) => function (...a) {
+    if (!slot.has(this)) throw new TypeError("postMessage: Can only be called on a Port object");
+    return fn.apply(this, a);
+  };
+  const realPort = {
     name: "message:to-priv",
     sender,
-    postMessage(m) { replies.push(m); },
-    disconnect() {},
+    postMessage: brand(function (m) { replies.push(m); }),
+    disconnect: brand(function () {}),
     onMessage: { addListener() {}, removeListener() {}, hasListener() { return false; } },
     onDisconnect: { addListener() {}, removeListener() {}, hasListener() { return false; } },
-  });
+  };
+  slot.set(realPort, true); // only the real port is branded
+  Object.freeze(realPort);
 
   // Fire the shim-wrapped listener with the frozen Safari port.
   captured(realPort);
@@ -427,8 +441,9 @@ test("onConnect: sender.url host is lowercased for runtime.id routing, replies s
   // 1) Routing now succeeds: the bundle saw a lowercased sender.url → port stored as "popup".
   assert.equal(routedId, "popup", "runtime.id-vs-sender.url routing must match after host lowercasing");
   assert.equal((tabPorts.popup || []).length, 1, "popup port must be stored in the bg port table");
-  // 2) The reply the bg posted reached the REAL port (clone forwards postMessage).
-  assert.deepEqual(replies, [{ rpc: "reply", ok: true }], "bg reply must reach the real popup port");
+  // 2) The reply the bg posted reached the REAL port — and did NOT throw despite the
+  //    native brand check, proving the wrapper forwards postMessage bound to the real port.
+  assert.deepEqual(replies, [{ rpc: "reply", ok: true }], "bg reply must reach the real popup port without a brand-check throw");
 });
 
 // Same routing fix for one-shot messages (onMessage): some backgrounds run the

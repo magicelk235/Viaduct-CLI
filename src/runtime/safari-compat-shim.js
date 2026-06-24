@@ -554,21 +554,38 @@ var __C2S_DEBUG__ = false;
       return clone;
     } catch (e) { return sender; }
   }
-  // A port whose .sender.url host is lowercased, but every method (postMessage,
-  // onMessage, onDisconnect, disconnect) still forwards to the REAL port. Object.create
-  // keeps the prototype chain so inherited methods/getters resolve to the real port;
-  // we override only `sender`. (The bg replies via this same port object, so its
-  // postMessage MUST remain the native one — Object.create guarantees that.)
+  // A port whose .sender.url host is lowercased, with every method/event still backed
+  // by the REAL port. The bg routes on this object AND replies through it
+  // (port.postMessage), so the wrapper must be transparent in both directions.
+  //
+  // We must NOT use Object.create(port): a method inherited via the prototype runs with
+  // `this` === the clone, and Safari's native Port.postMessage / .disconnect / event
+  // .addListener BRAND-CHECK their receiver — invoked on a foreign `this` they throw
+  // "Can only be called on a Port object" (proven live: the bg matched the port but every
+  // getPageConfig/treatments reply silently threw → popup got zero replies → stuck on
+  // "starting…"). Instead return a plain object that overrides only sender/name and
+  // forwards postMessage/disconnect as closures that call the REAL port (correct `this`),
+  // handing back the real onMessage/onDisconnect event objects unchanged so their native
+  // addListener also runs on the real receiver.
   function portWithLoweredSenderUrl(port) {
     if (!port) return port;
     try {
       var s = port.sender;
       var s2 = senderWithLoweredUrlHost(s);
       if (s2 === s) return port; // nothing to change
-      var clone = Object.create(port);
-      try { Object.defineProperty(clone, "sender", { value: s2, enumerable: true, configurable: true }); }
-      catch (e) { try { clone.sender = s2; } catch (e2) { return port; } }
-      return clone;
+      var w = {};
+      try { Object.defineProperty(w, "sender", { value: s2, enumerable: true, configurable: true }); }
+      catch (e) { try { w.sender = s2; } catch (e2) { return port; } }
+      try { Object.defineProperty(w, "name", { value: port.name, enumerable: true, configurable: true }); }
+      catch (e) { try { w.name = port.name; } catch (e2) {} }
+      // Methods bound to the real port so native brand checks on `this` pass.
+      if (typeof port.postMessage === "function") w.postMessage = function (m) { return port.postMessage(m); };
+      if (typeof port.disconnect === "function") w.disconnect = function () { return port.disconnect(); };
+      // Hand back the REAL event objects (don't re-wrap): the bundle calls
+      // port.onMessage.addListener(fn), which must run on the native event receiver.
+      try { if (port.onMessage) w.onMessage = port.onMessage; } catch (e) {}
+      try { if (port.onDisconnect) w.onDisconnect = port.onDisconnect; } catch (e) {}
+      return w;
     } catch (e) { return port; }
   }
   // Replace obj[name] with `fn`, returning true only if the swap actually took.
