@@ -57,7 +57,11 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
       // Never copy symlinks into the package. cpSync reproduces them verbatim, so a
       // link in the source (evil.txt -> /etc/hosts) would ship a dangling/absolute
       // link that leaks the build host's layout and 404s in Safari. Drop them.
-      if (lstatSync(src).isSymbolicLink()) return false;
+      // lstat can throw on a broken/racing entry; an unguarded throw here escapes the
+      // filter and aborts the whole copy with an opaque ENOENT — exclude on error.
+      let st;
+      try { st = lstatSync(src); } catch { return false; }
+      if (st.isSymbolicLink()) return false;
       // A manifest-referenced path is always kept, even under an excluded ancestor.
       if (keep.has(rel)) return true;
       // Excluded if its own name OR any ancestor segment is excluded — this stops a

@@ -57,3 +57,24 @@ test("tabGroups emulation lifecycle", async () => {
   assert.equal((await tg.query({})).length, 0, "group removed when empty");
   assert.deepEqual(events[events.length - 1], ["removed", gid]);
 });
+
+// A listener that removes itself during dispatch must not cause the NEXT listener to
+// be skipped. Chrome snapshots the listener set before firing; the shim's _emit must
+// iterate a copy, not the live array (splicing under the cursor shifts indices).
+test("tabGroups onCreated: self-removing listener doesn't skip the next one", async () => {
+  const { chrome } = setup();
+  const tg = chrome.tabGroups;
+  const fired = [];
+  const once = (g) => { tg.onCreated.removeListener(once); fired.push(["once", g.id]); };
+  tg.onCreated.addListener(once);
+  tg.onCreated.addListener((g) => fired.push(["second", g.id]));
+
+  const gid = await chrome.tabs.group({ tabIds: [1, 2] });
+  assert.deepEqual(fired, [["once", gid], ["second", gid]], "both listeners fired on first emit");
+
+  fired.length = 0;
+  await chrome.tabs.group({ groupId: gid, tabIds: [3] }); // existing group → no onCreated
+  await chrome.tabs.ungroup([1, 2, 3]);
+  const gid2 = await chrome.tabs.group({ tabIds: [1, 2] }); // new group → onCreated again
+  assert.deepEqual(fired, [["second", gid2]], "only the surviving listener fires the second time");
+});

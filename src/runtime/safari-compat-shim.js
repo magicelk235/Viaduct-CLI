@@ -156,6 +156,12 @@ var __C2S_DEBUG__ = false;
     }
   } catch (e) {}
 
+  // Monotonic suffix for synthesized ids. Date.now() alone collides when two ids are
+  // minted in the same millisecond (two notifications.create / contextMenus.create
+  // back-to-back), and a caller keying a map by id then loses one. Append a counter.
+  var __c2sUid = 0;
+  function uid(prefix) { return (prefix || "") + Date.now() + "-" + (++__c2sUid); }
+
   // Inert event stub so module-eval code that reads .addListener on a missing API does not throw.
   function event() {
     return { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } };
@@ -167,7 +173,11 @@ var __C2S_DEBUG__ = false;
       addListener: function (f) { if (typeof f === "function") ls.push(f); },
       removeListener: function (f) { var i = ls.indexOf(f); if (i >= 0) ls.splice(i, 1); },
       hasListener: function (f) { return ls.indexOf(f) >= 0; },
-      _emit: function () { for (var i = 0; i < ls.length; i++) { try { ls[i].apply(null, arguments); } catch (e) {} } },
+      // Snapshot before dispatch: Chrome dispatches to the listener set as it was
+      // when the event fired, so a listener that removes itself (one-shot pattern)
+      // must not shift the cursor and skip the next listener. Splicing a live array
+      // mid-loop does exactly that.
+      _emit: function () { var snap = ls.slice(); for (var i = 0; i < snap.length; i++) { try { snap[i].apply(null, arguments); } catch (e) {} } },
     };
   }
 
@@ -453,6 +463,11 @@ var __C2S_DEBUG__ = false;
       var name = "";
       try { name = (connectArgs[0] && typeof connectArgs[0] === "object") ? (connectArgs[0].name || "") : (typeof connectArgs[0] === "string" ? connectArgs[0] : ""); } catch (e) {}
       function wireReal(p) {
+        // The proxy was disconnected before the real port arrived (popup opened then
+        // closed before the bg woke). Don't keep the just-connected port — it'd be an
+        // orphan the caller can't reach and never tears down. Disconnect and bail so
+        // the bg's onDisconnect fires.
+        if (closed) { try { p.disconnect(); } catch (e) {} return; }
         real = p;
         try { for (var i = 0; i < msgListeners.length; i++) p.onMessage.addListener(msgListeners[i]); } catch (e) {}
         try { for (var j = 0; j < discListeners.length; j++) p.onDisconnect.addListener(discListeners[j]); } catch (e) {}
@@ -497,7 +512,11 @@ var __C2S_DEBUG__ = false;
         // The "no onConnect listeners" throw → background asleep. Return a proxy that
         // wakes it and connects for real. Any other error: re-throw (real bug).
         var msg = (e && e.message) ? e.message : "";
-        if (/onConnect|disconnected|not? *found|listener/i.test(msg)) return makeProxyPort(args);
+        // Match only the "no onConnect listeners / receiving end" family that means the
+        // background is asleep. The prior pattern (`not? *found|listener`) also matched
+        // unrelated errors like "addListener is not a function", swallowing a real bug
+        // into an infinite proxy-retry instead of surfacing it.
+        if (/onConnect|receiving end|message port closed|could not establish/i.test(msg)) return makeProxyPort(args);
         throw e;
       }
     }
@@ -788,7 +807,7 @@ var __C2S_DEBUG__ = false;
           new Notification(opts.title || "", { body: opts.message || "", icon: opts.iconUrl });
         }
       } catch (e) { /* ignore */ }
-      var nid = typeof id === "string" && id ? id : "c2s-" + Date.now();
+      var nid = typeof id === "string" && id ? id : uid("c2s-");
       // Chrome completes via the callback OR the promise, never both. Match that:
       // return early once the callback path is taken.
       if (typeof cb === "function") { cb(nid); return; }
@@ -832,7 +851,9 @@ var __C2S_DEBUG__ = false;
         addListener: function (f) { if (ls.indexOf(f) < 0) ls.push(f); },
         removeListener: function (f) { var i = ls.indexOf(f); if (i >= 0) ls.splice(i, 1); },
         hasListener: function (f) { return ls.indexOf(f) >= 0; },
-        __emit: function () { var a = arguments; for (var i = 0; i < ls.length; i++) { try { ls[i].apply(null, a); } catch (e) {} } },
+        // Snapshot before dispatch (see _emit in eventList): a self-removing listener
+        // must not shift the cursor and skip the next one.
+        __emit: function () { var a = arguments, snap = ls.slice(); for (var i = 0; i < snap.length; i++) { try { snap[i].apply(null, a); } catch (e) {} } },
       };
     };
 
@@ -1845,7 +1866,7 @@ var __C2S_DEBUG__ = false;
         addListener: function (f) { if (typeof f === "function") ls.push(f); },
         removeListener: function (f) { var i = ls.indexOf(f); if (i >= 0) ls.splice(i, 1); },
         hasListener: function (f) { return ls.indexOf(f) >= 0; },
-        _emit: function () { var a = arguments; for (var i = 0; i < ls.length; i++) { try { ls[i].apply(null, a); } catch (e) {} } } }; };
+        _emit: function () { var a = arguments, snap = ls.slice(); for (var i = 0; i < snap.length; i++) { try { snap[i].apply(null, a); } catch (e) {} } } }; };
       var onCreated = bmEvent(), onRemoved = bmEvent(), onChanged = bmEvent(), onMoved = bmEvent();
       var seed = function () {
         nodes = {
@@ -2069,7 +2090,7 @@ var __C2S_DEBUG__ = false;
     fill(chrome.contextMenus, {
       ContextType: { ALL: "all", PAGE: "page", SELECTION: "selection", LINK: "link", IMAGE: "image", VIDEO: "video", AUDIO: "audio", FRAME: "frame", EDITABLE: "editable", ACTION: "action" },
       ItemType: { NORMAL: "normal", CHECKBOX: "checkbox", RADIO: "radio", SEPARATOR: "separator" },
-      create: function (props, cb) { if (typeof cb === "function") { try { cb(); } catch (e) {} } return (props && props.id) || Date.now(); },
+      create: function (props, cb) { if (typeof cb === "function") { try { cb(); } catch (e) {} } return (props && props.id) || uid(); },
       update: function (id, props, cb) { return dual(undefined, cb); },
       remove: function (id, cb) { return dual(undefined, cb); },
       removeAll: function (cb) { return dual(undefined, cb); },
@@ -2275,7 +2296,9 @@ var __C2S_DEBUG__ = false;
       };
       var save = function () { try { if (chrome.storage && chrome.storage.local) { var b = {}; b[KEY] = cache; chrome.storage.local.set(b); } } catch (e) {} };
       var run = function (fn, cb) {
-        if (typeof cb === "function") { ensure(function () { try { cb(fn()); } catch (e) { cb(undefined); } }); return undefined; }
+        // Guard only fn(), not cb(): wrapping cb in the try means a throw *inside* the
+        // user callback re-invokes it with undefined — a double callback Chrome never does.
+        if (typeof cb === "function") { ensure(function () { var v; try { v = fn(); } catch (e) { v = undefined; } cb(v); }); return undefined; }
         return new Promise(function (res) { ensure(function () { res(fn()); }); });
       };
       fill(chrome.instanceID, {

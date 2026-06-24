@@ -26,9 +26,12 @@ function pkgVersion(): string {
 }
 
 // Apple bundle ids are reverse-DNS: dot-separated segments of letters, digits and
-// hyphens. No spaces, underscores, leading/trailing/empty dots. Xcode silently
-// fails the build on an invalid id, so reject it up front with a clear message.
-const BUNDLE_ID_RE = /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/;
+// hyphens. No spaces, underscores, leading/trailing/empty dots. A segment that
+// starts with a digit is rejected by parts of Apple's toolchain (defaultBundleId
+// strips leading digits for exactly this reason) — so require each segment to
+// start with a letter, keeping the manual --bundle-id path as strict as the auto
+// one. Xcode silently fails the build on an invalid id, so reject it up front.
+const BUNDLE_ID_RE = /^[A-Za-z][A-Za-z0-9-]*(\.[A-Za-z][A-Za-z0-9-]*)+$/;
 
 // Apple version strings are 1–3 dot-separated non-negative integers.
 const SAFARI_VERSION_RE = /^\d+(\.\d+){0,2}$/;
