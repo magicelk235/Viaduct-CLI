@@ -1640,6 +1640,24 @@ var __C2S_DEBUG__ = false;
         onChanged: event(),
       });
     }
+    // Safari (16.4+) SHIPS chrome.storage.session, but WITHOUT setAccessLevel — that's
+    // a Chrome-MV3-only API (it controls content-script visibility of session storage).
+    // The block above only runs when session is wholly ABSENT, so on Safari the real
+    // session object survives with setAccessLevel === undefined. Grammarly's bootstrap
+    // does `await session.setAccessLevel(...)` through a promise that ONLY settles in
+    // its callback (`(res,rej)=>session.setAccessLevel(lvl, ()=>lastError?rej():res())`).
+    // With the method undefined, the optional-chain call short-circuits, the callback
+    // never fires, the promise NEVER resolves, and there is no timeout on that await —
+    // so background init hangs before it registers its message listeners, and every
+    // popup→bg RPC queues forever (popup stuck "starting…", bg posts no replies). Add a
+    // no-op setAccessLevel that honors the callback/promise contract. The native session
+    // may be frozen, so go through mutableNamespace to get an extensible clone (it keeps
+    // the real get/set/remove bound) before attaching. Generic: any extension that awaits
+    // session.setAccessLevel on Safari would otherwise hang the same way.
+    var sess = stg ? mutableNamespace(stg, "session") : null;
+    if (sess && typeof sess.setAccessLevel !== "function") {
+      setIfMissing(sess, "setAccessLevel", function (o, cb) { return dual(undefined, cb); });
+    }
     // storage.managed — no MDM-policy surface; reads come back empty. Grammarly
     // blocks popup init waiting on managed.get; if it's undefined Grammarly times out.
     if (stg && !stg.managed) {
@@ -1652,10 +1670,23 @@ var __C2S_DEBUG__ = false;
     // Mirror managed onto the RESOLVED namespace too: Tampermonkey/Grammarly read
     // browser.storage.managed.get (the native namespace, distinct from chrome here),
     // which Safari omits → "undefined is not an object". Patch api.storage.managed
-    // when it differs from the chrome one we just stubbed.
-    if (api.storage && stg && api.storage !== stg && !api.storage.managed) {
+    // when it differs from the chrome one we just stubbed. Also patch session: if the
+    // resolved namespace has no session, adopt the chrome one; if it HAS a (native)
+    // session lacking setAccessLevel, backfill that method so a `browser.storage.session
+    // .setAccessLevel(...)` await can't hang init either (same root as above).
+    if (api.storage && stg && api.storage !== stg) {
       var apiStg = mutableNamespace(api, "storage");
-      if (apiStg) { setIfMissing(apiStg, "managed", stg.managed); setIfMissing(apiStg, "session", stg.session); }
+      if (apiStg) {
+        if (!apiStg.managed) setIfMissing(apiStg, "managed", stg.managed);
+        if (!apiStg.session) {
+          setIfMissing(apiStg, "session", sess || stg.session);
+        } else {
+          var apiSess = mutableNamespace(apiStg, "session");
+          if (apiSess && typeof apiSess.setAccessLevel !== "function") {
+            setIfMissing(apiSess, "setAccessLevel", function (o, cb) { return dual(undefined, cb); });
+          }
+        }
+      }
     }
 
     // chrome.idle — derive state from page visibility where a document exists;
