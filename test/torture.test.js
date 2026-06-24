@@ -18,10 +18,21 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { convert } from "../dist/convert.js";
 import { shimSource, SHIM_FILENAME } from "../dist/runtime/shim.js";
 
 const CHROME_ID = "abcdefghijklmnopabcdefghijklmnop";
+
+// The full pipeline ends by shelling to `xcrun safari-web-extension-packager`. That
+// utility ships with Xcode's Safari toolchain but is absent on some CI runner images
+// (e.g. GitHub's macOS runner with a stripped Xcode) — and when it's missing, convert()
+// reports a blocking failure that has nothing to do with the conversion logic this test
+// exercises. Probe for it so we can skip the success-requires-the-packager assertion
+// there; every other torture test reads result.stagedPath (populated before the
+// packager runs), so the conversion logic stays fully covered either way.
+const PACKAGER_AVAILABLE =
+  spawnSync("xcrun", ["--find", "safari-web-extension-packager"], { encoding: "utf8" }).status === 0;
 
 function buildGnarlyExtension() {
   const dir = mkdtempSync(join(tmpdir(), "torture-ext-"));
@@ -90,13 +101,19 @@ function convertGnarly() {
   return { result, src, out, cleanup: () => { rmSync(src, { recursive: true, force: true }); rmSync(out, { recursive: true, force: true }); } };
 }
 
-test("torture: the whole gnarly extension converts without a blocking error", () => {
+test("torture: the whole gnarly extension converts without a blocking error", (t) => {
   const { result, cleanup } = convertGnarly();
   try {
-    assert.equal(result.success, true, "conversion should succeed");
+    // The conversion-logic invariants — checked regardless of whether the platform
+    // packager is installed.
     assert.equal(result.extensionName, "Torture Test Extension", "i18n name resolved");
     const errors = result.issues.filter((i) => i.severity === "error");
     assert.deepEqual(errors, [], "no blocking errors:\n" + JSON.stringify(errors, null, 2));
+    assert.ok(result.stagedPath, "staging completed");
+    // result.success requires the Apple packager to run. Only assert it where the
+    // utility actually exists; otherwise the failure is the environment, not the code.
+    if (PACKAGER_AVAILABLE) assert.equal(result.success, true, "conversion should succeed");
+    else t.diagnostic("safari-web-extension-packager not found — skipping result.success assertion");
   } finally { cleanup(); }
 });
 
