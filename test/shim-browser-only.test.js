@@ -359,14 +359,28 @@ test("onConnect: sender.url host is lowercased for runtime.id routing, replies s
   const UPPER = "safari-web-extension://C16B51B5-85C1-41D4-A8F6-1C3DAD4D1098";
   const RUNTIME_ID = "c16b51b5-85c1-41d4-a8f6-1c3dad4d1098"; // Safari runtime.id: lowercase uuid
   let captured = null; // the wrapped listener the shim installed
+  // CRITICAL: Safari's native onConnect is an event object whose addListener is
+  // { writable:false, configurable:true } (proven live). A bare `oc.addListener = …`
+  // THROWS in strict mode here, so the shim must use defineProperty to install its
+  // wrapper. Model that exact descriptor — a plain writable method would let a broken
+  // (assignment-only) shim pass while silently failing on real Safari.
+  const nativeEvent = (capture) => {
+    const ev = {};
+    Object.defineProperty(ev, "addListener", {
+      value: capture, writable: false, enumerable: true, configurable: true,
+    });
+    ev.removeListener = () => {};
+    ev.hasListener = () => false;
+    return ev;
+  };
   const chrome = {
     runtime: {
       id: RUNTIME_ID, getManifest: () => ({}),
       getURL: (p) => UPPER + "/" + (p == null ? "" : p),
       connect() { throw new Error("noop"); },
       sendMessage() { return Promise.resolve(); },
-      onConnect: { addListener(fn) { captured = fn; }, removeListener() {}, hasListener() { return false; } },
-      onMessage: { addListener() {}, removeListener() {}, hasListener() { return false; } },
+      onConnect: nativeEvent((fn) => { captured = fn; }),
+      onMessage: nativeEvent(() => {}),
     },
     storage: { local: { get() {}, set() {} }, sync: { get() {} } },
     scripting: {}, tabs: {},
@@ -424,13 +438,22 @@ test("onMessage: sender.url host is lowercased for runtime.id routing (Safari)",
   const UPPER = "safari-web-extension://C16B51B5-85C1-41D4-A8F6-1C3DAD4D1098";
   const RUNTIME_ID = "c16b51b5-85c1-41d4-a8f6-1c3dad4d1098";
   let capturedMsg = null;
+  // Safari native event: addListener non-writable (see onConnect test above). The shim
+  // must defineProperty its wrapper, not assign it.
+  const nativeEvent = (capture) => {
+    const ev = {};
+    Object.defineProperty(ev, "addListener", { value: capture, writable: false, enumerable: true, configurable: true });
+    ev.removeListener = () => {};
+    ev.hasListener = () => false;
+    return ev;
+  };
   const chrome = {
     runtime: {
       id: RUNTIME_ID, getManifest: () => ({}),
       getURL: (p) => UPPER + "/" + (p == null ? "" : p),
       connect() { throw new Error("noop"); }, sendMessage() { return Promise.resolve(); },
-      onConnect: { addListener() {}, removeListener() {}, hasListener() { return false; } },
-      onMessage: { addListener(fn) { capturedMsg = fn; }, removeListener() {}, hasListener() { return false; } },
+      onConnect: nativeEvent(() => {}),
+      onMessage: nativeEvent((fn) => { capturedMsg = fn; }),
     },
     storage: { local: { get() {}, set() {} }, sync: { get() {} } },
     scripting: {}, tabs: {},
