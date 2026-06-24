@@ -123,17 +123,33 @@ var __C2S_DEBUG__ = false;
   if (!api) return;
   // ────────────────────────────────────────────────────────────────────────────
 
-  // navigator.userAgent Chrome-version spoof. Extensions commonly sniff the
-  // Chrome version out of the UA (e.g. /Chrom(e|ium)\/(\d+)\.(\d+)\.(\d+)\.(\d+)/)
-  // to build Web-Store / update URLs or gate behaviour. Safari's UA has no Chrome
-  // token, so that sniff returns undefined and the feature silently dies (the
-  // "Extension Source Downloader" download button is the canonical case). Only
-  // patch when the real UA lacks a Chrome token, and only inside the extension's
-  // own pages/worker (this shim never runs in web content), so we don't lie to
-  // sites or break Safari feature detection. Append a plausible Chrome token to
-  // the genuine UA rather than replacing it.
+  // navigator.userAgent Chrome-version spoof. Websites (and extension code reacting
+  // to the page) commonly sniff the Chrome version out of the UA
+  // (e.g. /Chrom(e|ium)\/(\d+)\.(\d+)\.(\d+)\.(\d+)/) to gate behaviour or build
+  // Web-Store / update URLs. Safari's UA has no Chrome token, so that sniff returns
+  // undefined and the feature silently dies ("Extension Source Downloader" is the
+  // canonical case). Append a plausible Chrome token when the real UA lacks one.
+  //
+  // BUT only in CONTENT-SCRIPT context (a real web page, http/https). The shim is
+  // prepended to content scripts AND to the extension's own pages (popup, options,
+  // background) — and in the extension's own pages a well-built cross-browser
+  // extension detects its host browser FROM THE UA to choose platform-specific code
+  // paths. Lying there makes it run its *Chrome* paths on Safari. Grammarly is the
+  // concrete failure: its background derives bundleInfo.browser from the UA, and
+  // the popup→bg port handshake routes the popup's `safari-web-extension://…` sender
+  // URL through a browser-specific matcher. Spoofed to "chrome", it tests that URL
+  // against a /^chrome-extension:\/\// regex, never matches, drops the port, and the
+  // popup hangs forever waiting on replies that never come. So scope the spoof to
+  // web pages (where it helps) and leave the extension's own pages truthful (where
+  // lying breaks Safari detection). Extension pages are the safari-web-extension: /
+  // chrome-extension: / moz-extension: protocols; content scripts run on http(s).
   try {
-    if (typeof navigator !== "undefined" && navigator.userAgent &&
+    var __isExtPage = false;
+    try {
+      var __proto = (typeof location !== "undefined" && location.protocol) || "";
+      __isExtPage = /^(safari-web-extension|chrome-extension|moz-extension):$/.test(__proto);
+    } catch (e) { __isExtPage = false; }
+    if (!__isExtPage && typeof navigator !== "undefined" && navigator.userAgent &&
         !/Chrom(e|ium)\/\d+\.\d+\.\d+\.\d+/.test(navigator.userAgent)) {
       var __ua = navigator.userAgent + " Chrome/120.0.0.0";
       Object.defineProperty(navigator, "userAgent", { get: function () { return __ua; }, configurable: true });
@@ -507,10 +523,60 @@ var __C2S_DEBUG__ = false;
       }
     } catch (e) {}
   }
+
+  // The SAME UUID case mismatch also breaks port ROUTING (live-proven on Grammarly).
+  // Some backgrounds key the popup/side-panel/devtools port by matching `sender.url`
+  // against a regex built from chrome.runtime.id, e.g.:
+  //   new RegExp(chrome.runtime.id + "/src/popup.html").test(sender.url)
+  // On Safari `chrome.runtime.id` is the LOWERCASE uuid but `sender.url` carries the
+  // UPPERCASE host (safari-web-extension://C16B51B5-…/src/popup.html), so the test
+  // fails → the port is judged "unknown" and never stored in the bg's port table →
+  // the bg posts no reply to the popup's RPCs (posted:0) → every popup-init RPC
+  // (getPageConfig / getExperimentTreatment) times out → "Grammarly is starting…"
+  // hangs forever. fixSenderOrigin can't help: it only touches sender.origin, and the
+  // routing reads sender.url. We also can't mutate sender.url itself — on Safari the
+  // sender is a frozen exotic object with a getter (proven live: assignment +
+  // defineProperty both silently fail). So hand the bundle's listener a shallow CLONE
+  // of the sender whose `url` host is lowercased to match chrome.runtime.id, leaving
+  // the real (frozen) sender untouched. Generic: any extension routing ports by
+  // runtime.id-vs-sender.url is fixed; for others it's a harmless host-case rewrite of
+  // a value that is itself case-insensitive as an origin.
+  function senderWithLoweredUrlHost(sender) {
+    if (!sender) return sender;
+    try {
+      var u = sender.url;
+      if (typeof u !== "string" || !u) return sender;
+      var low = lowerHost(u); // lowercases scheme://host only; keeps the case-sensitive path
+      if (low === u) return sender; // already aligned → no clone needed
+      var clone = Object.create(sender); // inherits every other getter (id, tab, frameId, origin…)
+      try { Object.defineProperty(clone, "url", { value: low, enumerable: true, configurable: true }); }
+      catch (e) { try { clone.url = low; } catch (e2) { return sender; } }
+      return clone;
+    } catch (e) { return sender; }
+  }
+  // A port whose .sender.url host is lowercased, but every method (postMessage,
+  // onMessage, onDisconnect, disconnect) still forwards to the REAL port. Object.create
+  // keeps the prototype chain so inherited methods/getters resolve to the real port;
+  // we override only `sender`. (The bg replies via this same port object, so its
+  // postMessage MUST remain the native one — Object.create guarantees that.)
+  function portWithLoweredSenderUrl(port) {
+    if (!port) return port;
+    try {
+      var s = port.sender;
+      var s2 = senderWithLoweredUrlHost(s);
+      if (s2 === s) return port; // nothing to change
+      var clone = Object.create(port);
+      try { Object.defineProperty(clone, "sender", { value: s2, enumerable: true, configurable: true }); }
+      catch (e) { try { clone.sender = s2; } catch (e2) { return port; } }
+      return clone;
+    } catch (e) { return port; }
+  }
   function wrapOnConnect(rt) {
     if (!rt || rt.__c2sOnConnect) return;
+    // canon (for the origin-equality fix) is best-effort; the sender.url ROUTING fix
+    // below doesn't need it, so don't bail when getURL("") is momentarily empty —
+    // that would skip the routing fix that actually unblocks the popup.
     var canon = canonicalOrigin(rt);
-    if (!canon) return;
     var oc = rt.onConnect;
     if (!oc || typeof oc.addListener !== "function" || oc.__c2sWrapped) return;
     var nativeAdd = oc.addListener.bind(oc);
@@ -518,7 +584,14 @@ var __C2S_DEBUG__ = false;
       if (typeof fn !== "function") return nativeAdd(fn);
       return nativeAdd(function (port) {
         try { if (port) fixSenderOrigin(port.sender, canon); } catch (e) {}
-        return fn.apply(this, arguments);
+        // Route-by-sender.url fix: give the bundle a port clone whose sender.url host
+        // is lowercased to match chrome.runtime.id, so runtime.id-based port routing
+        // recognizes the popup/panel and the bg can post replies back. The clone
+        // forwards postMessage/onMessage to the real port (Object.create), so replies
+        // still reach the popup.
+        var p = port;
+        try { p = portWithLoweredSenderUrl(port); } catch (e) { p = port; }
+        return fn.call(this, p);
       });
     };
     // Same mismatch hits onMessage-based privileged checks.
@@ -529,7 +602,12 @@ var __C2S_DEBUG__ = false;
         if (typeof fn !== "function") return nativeAddM(fn);
         return nativeAddM(function (msg, sender, reply) {
           try { fixSenderOrigin(sender, canon); } catch (e) {}
-          return fn.apply(this, arguments);
+          // Same route-by-sender.url fix for one-shot messages: hand the bundle a
+          // sender clone with a lowercased url host (some backgrounds run the same
+          // runtime.id-vs-sender.url match on onMessage senders).
+          var s = sender;
+          try { s = senderWithLoweredUrlHost(sender); } catch (e) { s = sender; }
+          return fn.call(this, msg, s, reply);
         });
       };
       try { om.__c2sWrapped = true; } catch (e) {}
