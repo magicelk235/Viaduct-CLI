@@ -8,6 +8,7 @@ var __C2S_DEBUG__ = false;
   var api = typeof browser !== "undefined" ? browser : (typeof chrome !== "undefined" ? chrome : null);
   if (!api) return;
 
+
   // Publish a global `chrome` aliased to `browser` BEFORE anything else. Safari
   // exposes `browser` in extension pages/content scripts/background, but `chrome`
   // is frequently absent (it is not guaranteed, and browser-polyfill's aliasing
@@ -161,6 +162,33 @@ var __C2S_DEBUG__ = false;
   // back-to-back), and a caller keying a map by id then loses one. Append a counter.
   var __c2sUid = 0;
   function uid(prefix) { return (prefix || "") + Date.now() + "-" + (++__c2sUid); }
+
+  // Popover open/closed flag, shared between the bg (sidePanel.open toggle) and the
+  // popover doc (marks open on load / closed on pagehide). Kept in storage.session so
+  // it survives the bg service worker suspending between shortcut presses (a module
+  // var would reset to "closed" and re-open instead of toggling). Both helpers no-op
+  // when storage.session is absent (Safari < 16.4), degrading to open-only.
+  var C2S_PANEL_OPEN_KEY = "__c2sPanelOpen";
+  function c2sSession() {
+    try { return (typeof chrome !== "undefined" && chrome.storage && chrome.storage.session) || null; } catch (e) { return null; }
+  }
+  function c2sGetPanelOpen() {
+    return new Promise(function (resolve) {
+      var ss = c2sSession();
+      if (!ss || typeof ss.get !== "function") { resolve(false); return; }
+      var done = function (o) { resolve(!!(o && o[C2S_PANEL_OPEN_KEY])); };
+      try {
+        var r = ss.get(C2S_PANEL_OPEN_KEY, done);
+        if (r && typeof r.then === "function") r.then(done, function () { resolve(false); });
+      } catch (e) { resolve(false); }
+    });
+  }
+  function c2sSetPanelOpen(v) {
+    var ss = c2sSession();
+    if (!ss || typeof ss.set !== "function") return;
+    var o = {}; o[C2S_PANEL_OPEN_KEY] = !!v;
+    try { var r = ss.set(o); if (r && typeof r.then === "function") r.catch(function () {}); } catch (e) {}
+  }
 
   // Inert event stub so module-eval code that reads .addListener on a missing API does not throw.
   function event() {
@@ -767,24 +795,39 @@ var __C2S_DEBUG__ = false;
       open: function (opts) {
         rememberPath(opts);
         // The panel HTML is wired as Safari's action popover (default_popup). A
-        // command/shortcut handler that calls sidePanel.open() means "show me the
-        // panel" — open the popover, not a tab. Safari 17.4+ exposes
-        // action.openPopup() for exactly this. Only fall back to a tab when the
-        // popover can't be opened (older Safari, or openPopup rejects because no
-        // window is focused). ponytail: tab fallback is the known-bad path the
-        // shortcut used to always take.
-        if (chrome.action && typeof chrome.action.openPopup === "function") {
+        // command/shortcut handler that calls sidePanel.open() means "toggle the
+        // panel". Safari has no action.closePopup and no popover-state query, and its
+        // port.onDisconnect doesn't fire on popover close, so we toggle cooperatively
+        // with the popover doc (see the panel-doc side below): a shared storage.session
+        // flag tracks open/closed; closed → action.openPopup() (Safari 17.4+) shows it;
+        // open → broadcast {__c2sClosePanel} so the popover window.close()s itself.
+        // Fall back to a tab only when openPopup is wholly absent (older Safari).
+        var canPopover = chrome.action && typeof chrome.action.openPopup === "function";
+        if (!canPopover) {
+          return chrome.tabs.create({ url: chrome.runtime.getURL(panelPath) });
+        }
+        return c2sGetPanelOpen().then(function (isOpen) {
+          if (isOpen) {
+            // Already open → close it. Tell the popover doc to self-close; clear the
+            // flag optimistically (the doc's pagehide will also clear it).
+            try {
+              var m = chrome.runtime && chrome.runtime.sendMessage;
+              if (m) { var r = chrome.runtime.sendMessage({ __c2sClosePanel: true }); if (r && typeof r.then === "function") r.catch(function () {}); }
+            } catch (e) {}
+            c2sSetPanelOpen(false);
+            return;
+          }
+          // Closed → open it. The popover doc marks the flag open on load; also set it
+          // here so a rapid second press toggles even before the doc's load fires.
           try {
             var p = chrome.action.openPopup();
-            if (p && typeof p.then === "function") {
-              return p.catch(function () {
-                return chrome.tabs.create({ url: chrome.runtime.getURL(panelPath) });
-              });
-            }
+            c2sSetPanelOpen(true);
+            // A reject here ("no gesture"/already-open race) must NOT spawn a tab —
+            // re-pressing is a no-op. Roll back the flag so state stays truthful.
+            if (p && typeof p.then === "function") return p.catch(function () { c2sSetPanelOpen(false); });
             return Promise.resolve(p);
-          } catch (e) {}
-        }
-        return chrome.tabs.create({ url: chrome.runtime.getURL(panelPath) });
+          } catch (e) { c2sSetPanelOpen(false); return Promise.resolve(); }
+        });
       },
       setOptions: function (opts) { rememberPath(opts); return Promise.resolve(); },
       getOptions: function () { return Promise.resolve({ path: panelPath, enabled: true }); },
@@ -1491,6 +1534,52 @@ var __C2S_DEBUG__ = false;
       if (typeof cb === "function") { try { cb(value); } catch (e) {} return; }
       return Promise.resolve(value);
     };
+
+    // chrome.action badge/title/icon setters REJECT on Safari with "Tab not found"
+    // when called from the background with a tabId that no longer maps to a live tab
+    // (or, for some Safari builds, any tabId at all). On Chrome these are no-ops/global
+    // updates and never reject. The danger: a bundle that does
+    // `await chrome.action.setBadgeText({text, tabId})` in its init chain (Honey,
+    // h0.js) has that promise reject → an UNHANDLED REJECTION aborts the init chain →
+    // later message handlers (Honey's stores:action) never register → the popup's
+    // request finds no listener → blank popup (live-proven). A badge update failing is
+    // cosmetic and must NEVER break init. Wrap the setters so a "tab not found" reject
+    // is swallowed (resolve undefined); retry tabId-less first so the global badge
+    // still updates when only the per-tab call was rejected.
+    if (chrome.action) {
+      var TAB_GONE_RE = /tab not found|no tab|invalid tab/i;
+      var wrapActionSetter = function (name) {
+        var orig = chrome.action[name];
+        if (typeof orig !== "function" || chrome.action["__c2s_" + name]) return;
+        chrome.action["__c2s_" + name] = true;
+        chrome.action[name] = function (details, cb) {
+          var self = this;
+          var call = function (d) {
+            try {
+              var r = orig.call(self, d);
+              return (r && typeof r.then === "function") ? r : Promise.resolve(r);
+            } catch (e) { return Promise.reject(e); }
+          };
+          var p = call(details).catch(function (err) {
+            // Per-tab call rejected because the tab is gone: retry without tabId so the
+            // global badge/title still updates; if THAT also rejects, give up quietly.
+            if (details && "tabId" in details && err && TAB_GONE_RE.test(String(err && err.message || err))) {
+              var d2 = Object.assign({}, details); delete d2.tabId;
+              return call(d2).catch(function () {});
+            }
+            // Any other reject (incl. tabId-less "tab not found"): swallow — a badge
+            // failure must not surface as an unhandled rejection that kills init.
+            return undefined;
+          });
+          if (typeof cb === "function") { p.then(function (v) { try { cb(v); } catch (e) {} }); return; }
+          return p;
+        };
+      };
+      wrapActionSetter("setBadgeText");
+      wrapActionSetter("setBadgeBackgroundColor");
+      wrapActionSetter("setTitle");
+      wrapActionSetter("setIcon");
+    }
 
     // MV2 aliases: browserAction/pageAction code running on an MV3/Safari manifest.
     // Point both at chrome.action so setBadgeText/setIcon/onClicked keep working.
@@ -2920,6 +3009,29 @@ var __C2S_DEBUG__ = false;
         // deliberately do NOT monkeypatch URLSearchParams.prototype.get — doing so
         // would clobber a native method for every instance in the document, feeding
         // unrelated app code the injected tabId.
+      }
+    } catch (e) { /* ignore */ }
+
+    // Popover-toggle, panel-doc side (pairs with sidePanel.open's bg side above, using
+    // the shared c2sSetPanelOpen flag). Mark the flag OPEN on load and CLOSED on
+    // pagehide (covers the user dismissing via the icon/click-away — Safari's
+    // port.onDisconnect won't tell the bg), and self-close when the bg broadcasts
+    // {__c2sClosePanel} on a toggle re-press. NOT { once:true } on pagehide: a doc
+    // restored from bfcache shows again, and the flag must re-track each visibility.
+    try {
+      c2sSetPanelOpen(true);
+      window.addEventListener("pagehide", function () { c2sSetPanelOpen(false); });
+      window.addEventListener("pageshow", function () { c2sSetPanelOpen(true); });
+      if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.onMessage &&
+          typeof chrome.runtime.onMessage.addListener === "function") {
+        chrome.runtime.onMessage.addListener(function (msg) {
+          if (msg && msg.__c2sClosePanel === true) {
+            c2sSetPanelOpen(false);
+            // window.close() is blocked after history.pushState (DOMWindow::canClose);
+            // our panel doc uses replaceState only, so this is safe here.
+            try { window.close(); } catch (e) {}
+          }
+        });
       }
     } catch (e) { /* ignore */ }
   }
