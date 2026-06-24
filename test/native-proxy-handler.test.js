@@ -25,6 +25,16 @@ test("native proxy handler: clean hosts/origin are written into the Swift litera
   assert.match(out, /static let chromeOrigin = "chrome-extension:\/\/abc"/);
 });
 
+test("native proxy handler: forwarded Cookie header isn't clobbered by URLSession's empty jar", () => {
+  // The shim sends the authenticated Cookie (from chrome.cookies, httpOnly
+  // included). URLSession's shared storage is empty in the appex; if it were
+  // allowed to manage cookies it would strip/replace our header → backend 401.
+  const out = generate("chrome-extension://abc", ["auth.grammarly.com"]);
+  assert.match(out, /req\.setValue\(cookie, forHTTPHeaderField: "Cookie"\)/, "explicit Cookie header set");
+  assert.match(out, /req\.httpShouldHandleCookies = false/, "request won't auto-apply jar cookies");
+  assert.match(out, /cfg\.httpShouldSetCookies = false/, "session won't inject jar cookies");
+});
+
 test("native proxy handler: a host with quote/backslash/newline can't break or inject the Swift literal", () => {
   // A malformed/hostile manifest can yield a host carrying these chars; stripping
   // only `"` would leave a backslash or newline that breaks the string literal.

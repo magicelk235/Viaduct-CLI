@@ -1,11 +1,12 @@
 # Grammarly — Safari conversion test report
 
-**Status: ⚠️ PARTIAL.** Background page no longer crashes (a Safari-specific
-`chrome.cookies.onChanged` null-event crash is fixed). The popup still does not
-finish initializing — but the remaining blocker is **Grammarly-internal** (its
-popup-init RPC handshake + a network "treatments"/experiments fetch), not a
-converter gap. Live-traced this session: the converter delivers everything
-faithfully; Grammarly's own backend/auth flow is what stalls.
+**Status: ⚠️ AUTH FIX LANDED (retest pending).** Two converter bugs were fixed
+this round: (1) a Safari-specific `chrome.cookies.onChanged` null-event crash that
+took down the background page, and (2) — the popup blocker — the native-host
+auth **proxy could not carry Grammarly's httpOnly session cookie**, so every
+authenticated request stayed `401 user_not_authorized` and the popup never left
+"Grammarly is starting…". The proxy now sources cookies from `chrome.cookies`
+(Safari's real jar, httpOnly included) instead of `document.cookie`.
 
 Source: `test extensions/Grammarly.zip` (MV3, service worker → background page).
 Bundle id: `com.viaduct.GrammarlyAIWritingAssistantandGrammarCheckerApp`.
@@ -16,83 +17,95 @@ background page), content scripts that inject the editor overlay into web text f
 and a popup. Uses managed storage (enterprise config), an identity/OAuth bridge,
 telemetry, and `runtime` messaging between popup, content scripts, and background.
 The popup talks to the background over a long-lived `runtime.connect` port named
-`message:to-priv` (the "to privileged" background message bus).
+`message:to-priv` (the "to privileged" background message bus). Auth is **cookie-
+based**: the `grauth` session cookie (httpOnly) is sent with `credentials:"include"`
+to `auth.grammarly.com` / `*.grammarly.com` endpoints (`/v5/api/userinfo`, the
+treatments/experiments service, etc.).
 
 ## The problem (as seen live)
-Popup shows "Loading Grammarly", then:
+Popup shows "Grammarly is starting…" forever. Background logs `experiments updated`
+(bg init completes after the cookie-crash fix), but the popup's init chain dies on:
 ```
 grm WARN  [universal.popup] Experiments fetch failed, continuing without: "Promise timed out."
 grm ERROR [universal.popup] Popup initialization attempt 1/2 failed: "Timeout has occurred"
-grm ERROR [universal.popup] All initialization attempts failed, giving up
 grm WARN  [lib.tracking.call.transport] tracking call timeout — "timeout call through bg page"
 ```
-And earlier, the fatal one in the **background** page:
+Live probes from the bg console isolated the true cause:
 ```
-TypeError: Cannot destructure property 'cookie' from null or undefined  (Grammarly-bg.js)
-[idpoly] GLOBAL ERROR
-grm ERROR [lib.tracking.telemetry] bg.unhandledException
+C2S_COOKIES  10            ← chrome.cookies.getAll DOES see 10 grammarly cookies
+C2S_AUTH     405 type:basic ← network to auth.grammarly.com works (real CORS response)
+C2S_USERINFO 401 {"error":"user_not_authorized"}  ← the authenticated call is rejected
 ```
 
-## The process (how it was diagnosed)
-Diagnosed entirely from the **background-page console** (the popup relay is
-unreliable) using live spy listeners, link by link:
+## Root cause (traced link by link)
+The session cookie was never reaching the backend — by **two** compounding paths,
+both converter-relevant:
 
-1. **bg was crashing at init.** `Cannot destructure property 'cookie'`. Located the
-   offset in `Grammarly-bg.js`: a `chrome.cookies.onChanged` listener doing
-   `const {cookie, cause} = changeInfo`. **Safari fires `onChanged` with a NULL
-   changeInfo**, so the destructure throws; unhandled in the bg page it takes down
-   the whole background → every popup RPC then times out. (Reproduced in Node first:
-   `const {cookie}=null` → `TypeError`.)
-2. After the cookie fix, **bg stays alive**. Re-traced the popup handshake:
-   - `connect`/`onConnect`/`onMessage` all wrapped, `browser === chrome`. ✓
-   - Spied `onConnect`: popup opens a **port** `message:to-priv`, `sender.origin` is
-     the **lowercase** UUID (the getURL host-lowercasing fix is working). ✓
-   - Spied the port: popup sends **18 RPCs** (`cs-to-bg-rpc-…`); bg **`posted:0`** —
-     never replies on the port.
-   - Spied port lifecycle: **3 connects, 0 disconnects** — the ports stay alive. So
-     it's *not* a Safari port-lifecycle/disconnect race; bg simply generates no reply.
-   - `chrome.storage.managed.get(...)` was suspected (bg logs "Manage storage
-     timeout") but live probe showed it **resolves `{}` and calls back** — not the
-     blocker; Grammarly's own managed wrapper logs its own timeout elsewhere.
+1. **Direct in-browser fetch** (`credentials:"include"`): Safari treats the
+   `safari-web-extension://<uuid>` origin as **third-party** to `grammarly.com`, so
+   ITP strips the site cookies from the request → backend answers `401
+   user_not_authorized`. (Platform behavior — but the converter already has a
+   recovery path for exactly this: the native-host proxy.)
 
-Conclusion from the trace: the converter side is clean (ports connect, stay open,
-messages delivered, origin privileged). What fails is **Grammarly's RPC dispatcher
-not answering the popup's init RPCs**, alongside `popupFetchTreatmentsFails:
-"Promise timed out"` — a **network** experiments/treatments fetch that depends on
-Grammarly's backend/auth (session cookie / network context) under Safari.
+2. **The native-host proxy retry** (the recovery) **was also failing auth.** On a
+   401/403 (or a hard CORS block) the shim retries the request out-of-process
+   through the Swift `SafariWebExtensionHandler`, which can set the real Chrome
+   `Origin` and isn't subject to CORS. But it built the forwarded `Cookie` header
+   from **`document.cookie`** — and a session cookie like `grauth` is **httpOnly**,
+   so it is *invisible* to `document.cookie`. The proxy therefore retried **without
+   the session cookie** and got the same 401. The recovery never recovered.
+
+The asymmetry that unlocks the fix: **`chrome.cookies` reads Safari's real cookie
+jar, httpOnly cookies included** — proven live (`C2S_COOKIES 10` returned the
+grammarly cookies). `document.cookie` cannot. The proxy was simply reading from the
+wrong source.
 
 ## The solution (converter-side fix that landed)
-**`chrome.cookies.onChanged` null-event guard** (`safari-compat-shim.js`). Safari
-exposes `chrome.cookies.onChanged` but emits a **null** changeInfo. `fill()`
-no-clobbers, so the inert stub was skipped and the broken native event survived.
-The shim now wraps `onChanged.addListener` to **drop null/undefined events** before
-they reach the listener, so a `const {cookie} = changeInfo` listener never throws.
-This is a **general fix**: any converted extension whose background listens on
-`cookies.onChanged` would otherwise crash its background page on Safari.
-Regression covered in `test/emulated-apis.test.js`
-("cookies.onChanged: null events are swallowed, real events pass through").
+**Source the proxy's Cookie header from `chrome.cookies`, not `document.cookie`**
+(`safari-compat-shim.js`). New `gatherCookieHeader(url)`:
+`chrome.cookies.getAll({url})` → `name=value; …` (httpOnly included), falling back
+to `document.cookie` only when the cookies API is unavailable. `proxyFetch` awaits
+it before posting to the native host. Works from both the popup and the bg page
+(both hold the `cookies` permission).
 
-Shared fixes from earlier rounds that also apply (and were re-confirmed live):
-shim survives frozen Safari roots; `runtime.connect` wake-proxy; `getURL` host
-lowercased so privileged-origin checks pass; managed-storage stub resolves empty.
+**Stop URLSession from clobbering the forwarded cookie** (`packager.ts`, the
+generated Swift proxy handler). The appex's `HTTPCookieStorage.shared` is empty
+(it does not share Safari's browser jar); if URLSession were allowed to manage
+cookies it would strip/replace our explicit, authenticated `Cookie` header. Set
+`req.httpShouldHandleCookies = false` and `cfg.httpShouldSetCookies = false`
+(`httpCookieAcceptPolicy = .never`) so the header we built from `chrome.cookies`
+is what actually goes on the wire.
 
-## What's left — NOT shim-fixable (Grammarly-internal)
-- **Popup init RPC handshake unanswered.** bg receives the popup's port RPCs but
-  posts no reply. The reply path is gated by Grammarly's own dispatcher/init, which
-  is stalled — not by the converter (ports are connected, privileged, and alive).
-- **`popupFetchTreatmentsFails` / "Experiments fetch failed: Promise timed out".**
-  A network fetch of Grammarly's feature-flag "treatments" times out; the popup's
-  init chain depends on it. This is a Grammarly backend/auth/network dependency
-  (likely a missing session cookie or network context in the Safari extension),
-  same class as Bitwarden's WASM-SDK blocker — document, don't chase.
-- **`cookie from null` is fixed**; the remaining `[idpoly] GLOBAL ERROR` and
-  `User institution id is not defined` are Grammarly-internal init/identity state,
-  not converter throws.
-- **Font CSP refusals** (`Refused to load … .woff2`): cosmetic; fallback fonts render.
+This is **general**: any converted extension whose backend authenticates via an
+httpOnly cookie (the common case) hit the same dead end — the proxy retry could
+never carry the session. Now it can.
+
+Regression coverage:
+- `test/proxy.test.js` — "proxy cookie sourcing: httpOnly cookie from
+  chrome.cookies lands in the header" (+ updated proxy-hardening assertions).
+- `test/native-proxy-handler.test.js` — "forwarded Cookie header isn't clobbered
+  by URLSession's empty jar".
+
+Shared fixes from earlier rounds that also apply (re-confirmed live): shim survives
+frozen Safari roots; `runtime.connect` wake-proxy; `getURL` host lowercased for
+origin checks only (resource paths keep real case); managed-storage stub resolves
+empty; `cookies.onChanged` null-event guard; `connect-src 'self'` injection.
+
+## What's left
+- **Retest in Safari** with the new build: confirm `C2S_USERINFO` flips from `401`
+  to `200` (cookie now carried via the proxy) and the popup completes init. The
+  reinstall cycle matters — verify the new shim + Swift handler reached the
+  installed `.appex` before retesting.
+- **Residual platform risk (not converter):** if `auth.grammarly.com` additionally
+  requires a CSRF token bound to the session, or otherwise rejects the spoofed-
+  Origin server-side request, that is a backend policy beyond the converter. The
+  *cookie-not-carried* root cause — the thing that made auth structurally
+  impossible — is fixed.
+- Font CSP refusals (`Refused to load … .woff2`): cosmetic; fallback fonts render.
 
 ## Verdict
-Converter side is done for Grammarly: the bg-killing `cookies.onChanged` crash is
-fixed, and the popup port connects, is privileged, stays alive, and delivers its
-messages. The popup still can't finish init because Grammarly's own RPC/treatments
-flow doesn't complete under Safari — an extension/backend limitation, not a
-converter bug.
+The converter bug that blocked Grammarly's popup is identified and fixed: the
+native-host auth proxy now carries the httpOnly session cookie (read via
+`chrome.cookies`) instead of dropping it, and the Swift handler no longer lets an
+empty URLSession jar overwrite it. Pending a Safari retest to confirm the popup
+finishes init end-to-end.
