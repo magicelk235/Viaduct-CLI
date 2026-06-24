@@ -402,14 +402,45 @@ var __C2S_DEBUG__ = false;
       try { Object.defineProperty(rt, "getURL", { value: wrapped, writable: true, configurable: true }); rt.__c2sGetURL = true; } catch (e2) {}
     }
   }
+  // Safari's `chrome.runtime.id` is the App-Extension BUNDLE id (e.g.
+  // "com.viaduct.Foo.Extension (TEAMID)") — NOT the per-install UUID that appears as the
+  // host of getURL()/sender.url (e.g. "safari-web-extension://<uuid>/…"). On Chrome the
+  // two are identical, and bundles rely on that: they route the popup/side-panel/devtools
+  // port by `new RegExp(chrome.runtime.id + "/src/popup.html").test(sender.url)` (Grammarly
+  // Oa/xa/Pa). On Safari that regex can NEVER match — the id is the bundle id while the url
+  // host is the UUID (and the bundle id even contains regex metachars: spaces, parens). So
+  // the popup port is judged "unknown", never stored, and the bg posts no reply → the
+  // popup's getPageConfig RPC never resolves → "Grammarly is starting…" hangs forever.
+  // Restore Chrome's invariant: override runtime.id to the UUID taken from getURL("")'s
+  // host (lowercased — patchGetURL already lowercases the root-arg host, and the companion
+  // wrapOnConnect fix lowercases sender.url's host, so both sides of the regex agree).
+  // No-op if the host can't be derived; never throws.
+  function uuidFromGetURL(rt) {
+    try {
+      var u = (typeof rt.getURL === "function") ? rt.getURL("") : "";
+      var m = /^(?:safari-web-extension|chrome-extension|moz-extension):\/\/([^/]+)/i.exec(u || "");
+      return m ? m[1] : "";
+    } catch (e) { return ""; }
+  }
+  function patchRuntimeId(rt) {
+    if (!rt || rt.__c2sId) return;
+    var uuid = uuidFromGetURL(rt);
+    if (!uuid) return; // can't derive — leave native id untouched
+    var cur; try { cur = rt.id; } catch (e) { cur = undefined; }
+    if (cur === uuid) { rt.__c2sId = true; return; } // already the UUID (real Chrome / future Safari)
+    var took = false;
+    try { rt.id = uuid; took = (rt.id === uuid); } catch (e) {}
+    if (!took) { try { Object.defineProperty(rt, "id", { value: uuid, writable: true, configurable: true, enumerable: true }); took = (rt.id === uuid); } catch (e) {} }
+    if (took) rt.__c2sId = true;
+  }
   // A FROZEN Safari chrome.runtime blocks the getURL wrap (assignment + defineProperty
   // both fail on a frozen object), so getURL("") keeps returning ""/undefined and
   // uBlock's vAPI.getURL("").slice crashes. Swap in a mutable runtime clone (native
   // methods stay bound to the original) so the wrap lands. Then re-run the runtime
   // event/enum backfill on the now-mutable namespace too.
-  if (hasChrome) { var __crt = mutableNamespace(chrome, "runtime"); patchGetURL(__crt); backfillRuntimeEvents(__crt); }
-  if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) { var __brt = mutableNamespace(browser, "runtime"); patchGetURL(__brt); backfillRuntimeEvents(__brt); }
-  if (api && api !== __browser && !(hasChrome && api === chrome)) { var __art = mutableNamespace(api, "runtime"); patchGetURL(__art); backfillRuntimeEvents(__art); }
+  if (hasChrome) { var __crt = mutableNamespace(chrome, "runtime"); patchGetURL(__crt); patchRuntimeId(__crt); backfillRuntimeEvents(__crt); }
+  if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) { var __brt = mutableNamespace(browser, "runtime"); patchGetURL(__brt); patchRuntimeId(__brt); backfillRuntimeEvents(__brt); }
+  if (api && api !== __browser && !(hasChrome && api === chrome)) { var __art = mutableNamespace(api, "runtime"); patchGetURL(__art); patchRuntimeId(__art); backfillRuntimeEvents(__art); }
 
   // runtime.connect() wake-the-background. Safari THROWS synchronously
   // "Invalid call to runtime.connect(). No runtime.onConnect listeners found." when
@@ -615,10 +646,11 @@ var __C2S_DEBUG__ = false;
       return nativeAdd(function (port) {
         try { if (port) fixSenderOrigin(port.sender, canon); } catch (e) {}
         // Route-by-sender.url fix: give the bundle a port clone whose sender.url host
-        // is lowercased to match chrome.runtime.id, so runtime.id-based port routing
-        // recognizes the popup/panel and the bg can post replies back. The clone
-        // forwards postMessage/onMessage to the real port (Object.create), so replies
-        // still reach the popup.
+        // is lowercased to match the (now UUID, also lowercased) chrome.runtime.id, so
+        // runtime.id-based port routing recognizes the popup/panel and the bg can post
+        // replies back. The clone forwards postMessage/onMessage bound to the real port,
+        // so replies still reach the popup. (Pairs with patchRuntimeId above: the id had
+        // to become the UUID first, or the two strings could never match.)
         var p = port;
         try { p = portWithLoweredSenderUrl(port); } catch (e) { p = port; }
         return fn.call(this, p);
