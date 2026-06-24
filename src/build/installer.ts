@@ -146,6 +146,10 @@ export function parsePluginkitList(stdout: string): SafariExtension[] {
     const cols = line.split("\t").filter((c) => c.length > 0);
     if (cols.length < 2) continue;
     const path = cols[cols.length - 1];
+    // Some pluginkit states print only flags+id with no path tab; filtering empties
+    // then makes the id token masquerade as the path. Require an absolute path so a
+    // malformed line is skipped rather than surfaced as a garbage --list entry.
+    if (!path.startsWith("/")) continue;
     // The id is the last space-separated token of the first column; it carries a
     // trailing "(version)" — strip it for a clean id.
     const idToken = cols[0].split(/\s+/).filter(Boolean).pop() ?? "";

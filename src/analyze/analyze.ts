@@ -93,10 +93,14 @@ const HARDCODED_EXT_URL_RE = /chrome-extension:\/\/[a-p]{32}\b/;
 // author still needs to add their own "edit in Safari → Settings → Extensions" UI.
 const CHROME_SETTINGS_URL_RE = /chrome:\/\/(extensions|settings)\b/;
 const BLOCKING_WEBREQUEST_RE = /chrome\.webRequest\.on\w+/;
-// A regex literal that matches Chrome/Chromium followed by a version number — the
-// telltale of UA version sniffing (e.g. /Chrom(e|ium)\/([0-9]+)\./). Matches the
-// source text of such a pattern; the version capture is what breaks on Safari.
-const UA_CHROME_SNIFF_RE = /Chrom\(\?:e\|ium\)|Chrom\(e\|ium\)/;
+// Detect code that pulls a Chrome version token out of the UA string — the telltale
+// of UA version sniffing (e.g. /Chrome\/(\d+)/, /Chrom(e|ium)\/([0-9]+)\./). The
+// version capture is what breaks on Safari (no Chrome token). We match two robust
+// source signals: a `Chrome/` or `Chromium/` literal where the slash may be escaped
+// (`Chrome\/` in a regex literal), and the `Chrom(e|ium)` regex alternation in bare
+// or non-capturing form. Info-only/shimmed, so a slightly loose match is fine; the
+// prior pattern only matched one exact literal spelling and was near-dead.
+const UA_CHROME_SNIFF_RE = /Chrom(?:e|ium)\\?\/|Chrom\((?:\?:)?e\|ium\)/;
 const TIMER_RE = /(setTimeout|setInterval)\s*\(/;
 const BACKGROUND_FILE_RE = /(background|service[-_]?worker)/i;
 // The Safari 18 port bug is specific to iframe ↔ content-script ports, reached
