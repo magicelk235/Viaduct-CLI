@@ -288,7 +288,12 @@ async function main(): Promise<void> {
     process.exit(0);
   }
   if (values.uninstall !== undefined) {
-    process.exit(uninstallFromSafari(values.uninstall, values["install-dir"]) ? 0 : 1);
+    const name = values.uninstall.trim();
+    if (!name) {
+      fail("--uninstall needs an app name (e.g. --uninstall \"My Extension\").");
+      process.exit(1);
+    }
+    process.exit(uninstallFromSafari(name, values["install-dir"]) ? 0 : 1);
   }
 
   const input = positionals[0];

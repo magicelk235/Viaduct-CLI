@@ -338,8 +338,9 @@ export function buildXcodeProject(
   const productsDir = join(derived, "Build", "Products", "Release");
   const apps = findFiles(productsDir, (n) => n.endsWith(".app"), 4);
   // Match the app we built by name; a multi-platform Release dir can hold several .app
-  // bundles, and readdir order is not guaranteed, so [0] could be the wrong one.
-  const built = apps.find((p) => basename(p) === `${appName}.app`) ?? apps[0];
+  // bundles, and readdir order is not guaranteed, so [0] could be the wrong one — never
+  // fall back to an arbitrary bundle (it could be the iOS app for a macOS build).
+  const built = apps.find((p) => basename(p) === `${appName}.app`);
   if (!built) {
     rmSync(derived, { recursive: true, force: true });
     return null;
@@ -415,7 +416,9 @@ export function unsignedExtensionsAllowed(): boolean | null {
 export function detectXcodeTeam(): string | null {
   const res = run("defaults", ["read", "com.apple.dt.Xcode", "IDEProvisioningTeamByIdentifier"]);
   if (res.code !== 0) return null;
-  const ids = [...res.stdout.matchAll(/teamID\s*=\s*"?([A-Z0-9]{10})"?/g)].map((m) => m[1]);
+  // Boundary after the 10 chars so an over-long token isn't truncated into a
+  // wrong 10-char id; a real Apple team id is exactly 10 alphanumerics.
+  const ids = [...res.stdout.matchAll(/teamID\s*=\s*"?([A-Z0-9]{10})(?![A-Z0-9])"?/g)].map((m) => m[1]);
   return ids[0] ?? null;
 }
 

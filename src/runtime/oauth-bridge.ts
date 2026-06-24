@@ -156,11 +156,20 @@ function injectPolyfillImport(stageDir: string, swRel: string): void {
 
 /** Ensure `resource` is exposed to `matches` in web_accessible_resources (MV3 form). */
 function addWebAccessible(manifest: Manifest, resource: string, matches: string[]): void {
-  const war = Array.isArray(manifest.web_accessible_resources)
-    ? (manifest.web_accessible_resources as WarEntry[])
-    : [];
+  // Normalize whatever's there into MV3 object form, preserving existing entries.
+  // A bare MV2 string[] (or a stray loose string in a mixed array) gets wrapped
+  // rather than dropped; only a wholly-malformed non-array value resets to empty.
+  const existing = manifest.web_accessible_resources;
+  const raw: unknown[] = Array.isArray(existing) ? existing : [];
+  const looseStrings = raw.filter((e): e is string => typeof e === "string");
+  const war = raw.filter(
+    (e): e is WarEntry => typeof e === "object" && e !== null
+  );
+  if (looseStrings.length > 0) {
+    war.push({ resources: looseStrings, matches: ["<all_urls>"] });
+  }
   const already = war.some(
-    (e) => e && Array.isArray(e.resources) && e.resources.includes(resource)
+    (e) => Array.isArray(e.resources) && e.resources.includes(resource)
   );
   if (!already) war.push({ resources: [resource], matches, use_dynamic_url: false });
   manifest.web_accessible_resources = war;

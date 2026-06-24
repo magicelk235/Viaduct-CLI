@@ -51,7 +51,9 @@ export function shimSource(config: ShimConfig = {}): string {
     hosts: config.proxyHosts || [],
   });
   const runtime = readFileSync(join(RUNTIME_DIR, SHIM_FILENAME), "utf-8");
-  return runtime.replace("__C2S_PROXY_CONFIG_JSON__", proxyCfg);
+  // split/join = global replace; the placeholder appears once today, but a stray
+  // second occurrence must not survive as invalid JS (matches oauth-bridge.ts).
+  return runtime.split("__C2S_PROXY_CONFIG_JSON__").join(proxyCfg);
 }
 
 export function writeShim(targetDir: string, config: ShimConfig = {}): string {

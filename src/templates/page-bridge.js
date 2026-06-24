@@ -48,7 +48,15 @@
     var mtype = msg && msg.type ? msg.type : "(no type)";
     DBG("[bridge] page->SW send", mtype, "reqId", reqId);
     var p = new Promise(function (resolve, reject) {
+      // Timeout so the promise can't hang forever: if the page calls sendMessage
+      // before the isolated-world relay has attached its listener, the postMessage
+      // is dropped and no reply ever arrives. (The relay has its own 30s SW timeout;
+      // this guards the page->relay leg the relay can't see.)
+      var to = setTimeout(function () {
+        if (pending[reqId]) { delete pending[reqId]; reject(new Error("bridge timeout: no response from extension")); }
+      }, 30000);
       pending[reqId] = function (resp, err) {
+        clearTimeout(to);
         if (err) { console.error("[bridge] SW->page ERROR", mtype, reqId, err); reject(new Error(err)); }
         else { DBG("[bridge] SW->page resp", mtype, reqId, resp ? "(ok)" : resp); resolve(resp); }
       };

@@ -51,6 +51,18 @@ test("downloads: search finds the item and filters by state", async () => {
   assert.equal((await chrome.downloads.search({ state: "in_progress" })).length, 0);
 });
 
+test("downloads: search({id:[...]}) matches by id array (scalar-compare must not shadow the array form)", async () => {
+  const chrome = setup();
+  const id1 = await chrome.downloads.download({ url: "https://x.test/a.zip" });
+  const id2 = await chrome.downloads.download({ url: "https://x.test/b.zip" });
+  await tick();
+  assert.equal((await chrome.downloads.search({ id: [id1] })).length, 1);
+  assert.equal((await chrome.downloads.search({ id: [id1, id2] })).length, 2);
+  assert.equal((await chrome.downloads.search({ id: [9999] })).length, 0);
+  // scalar form still works
+  assert.equal((await chrome.downloads.search({ id: id1 })).length, 1);
+});
+
 test("downloads: erase removes matching items and fires onErased", async () => {
   const chrome = setup();
   const id = await chrome.downloads.download({ url: "https://x.test/b.zip" });
