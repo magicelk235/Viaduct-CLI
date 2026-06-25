@@ -199,6 +199,7 @@ function analyzeOnly(
             platforms,
             removedPermissions: permissionsToRemove,
             manifestChanges: changes,
+            strict,
           },
           issues
         );

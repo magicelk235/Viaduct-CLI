@@ -72,12 +72,12 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest, chromeId?
   if (!sw) return notes; // only MV3 service-worker extensions have this handshake
 
   // 1. Emit the identity polyfill — it shims chrome.identity in the SW and is
-  //    imported below regardless of whether the page bridge gets wired.
-  for (const tmpl of [BRIDGE_POLYFILL, BRIDGE_PAGE, BRIDGE_PAGE_CS]) {
-    if (!existsSync(join(TEMPLATE_DIR, tmpl))) {
-      notes.push(`OAuth bridge template "${tmpl}" is missing from the install; skipping chrome.identity bridge.`);
-      return notes;
-    }
+  //    imported below regardless of whether the page bridge gets wired. Only the
+  //    polyfill is always needed; the page-bridge templates are checked later,
+  //    where they're used, so a missing page bridge doesn't kill the SW shim.
+  if (!existsSync(join(TEMPLATE_DIR, BRIDGE_POLYFILL))) {
+    notes.push(`OAuth bridge template "${BRIDGE_POLYFILL}" is missing from the install; skipping chrome.identity bridge.`);
+    return notes;
   }
   // The bridge templates carry a placeholder Chrome id. When the caller passes the
   // extension's real Chrome id (derived from the source manifest `key`) we bake it
@@ -90,9 +90,11 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest, chromeId?
   //    and chrome.identity shim install before the bundle evaluates.
   injectPolyfillImport(stageDir, sw);
 
-  // 3. The loader uses ES `import`, so the background MUST stay a module.
-  //    `sw` is truthy here, so `manifest.background` is guaranteed defined.
-  manifest.background = { ...manifest.background, type: "module" };
+  // 3. (No background.type mutation here.) convertServiceWorkerToBackgroundPage
+  //    runs later in the pipeline and overwrites manifest.background entirely with
+  //    { page, persistent:false }, loading the SW via <script type="module">, so a
+  //    type:"module" set here would be discarded. The injected `import` (step 2)
+  //    is what actually persists and pulls in the polyfill.
 
   // 4. Wire the page-side bridge on the externally_connectable origins (that is
   //    exactly the set of pages allowed to message the extension). Without any
@@ -104,7 +106,13 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest, chromeId?
     return notes;
   }
 
-  // Page bridge is actually wired → emit its two assets now.
+  // Page bridge is actually wired → emit its two assets now. If either page-bridge
+  // template is missing from the install, the SW shim already landed above; skip
+  // only the page wiring rather than aborting the whole bridge.
+  if (!existsSync(join(TEMPLATE_DIR, BRIDGE_PAGE)) || !existsSync(join(TEMPLATE_DIR, BRIDGE_PAGE_CS))) {
+    notes.push("chrome.identity shim emitted; page bridge skipped (page-bridge template missing from install).");
+    return notes;
+  }
   copyFileSync(join(TEMPLATE_DIR, BRIDGE_PAGE), join(stageDir, BRIDGE_PAGE));
   substituteExtId(join(stageDir, BRIDGE_PAGE), chromeId);
   copyFileSync(join(TEMPLATE_DIR, BRIDGE_PAGE_CS), join(stageDir, BRIDGE_PAGE_CS));

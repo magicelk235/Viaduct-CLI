@@ -102,6 +102,27 @@ test("readingList: duplicate URL rejects", async () => {
   await assert.rejects(() => chrome.readingList.addEntry({ url: "https://dup.test", title: "y" }));
 });
 
+test("readingList: read-only lastError getter does not misroute a success callback", async () => {
+  // Safari exposes runtime.lastError as a read-only exotic getter, so the shim's
+  // `lastError = null` on the SUCCESS path throws; the emulated API's own catch
+  // then fires the FAILURE callback (cb(undefined)) for an operation that worked.
+  // setLastErr() must swallow the assignment throw so the real result is delivered.
+  const runtime = { getManifest: () => ({}) };
+  Object.defineProperty(runtime, "lastError", {
+    get: () => null,
+    set: () => { throw new TypeError("lastError is read-only"); },
+    configurable: false,
+  });
+  const chrome = setup(makeStore(), { runtime });
+  const got = await new Promise((res) =>
+    chrome.readingList.addEntry({ url: "https://ro.test", title: "ok" }, () =>
+      chrome.readingList.query({}, res)
+    )
+  );
+  assert.equal(got.length, 1, "success callback fired with the real result");
+  assert.equal(got[0].url, "https://ro.test");
+});
+
 test("readingList: persists across a fresh shim", async () => {
   const store = makeStore();
   await setup(store).readingList.addEntry({ url: "https://p.test", title: "keep" });

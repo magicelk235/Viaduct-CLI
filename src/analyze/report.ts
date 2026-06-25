@@ -126,6 +126,8 @@ export interface ReportMeta {
   removedPermissions?: string[];
   /** Human-readable manifest rewrites (from summarizeManifestChanges). */
   manifestChanges?: string[];
+  /** --strict: count warnings as blocking, so the status matches the exit code. */
+  strict?: boolean;
 }
 
 /** Build the Markdown conversion report as a string (no I/O). */
@@ -141,7 +143,7 @@ export function buildReportMarkdown(meta: ReportMeta, issues: Issue[]): string {
 
   // Blocking = unresolved errors (auto-fixed ones don't block); same gate the
   // converter and --analyze use, so the verdict here agrees with the exit code.
-  const blocking = countBlocking(issues);
+  const blocking = countBlocking(issues, meta.strict);
   const status = blocking === 0 ? "✅ Convertible — no blocking issues" : `⛔ ${blocking} blocking error(s) — use --force to convert anyway`;
 
   const lines: string[] = [

@@ -46,10 +46,13 @@ export function shimSource(config: ShimConfig = {}): string {
   // we read it and substitute the one placeholder. Reading bytes verbatim keeps
   // every regex backslash (/\\$(\\d+)/, /api\\.anthropic\\.com/) intact — no
   // template-literal escaping to corrupt them.
+  // JSON.stringify leaves U+2028/U+2029 raw — legal in JSON but a line terminator
+  // inside a JS string literal, so an exotic host carrying one would make the
+  // emitted shim a SyntaxError (→ whole shim dead). Escape them to \u form.
   const proxyCfg = JSON.stringify({
     origin: config.chromeOrigin || "",
     hosts: config.proxyHosts || [],
-  });
+  }).replace(/[\u2028\u2029]/g, (c) => c === "\u2028" ? "\\u2028" : "\\u2029");
   const runtime = readFileSync(join(RUNTIME_DIR, SHIM_FILENAME), "utf-8");
   // split/join = global replace; the placeholder appears once today, but a stray
   // second occurrence must not survive as invalid JS (matches oauth-bridge.ts).
