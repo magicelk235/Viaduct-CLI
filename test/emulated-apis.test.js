@@ -2,7 +2,13 @@
 // userScripts (registry), instanceID (stable id).
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { shimSource } from "../dist/runtime/shim.js";
+
+// The raw .js with its placeholder unreplaced (what ships if a build substitution misses).
+const SHIM_JS_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "runtime", "safari-compat-shim.js");
 
 function makeStore() {
   const data = {};
@@ -421,4 +427,29 @@ test("frozen sidePanel/identity/notifications slots don't kill later shim patche
   assert.ok(c.storage && c.storage.session, "late storage.session patch reached");
   assert.equal(typeof c.runtime.getPlatformInfo, "function", "late runtime.getPlatformInfo reached");
   assert.equal(typeof c.runtime.getContexts, "function", "late runtime.getContexts reached");
+});
+
+// ---- externally_connectable events: reading them at SW eval must not throw ----
+test("runtime.onMessageExternal/onConnectExternal are backfilled (Safari omits them)", () => {
+  // Grammarly/Requestly receivers read chrome.runtime.onMessageExternal.addListener at
+  // module-eval. Safari doesn't expose these → undefined.addListener threw and aborted
+  // the whole SW. Backfilled as inert events: register OK, never fire.
+  const chrome = setup();
+  assert.equal(typeof chrome.runtime.onMessageExternal.addListener, "function");
+  assert.equal(typeof chrome.runtime.onConnectExternal.addListener, "function");
+  assert.doesNotThrow(() => chrome.runtime.onMessageExternal.addListener(() => {}));
+  assert.doesNotThrow(() => chrome.runtime.onConnectExternal.addListener(() => {}));
+});
+
+// ---- proxy config guard: a missed build substitution must not kill the host script ----
+test("a bare __C2S_PROXY_CONFIG_JSON__ token (substitution miss) degrades, doesn't throw", () => {
+  // Line 2 sits above the IIFE's outer try. If the build ever fails to replace the
+  // placeholder, the bare token is an undefined identifier → ReferenceError → the
+  // prepended content script dies. The try/catch guard must contain that.
+  const raw = readFileSync(SHIM_JS_PATH, "utf-8"); // the real .js, placeholder unreplaced
+  assert.ok(raw.includes("__C2S_PROXY_CONFIG_JSON__"), "source still has the raw placeholder");
+  const chrome = { runtime: { lastError: null, getManifest: () => ({}) }, storage: { local: { get: (k, cb) => cb({}), set: (o, cb) => cb && cb() } } };
+  assert.doesNotThrow(() => {
+    new Function("chrome", "window", "self", "globalThis", raw)(chrome, { addEventListener() {} }, undefined, { chrome });
+  }, "unsubstituted shim must not throw at top level");
 });
