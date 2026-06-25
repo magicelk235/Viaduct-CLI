@@ -399,7 +399,6 @@ async function main(): Promise<void> {
       zip: values.zip,
       openXcode: values["open-xcode"],
       keepModuleBackground: values["keep-module"],
-      verbose: values.verbose,
     });
   } catch (e) {
     fail((e as Error).message);
