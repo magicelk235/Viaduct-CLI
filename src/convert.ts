@@ -293,6 +293,10 @@ export function convert(opts: ConvertOptions): ConvertResult {
         result.installedAppPath = inst.installedAppPath;
         ok(`Installed → ${inst.installedAppPath}`);
       } else {
+        // The user asked for --install and it didn't happen. The build is fine, so we
+        // still surface the app path, but flag the run as install-failed so the CLI
+        // exits non-zero rather than printing "Done" and exiting 0.
+        result.installFailed = true;
         const stableApp = join(outputDir, basename(builtApp));
         if (moveBundle(builtApp, stableApp)) {
           result.appPath = stableApp;

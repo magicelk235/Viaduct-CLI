@@ -526,9 +526,21 @@ var __C2S_DEBUG__ = false;
         queued = [];
       }
       var attempts = 0;
+      function giveUp() {
+        // No real port arrived within the ceiling (truly listener-less channel, or a
+        // background that never woke). Chrome would have fired the port's onDisconnect
+        // by now ("Receiving end does not exist."); the proxy must do the same or a
+        // caller awaiting onDisconnect to recover/retry hangs forever. Mark closed
+        // first so a re-entrant disconnect() in a listener is a no-op, then dispatch
+        // the buffered onDisconnect listeners.
+        if (closed) return;
+        closed = true;
+        var list = discListeners.slice();
+        for (var i = 0; i < list.length; i++) { try { list[i](); } catch (e) {} }
+      }
       function tryConnect() {
         if (real || closed) return;
-        if (++attempts > 40) return; // ~6s ceiling; give up quietly
+        if (++attempts > 40) { giveUp(); return; } // ~6s ceiling
         // Wake the background page; a one-shot message forces Safari to spin it up.
         if (nativeSend) { try { var r = nativeSend({ __c2s_wake__: 1 }); if (r && typeof r.then === "function") r.then(function () {}, function () {}); } catch (e) {} }
         var p = null;
@@ -782,12 +794,31 @@ var __C2S_DEBUG__ = false;
       set: syncFwd(local.set),
       remove: syncFwd(local.remove),
       clear: syncFwd(local.clear),
-      getBytesInUse: local.getBytesInUse ? syncFwd(local.getBytesInUse) : function () { return Promise.resolve(0); },
+      // local.getBytesInUse is usually absent on the polyfilled browser object, so the
+      // fallback runs — it MUST honor the dual contract (strip + invoke a trailing cb),
+      // else `sync.getBytesInUse(keys, cb)` returns a promise the caller discards and cb
+      // never fires, hanging quota-check init code.
+      getBytesInUse: local.getBytesInUse ? syncFwd(local.getBytesInUse) : function () {
+        var a = [].slice.call(arguments);
+        var cb = typeof a[a.length - 1] === "function" ? a.pop() : null;
+        if (cb) { cb(0); return; }
+        return Promise.resolve(0);
+      },
       // Bundles read storage.sync.onChanged.addListener at module-eval; a bare stub
       // would silently never fire. sync is backed by local here, so relay the global
       // storage.onChanged but only for the backing "local" area, and pass just
       // (changes) — a real .sync.onChanged listener must not see other areas' writes
       // (Chrome's .sync.onChanged is area-scoped and single-arg).
+      //
+      // ponytail: sync and local share one flat backing store, so this relay cannot
+      // tell a sync-origin write from a plain local.set — a sync.onChanged listener
+      // will also see unrelated local writes, and a global onChanged listener that
+      // branches on `area === "sync"` never fires for sync writes (Safari reports the
+      // backing write as "local"). Separating them needs key-namespacing the sync blob
+      // in local, which would orphan data already written under the flat scheme by an
+      // earlier conversion — not worth the migration for a Safari-only partial gap
+      // where data still persists and sync.get works. Add namespacing if an extension
+      // is observed mixing distinct local+sync keys and reacting on area.
       onChanged: (function () {
         var subs = [];
         if (__stg.onChanged && typeof __stg.onChanged.addListener === "function") {
@@ -1036,6 +1067,33 @@ var __C2S_DEBUG__ = false;
           }
           return Promise.resolve();
         };
+      }
+
+      // chrome.tabs zoom surface (getZoom/setZoom/get|setZoomSettings/onZoomChange) is
+      // ABSENT in Safari. A bundle that reads `chrome.tabs.onZoomChange.addListener` at
+      // module-eval hits `undefined.addListener` → TypeError that aborts the whole
+      // SW/popup script (every later listener never registers). Backfill inert,
+      // promise/callback-dual stubs so the surface is reachable without crashing; zoom
+      // is a no-op (Safari can't programmatically zoom a tab) but get* returns sane
+      // defaults so callers don't choke on undefined. Only fill what Safari omits.
+      if (chrome.tabs) {
+        var zoomDual = function (value, cb) {
+          if (typeof cb === "function") { try { cb(value); } catch (e) {} return; }
+          return Promise.resolve(value);
+        };
+        if (typeof chrome.tabs.getZoom !== "function") {
+          chrome.tabs.getZoom = function (tabId, cb) { if (typeof tabId === "function") cb = tabId; return zoomDual(1, cb); };
+        }
+        if (typeof chrome.tabs.setZoom !== "function") {
+          chrome.tabs.setZoom = function (tabId, factor, cb) { if (typeof factor === "function") cb = factor; return zoomDual(undefined, cb); };
+        }
+        if (typeof chrome.tabs.getZoomSettings !== "function") {
+          chrome.tabs.getZoomSettings = function (tabId, cb) { if (typeof tabId === "function") cb = tabId; return zoomDual({ mode: "automatic", scope: "per-origin", defaultZoomFactor: 1 }, cb); };
+        }
+        if (typeof chrome.tabs.setZoomSettings !== "function") {
+          chrome.tabs.setZoomSettings = function (tabId, settings, cb) { if (typeof settings === "function") cb = settings; return zoomDual(undefined, cb); };
+        }
+        if (!chrome.tabs.onZoomChange) chrome.tabs.onZoomChange = event();
       }
 
       // Expose tab.groupId on tabs.get/query results so reading code sees membership.
@@ -1494,9 +1552,24 @@ var __C2S_DEBUG__ = false;
     chrome.browsingData = chrome.browsingData || {};
     fill(chrome.browsingData, { remove: resolveEmpty(undefined), settings: resolveEmpty({ options: {}, dataToRemove: {}, dataRemovalPermitted: {} }) });
 
-    // Capture APIs → defer to getDisplayMedia where possible, else reject.
+    // Capture APIs are unsupported in Safari (no tab/display capture surface).
     chrome.tabCapture = chrome.tabCapture || {};
-    fill(chrome.tabCapture, { capture: rejectUnsupported("tabCapture"), getCapturedTabs: resolveEmpty([]), onStatusChanged: event() });
+    fill(chrome.tabCapture, {
+      capture: rejectUnsupported("tabCapture"),
+      getCapturedTabs: resolveEmpty([]),
+      onStatusChanged: event(),
+      // MV3's preferred entry: get a stream id in the SW, hand it to getUserMedia in a
+      // page. WebKit has no equivalent, but a missing method makes the caller's
+      // `chrome.tabCapture.getMediaStreamId(opts, cb)` throw a TypeError mid-handler.
+      // Set lastError + invoke the callback with undefined so callers hit their error
+      // branch (they check `typeof streamId !== "string"`) instead of crashing.
+      getMediaStreamId: function (opts, cb) {
+        if (typeof opts === "function") cb = opts;
+        setLastErr({ message: "tabCapture.getMediaStreamId is unsupported in Safari." });
+        if (typeof cb === "function") { try { cb(undefined); } catch (e) {} return; }
+        return Promise.resolve(undefined);
+      },
+    });
     chrome.desktopCapture = chrome.desktopCapture || {};
     // chooseDesktopMedia MUST invoke its callback (Chrome calls it with "" on cancel);
     // returning only a request id leaves callers waiting forever. Signal cancellation.

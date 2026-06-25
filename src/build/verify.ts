@@ -8,24 +8,36 @@ export interface VerifyResult {
   enabled: boolean | null;
 }
 
-// pluginkit's verbose (`-mAvvv`) output prints a per-plugin block. Within the
-// block for our appex it lists a status line; an extension Safari has accepted
-// shows `"enabled" = 1` (or no explicit disable). We can't drive WebInspector
-// from a plain CLI, so "loads cleanly" is approximated by: registered AND not
-// flagged disabled. Console-error capture is a platform limit, not done here.
-// ponytail: pluginkit-flag heuristic, upgrade to WebInspector relay if console errors are needed.
-export function parseEnabled(pluginkitVerbose: string, extBundleId: string): boolean | null {
-  const marker = `${extBundleId}.Extension`;
-  const idx = pluginkitVerbose.indexOf(marker);
-  if (idx === -1) return null;
-  // The plugin's block runs from its id to the next blank-line separator.
-  const rest = pluginkitVerbose.slice(idx);
-  const end = rest.indexOf("\n\n");
-  const block = end === -1 ? rest : rest.slice(0, end);
-  if (/"enabled"\s*=\s*0/.test(block) || /\bdisabled\b/i.test(block)) return false;
-  if (/"enabled"\s*=\s*1/.test(block)) return true;
-  // Present but no explicit enabled flag: registered-but-unknown, treat as null.
+// Enabled/disabled state is NOT in pluginkit's verbose (`-mAvvv`) block — that block
+// only carries Path/UUID/SDK/Display Name/… (no "enabled" key, and the words
+// enabled/disabled never appear). State lives in the FLAGS COLUMN of the compact
+// `-mv`/`-m` listing: each line is `<flags><bundleId>(<ver>)\t<UUID>\t…`, where the
+// leading flag chars before the id encode state — blank = enabled, `-` = disabled,
+// `!`/`B`/`e`/… = ignored/other non-running states. So parse a compact listing's flag
+// column, not the verbose block (the old `"enabled"=N` regexes were dead on real
+// output, and a bare `\bdisabled\b` scan false-flagged any extension whose Path or
+// name merely contained the word "disabled"). Returns null when the id isn't found
+// (caller already checks registration separately).
+// ponytail: flag-column heuristic, upgrade to WebInspector relay if console errors are needed.
+export function parseEnabled(pluginkitCompact: string, extBundleId: string): boolean | null {
+  const id = `${extBundleId}.Extension`;
+  for (const line of pluginkitCompact.split("\n")) {
+    const at = line.indexOf(id);
+    if (at === -1) continue;
+    // Everything before the id on its line is the flag column (plus indent). pluginkit
+    // pads enabled plugins with spaces and marks others with a flag char.
+    const flags = line.slice(0, at).trim();
+    if (flags === "") return true;          // no flag → enabled
+    if (/[-!Bie]/.test(flags)) return false; // disabled/ignored/blocked/etc.
+    return null;                             // some other flag we don't classify
+  }
   return null;
+}
+
+// Compact, machine-parseable plugin listing whose leading flag column carries the
+// enabled/disabled state (unlike the verbose -mAvvv block used for registration).
+export function pluginkitCompactStatus(): string {
+  return run("pluginkit", ["-mv", "-p", "com.apple.Safari.web-extension"]).stdout;
 }
 
 /**
@@ -41,7 +53,8 @@ export function verifyInSafari(bundleId: string): VerifyResult {
 
   const status = pluginkitStatus();
   const registered = bundleRegistered(status, bundleId);
-  const enabled = parseEnabled(status, bundleId);
+  // State comes from the compact flag column, not the verbose block.
+  const enabled = parseEnabled(pluginkitCompactStatus(), bundleId);
 
   if (!registered) {
     warn("Extension is not registered with Safari yet. Open Safari → Settings → Extensions and enable it, then re-run --verify.");

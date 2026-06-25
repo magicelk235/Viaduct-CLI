@@ -288,8 +288,10 @@ ${polyTag}${shimTag}${importTags}<script type="module" src="${sw}"></script>
  * Returns -1 if no balanced close is found. Template-literal `${}` expressions
  * are tracked so a ")" inside an interpolation still counts.
  */
-function matchBalancedParen(src: string, open: number): number {
+export function matchBalancedParen(src: string, open: number): number {
   let depth = 0;
+  // Last non-whitespace char seen, to disambiguate `/` as regex-start vs division.
+  let prev = "";
   for (let i = open; i < src.length; i++) {
     const c = src[i];
     if (c === "(") depth++;
@@ -305,15 +307,54 @@ function matchBalancedParen(src: string, open: number): number {
         if (src[i] === quote) break;
         i++;
       }
-    } else if (c === "/" && src[i + 1] === "/") {
-      const nl = src.indexOf("\n", i);
-      if (nl < 0) return -1;
-      i = nl;
-    } else if (c === "/" && src[i + 1] === "*") {
-      const close = src.indexOf("*/", i + 2);
-      if (close < 0) return -1;
-      i = close + 1;
+    } else if (c === "/" && (src[i + 1] === "/" || src[i + 1] === "*")) {
+      // Comment — but only if `/` isn't actually starting a regex literal. After a
+      // value (identifier/number/`)`/`]`), `/` is division and `//`/`/*` is a real
+      // comment; in an expression position (after `(`,`,`,`=`,`[`,operators, or at
+      // the start) a leading `/` begins a regex whose first char may be `/` or `*`
+      // (e.g. /[/*]/), which must NOT be read as a comment.
+      if (startsRegex(prev)) {
+        i = skipRegex(src, i);
+        if (i < 0) return -1;
+      } else if (src[i + 1] === "/") {
+        const nl = src.indexOf("\n", i);
+        if (nl < 0) return -1;
+        i = nl;
+      } else {
+        const close = src.indexOf("*/", i + 2);
+        if (close < 0) return -1;
+        i = close + 1;
+      }
+    } else if (c === "/" && startsRegex(prev)) {
+      // A regex literal whose body doesn't start with `/`/`*` (e.g. /\//, /a-z/).
+      i = skipRegex(src, i);
+      if (i < 0) return -1;
     }
+    if (c !== " " && c !== "\t" && c !== "\n" && c !== "\r") prev = c;
+  }
+  return -1;
+}
+
+// Does a `/` at the current position begin a regex literal (vs division)? A regex
+// starts when the previous significant char is empty (start) or anything that can't
+// end a value — operators, openers, commas, etc. Conservative: when unsure, treats
+// `/` as division (the pre-existing behavior).
+function startsRegex(prev: string): boolean {
+  return prev === "" || "(,=:[!&|?{};+-*%^~<>".indexOf(prev) >= 0;
+}
+
+// Given index `start` at the opening `/` of a regex literal, return the index of its
+// closing `/`, honoring `\` escapes and `[...]` character classes (where `/` is not a
+// delimiter). Returns -1 if unterminated.
+function skipRegex(src: string, start: number): number {
+  let inClass = false;
+  for (let i = start + 1; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === "\\") { i++; continue; }
+    if (ch === "[") inClass = true;
+    else if (ch === "]") inClass = false;
+    else if (ch === "/" && !inClass) return i;
+    else if (ch === "\n") return -1;
   }
   return -1;
 }

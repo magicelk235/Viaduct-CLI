@@ -111,4 +111,9 @@ export interface ConvertResult {
   appPath?: string;
   resolvedBundleId?: string;
   installedAppPath?: string;
+  /** --install was requested but installToSafari could not place the app in the
+   *  install dir. The build itself succeeded, so success stays true, but the caller
+   *  must treat the run as failed (non-zero exit) since the user's install didn't
+   *  happen — and any --verify keyed on installedAppPath can't run. */
+  installFailed?: boolean;
 }
