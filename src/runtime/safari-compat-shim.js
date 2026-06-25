@@ -8,6 +8,16 @@ var __C2S_DEBUG__ = false;
   var api = typeof browser !== "undefined" ? browser : (typeof chrome !== "undefined" ? chrome : null);
   if (!api) return;
 
+  // Assign chrome.runtime.lastError defensively. On some hosts it's a read-only
+  // exotic getter, so a bare `lastError = x` THROWS — and when that assignment sits
+  // in an emulated API's success path, the throw is caught by that API's own
+  // try/catch and misrouted to the failure callback, silently breaking every
+  // successful call. Always wrap. (No-op where the host rejects the write; the
+  // emulated APIs only set it to surface their own faults, never the host's.)
+  function setLastErr(v) {
+    try { var rt = (typeof chrome !== "undefined" && chrome.runtime); if (rt) rt.lastError = v; } catch (e) {}
+  }
+
 
   // Publish a global `chrome` aliased to `browser` BEFORE anything else. Safari
   // exposes `browser` in extension pages/content scripts/background, but `chrome`
@@ -1485,7 +1495,7 @@ var __C2S_DEBUG__ = false;
         entries = {}; fin();
       };
       var run = function (fn, cb) {
-        if (typeof cb === "function") { ensure(function () { try { var v = fn(); if (chrome.runtime) chrome.runtime.lastError = null; cb(v); } catch (e) { if (chrome.runtime) chrome.runtime.lastError = { message: e.message }; cb(undefined); } }); return undefined; }
+        if (typeof cb === "function") { ensure(function () { try { var v = fn(); setLastErr(null); cb(v); } catch (e) { setLastErr({ message: e.message }); cb(undefined); } }); return undefined; }
         return new Promise(function (res, rej) { ensure(function () { try { res(fn()); } catch (e) { rej(e); } }); });
       };
       var norm = function (e) { return { url: e.url, title: e.title || "", hasBeenRead: !!e.hasBeenRead, creationTime: e.creationTime || Date.now(), lastUpdateTime: e.lastUpdateTime || Date.now() }; };
@@ -2137,8 +2147,8 @@ var __C2S_DEBUG__ = false;
       function promiseOrCb(fn, cb) {
         if (typeof cb === "function") {
           ensure(function () {
-            try { var v = fn(); if (chrome.runtime) chrome.runtime.lastError = null; cb(v); }
-            catch (e) { if (chrome.runtime) chrome.runtime.lastError = { message: e.message }; cb(undefined); }
+            try { var v = fn(); setLastErr(null); cb(v); }
+            catch (e) { setLastErr({ message: e.message }); cb(undefined); }
           });
           return undefined;
         }
@@ -2493,7 +2503,7 @@ var __C2S_DEBUG__ = false;
         resetWorldConfiguration: function (p, cb) { if (typeof p === "function") { cb = p; } return dual(undefined, cb); },
       });
       function shallowCopy(o) { var r = {}; for (var k in o) r[k] = o[k]; return r; }
-      function rejectOrCb(err, cb) { if (typeof cb === "function") { if (chrome.runtime) chrome.runtime.lastError = { message: err.message }; cb(); return undefined; } return Promise.reject(err); }
+      function rejectOrCb(err, cb) { if (typeof cb === "function") { setLastErr({ message: err.message }); cb(); return undefined; } return Promise.reject(err); }
     })();
     chrome.dom = chrome.dom || {};
     fill(chrome.dom, {
