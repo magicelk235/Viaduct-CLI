@@ -36,12 +36,16 @@ export function extractStoreId(url: string): string | undefined {
   return undefined;
 }
 
+// Google's CRX endpoint gates responses on prodversion; too stale a value risks it
+// declining newer extensions. Keep this within a major or two of current Chrome stable.
+const CRX_PRODVERSION = "131.0";
+
 /** Build the clients2 CRX download endpoint (302-redirects to the real CRX). */
 export function crxEndpoint(id: string): string {
   const x = `id=${id}&installsource=ondemand&uc`;
   return (
     "https://clients2.google.com/service/update2/crx" +
-    "?response=redirect&acceptformat=crx2,crx3&prodversion=120.0" +
+    `?response=redirect&acceptformat=crx2,crx3&prodversion=${CRX_PRODVERSION}` +
     `&x=${encodeURIComponent(x)}`
   );
 }

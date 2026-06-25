@@ -2,7 +2,7 @@ import { readdirSync, existsSync, readFileSync, writeFileSync, mkdtempSync, rmSy
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
-import { run, info, ok, warn } from "../util.js";
+import { run, info, warn } from "../util.js";
 import type { Platforms } from "../types.js";
 
 function findFiles(dir: string, predicate: (name: string, full: string) => boolean, depth = 3, acc: string[] = []): string[] {

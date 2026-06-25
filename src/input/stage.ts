@@ -49,6 +49,12 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
   mkdirSync(stageDir, { recursive: true });
 
   const root = resolve(sourceDir);
+  // Realpath'd root for the kept-symlink containment check below. resolve() doesn't
+  // collapse symlinked ancestors, but realpathSync(srcLink) does — so on macOS where
+  // scratch dirs live under /tmp (a symlink to /private/tmp), an in-tree target would
+  // realpath to /private/... and fail `startsWith(root)`, silently dropping the asset.
+  let realRoot = root;
+  try { realRoot = realpathSync(root); } catch { /* source missing → cpSync errors anyway */ }
   cpSync(sourceDir, stageDir, {
     recursive: true,
     filter: (src) => {
@@ -93,8 +99,10 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
     let target;
     try {
       target = realpathSync(srcLink);
-      // Only follow links whose target stays inside the source tree.
-      if (target !== root && !target.startsWith(root + sep)) continue;
+      // Only follow links whose target stays inside the source tree (compare against
+      // the realpath'd root so a symlinked ancestor like /tmp→/private/tmp doesn't
+      // make an in-tree target look external).
+      if (target !== realRoot && !target.startsWith(realRoot + sep)) continue;
       if (!statSync(target).isFile()) continue;
     } catch { continue; }
     const dest = join(stageDir, rel);
