@@ -1528,14 +1528,56 @@ var __C2S_DEBUG__ = false;
     };
   }
 
-  // offscreen documents do not exist in Safari; stub so createDocument/hasDocument resolve.
+  // chrome.offscreen — Safari has no offscreen-document API, but the conversion turns
+  // the MV3 service worker into a Safari BACKGROUND PAGE (convertServiceWorkerToBackgroundPage),
+  // which has a real DOM. So emulate createDocument with a hidden extension-origin
+  // <iframe src=getURL(url)>: the offscreen page's scripts run and register their
+  // chrome.runtime.onMessage listeners for real, and Safari's native sendMessage
+  // broadcasts to all extension-origin documents — so the SW→offscreen messaging the
+  // extension already wrote works WITHOUT re-plumbing. (Bitwarden/Honey/GoogleTranslate/
+  // Momentum/etc. delegate clipboard/DOM-parse/crypto/TTS to an offscreen doc; a no-op
+  // stub silently dropped all of it.) An extension-origin iframe is not CORS/sandbox
+  // blocked and needs no manifest permission. When there is no DOM (a pure SW context),
+  // stay a no-op — there's nothing to attach the iframe to.
+  // __c2sOffscreenDoc is read by runtime.getContexts below so the OFFSCREEN_DOCUMENT
+  // context is reported (callers enumerate it before messaging).
   if (hasChrome && !chrome.offscreen) {
+    var __offscreenFrame = null;
+    var __offscreenUrl = "";
     chrome.offscreen = {
       Reason: { AUDIO_PLAYBACK: "AUDIO_PLAYBACK", BLOBS: "BLOBS", CLIPBOARD: "CLIPBOARD", DOM_PARSER: "DOM_PARSER", DOM_SCRAPING: "DOM_SCRAPING", IFRAME_SCRIPTING: "IFRAME_SCRIPTING", TESTING: "TESTING", USER_MEDIA: "USER_MEDIA", WORKERS: "WORKERS", DISPLAY_MEDIA: "DISPLAY_MEDIA", GEOLOCATION: "GEOLOCATION", LOCAL_STORAGE: "LOCAL_STORAGE", BATTERY_STATUS: "BATTERY_STATUS", MATCH_MEDIA: "MATCH_MEDIA", WEB_RTC: "WEB_RTC" },
-      createDocument: function () { return Promise.resolve(); },
-      closeDocument: function () { return Promise.resolve(); },
-      hasDocument: function () { return Promise.resolve(false); },
+      createDocument: function (opts, cb) {
+        var done = function (err) {
+          if (err) { setLastErr({ message: err }); }
+          if (typeof cb === "function") { try { cb(); } catch (e) {} return undefined; }
+          return err ? Promise.reject(new Error(err)) : Promise.resolve();
+        };
+        // Chrome rejects a second concurrent offscreen document.
+        if (__offscreenFrame) return done("Only a single offscreen document may be created.");
+        if (typeof document === "undefined" || !document.body) return done(); // no DOM → no-op (SW context)
+        try {
+          var url = opts && opts.url ? opts.url : "";
+          var abs = chrome.runtime && chrome.runtime.getURL ? chrome.runtime.getURL(url) : url;
+          var f = document.createElement("iframe");
+          f.src = abs;
+          f.setAttribute("aria-hidden", "true");
+          f.style.cssText = "position:absolute;width:0;height:0;border:0;visibility:hidden;left:-9999px;";
+          document.body.appendChild(f);
+          __offscreenFrame = f;
+          __offscreenUrl = url;
+        } catch (e) { return done("Failed to create offscreen document."); }
+        return done();
+      },
+      closeDocument: function (cb) {
+        try { if (__offscreenFrame && __offscreenFrame.parentNode) __offscreenFrame.parentNode.removeChild(__offscreenFrame); } catch (e) {}
+        __offscreenFrame = null; __offscreenUrl = "";
+        if (typeof cb === "function") { try { cb(); } catch (e) {} return undefined; }
+        return Promise.resolve();
+      },
+      hasDocument: function (cb) { var v = !!__offscreenFrame; if (typeof cb === "function") { try { cb(v); } catch (e) {} return undefined; } return Promise.resolve(v); },
     };
+    // Expose state for runtime.getContexts (defined later in the namespace-backfill block).
+    try { chrome.runtime && (chrome.runtime.__c2sOffscreen = function () { return __offscreenFrame ? __offscreenUrl : null; }); } catch (e) {}
   }
 
   // Namespaces with NO Safari equivalent that Chrome extensions still reference at
@@ -2144,26 +2186,46 @@ var __C2S_DEBUG__ = false;
       }
     }
 
-    // chrome.idle — derive state from page visibility where a document exists;
-    // a background context simply reports "active". onStateChanged is wired to the
-    // document's visibilitychange so listeners ACTUALLY fire (hidden->"idle",
-    // visible->"active") instead of being a dead event — that's the whole point of
-    // the API. ("locked" has no web signal, so it's never reported.)
+    // chrome.idle — in a document context, derive REAL idle from user activity (the
+    // way Chrome does): reset an activity clock on input events, and report "idle" when
+    // no input for `detectionInterval` seconds OR the page is hidden, else "active".
+    // setDetectionInterval is a real knob (drives both queryState's threshold and the
+    // onStateChanged transitions), and onStateChanged fires on the active<->idle edge.
+    // In a pure background/SW context (no document) there are no input events, so it
+    // degrades to visibility-only / always-active. ("locked" has no web signal.)
     chrome.idle = chrome.idle || {};
-    var __idleState = function () {
-      return (typeof document !== "undefined" && document.visibilityState === "hidden") ? "idle" : "active";
-    };
+    var __idleHasDoc = typeof document !== "undefined" && !!document.addEventListener;
+    var __idleInterval = 60; // seconds; Chrome's minimum is 15, default detection 60
+    var __idleLastActivity = Date.now();
+    var __idleCur = "active";
     var __idleListeners = [];
-    if (typeof document !== "undefined" && document.addEventListener) {
-      document.addEventListener("visibilitychange", function () {
-        var s = __idleState();
-        var isnap = __idleListeners.slice(); // snapshot — self-removing listener mustn't skip the next
-        for (var i = 0; i < isnap.length; i++) { try { isnap[i](s); } catch (e) {} }
-      });
+    // queryState honors its own threshold arg; the live edge tracker uses __idleInterval.
+    var __idleStateFor = function (thresholdSec) {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return "idle";
+      if (!__idleHasDoc) return "active"; // no input signal here
+      var sec = (typeof thresholdSec === "number" && thresholdSec > 0) ? thresholdSec : __idleInterval;
+      return (Date.now() - __idleLastActivity) >= sec * 1000 ? "idle" : "active";
+    };
+    var __idleEmit = function (state) {
+      if (state === __idleCur) return;
+      __idleCur = state;
+      var snap = __idleListeners.slice(); // self-removing listener mustn't skip the next
+      for (var i = 0; i < snap.length; i++) { try { snap[i](state); } catch (e) {} }
+    };
+    if (__idleHasDoc) {
+      var __idleBump = function () { __idleLastActivity = Date.now(); if (__idleCur !== "active" && document.visibilityState !== "hidden") __idleEmit("active"); };
+      var __idleEvents = ["mousemove", "mousedown", "keydown", "wheel", "touchstart", "scroll", "pointerdown"];
+      for (var __ie = 0; __ie < __idleEvents.length; __ie++) {
+        try { document.addEventListener(__idleEvents[__ie], __idleBump, { passive: true, capture: true }); } catch (e) { try { document.addEventListener(__idleEvents[__ie], __idleBump, true); } catch (e2) {} }
+      }
+      document.addEventListener("visibilitychange", function () { __idleEmit(__idleStateFor()); });
+      // Poll the inactivity edge so active->idle fires without further input. Cheap
+      // (every ~15s); only does work when a listener is registered.
+      setInterval(function () { if (__idleListeners.length) __idleEmit(__idleStateFor()); }, 15000);
     }
     fill(chrome.idle, {
-      queryState: function (sec, cb) { return dual(__idleState(), cb); },
-      setDetectionInterval: function () {},
+      queryState: function (sec, cb) { if (typeof sec === "function") { cb = sec; sec = undefined; } return dual(__idleStateFor(sec), cb); },
+      setDetectionInterval: function (sec) { if (typeof sec === "number" && sec >= 15) __idleInterval = sec; },
       getAutoLockDelay: function (cb) { return dual(0, cb); },
       onStateChanged: {
         addListener: function (f) { if (typeof f === "function") __idleListeners.push(f); },
@@ -2662,16 +2724,51 @@ var __C2S_DEBUG__ = false;
       }
     } catch (e) {}
 
-    // chrome.permissions — answer "not granted" rather than throw, so callers
-    // take their no-permission code path.
+    // chrome.permissions — Safari grants every manifest-declared permission/host up
+    // front (there is no runtime grant/revoke), so answer TRUTHFULLY from the manifest
+    // instead of a blanket "not granted". A hardcoded contains()→false makes the very
+    // common `if (await permissions.contains({permissions:['tabs']}))` gate take the
+    // denied branch for a permission the extension actually holds (Bitwarden even
+    // THROWS on the false answer), silently disabling features. Derive the granted set
+    // from getManifest() — the same introspection management.getSelf already uses. No
+    // interactive prompt is possible, so request() resolves true only when the asked
+    // perms are already declared (already effectively granted); a genuinely-new grant
+    // can't be synthesized, so it stays false.
     chrome.permissions = chrome.permissions || {};
-    fill(chrome.permissions, {
-      contains: function (p, cb) { return dual(false, cb); },
-      getAll: function (cb) { return dual({ permissions: [], origins: [] }, cb); },
-      request: function (p, cb) { return dual(false, cb); },
-      remove: function (p, cb) { return dual(false, cb); },
-      onAdded: event(), onRemoved: event(),
-    });
+    (function () {
+      var manifestPerms = function () {
+        var mf = {}; try { mf = (chrome.runtime && chrome.runtime.getManifest && chrome.runtime.getManifest()) || {}; } catch (e) {}
+        var perms = [].concat(mf.permissions || [], mf.optional_permissions || []);
+        var origins = [].concat(mf.host_permissions || [], mf.optional_host_permissions || []);
+        return { perms: perms, origins: origins };
+      };
+      var matchOrigin = function (declared, asked) {
+        // A declared host pattern grants an asked origin if it is the same or broader.
+        // Cheap check: <all_urls>/*://*/* grant anything; otherwise exact membership.
+        for (var i = 0; i < declared.length; i++) {
+          var d = declared[i];
+          if (d === asked || d === "<all_urls>" || d === "*://*/*") return true;
+        }
+        return false;
+      };
+      var has = function (req) {
+        req = req || {};
+        var m = manifestPerms();
+        var ps = req.permissions || [], os = req.origins || [];
+        for (var i = 0; i < ps.length; i++) if (m.perms.indexOf(ps[i]) < 0) return false;
+        for (var j = 0; j < os.length; j++) if (!matchOrigin(m.origins, os[j])) return false;
+        return true;
+      };
+      fill(chrome.permissions, {
+        contains: function (p, cb) { return dual(has(p), cb); },
+        getAll: function (cb) { var m = manifestPerms(); return dual({ permissions: m.perms, origins: m.origins }, cb); },
+        // Already-declared → already granted (resolve true). Anything else can't be
+        // granted without a native prompt Safari doesn't expose here → false.
+        request: function (p, cb) { return dual(has(p), cb); },
+        remove: function (p, cb) { return dual(false, cb); },
+        onAdded: event(), onRemoved: event(),
+      });
+    })();
 
     // chrome.webRequest — observation-only in Safari (macOS); backfill the event
     // objects + handler behavior constant so listener registration never throws.
@@ -2763,7 +2860,26 @@ var __C2S_DEBUG__ = false;
     // chrome.fontSettings / accessibilityFeatures — ChromeSetting-style leaves.
     chrome.fontSettings = chrome.fontSettings || {};
     fill(chrome.fontSettings, {
-      getFontList: function (cb) { return dual([], cb); },
+      // Try the Local Font Access API where the engine + context allow it (a popup/
+      // options page driven by a user gesture); map FontData[] → Chrome's
+      // [{fontId, displayName}]. queryLocalFonts throws (SecurityError/NotAllowedError)
+      // without a secure context + gesture + permission, so try/catch → [] keeps the
+      // old honest fallback (e.g. in a background page) instead of regressing to a throw.
+      getFontList: function (cb) {
+        var toList = function (fonts) {
+          var out = [];
+          try { for (var i = 0; i < fonts.length; i++) { var f = fonts[i]; out.push({ fontId: f.postscriptName || f.fullName || f.family, displayName: f.fullName || f.family }); } } catch (e) {}
+          return out;
+        };
+        try {
+          if (typeof self !== "undefined" && typeof self.queryLocalFonts === "function") {
+            var p = self.queryLocalFonts().then(toList, function () { return []; });
+            if (typeof cb === "function") { p.then(function (r) { try { cb(r); } catch (e) {} }); return; }
+            return p;
+          }
+        } catch (e) {}
+        return dual([], cb);
+      },
       getFont: function (d, cb) { return dual({ fontId: "", levelOfControl: "not_controllable" }, cb); },
       setFont: function (d, cb) { return dual(undefined, cb); },
       clearFont: function (d, cb) { return dual(undefined, cb); },
@@ -3038,8 +3154,19 @@ var __C2S_DEBUG__ = false;
         // registry to enumerate; return an empty list so callers fall through to their
         // "no such context, create/skip" branch instead of throwing on undefined().
         getContexts: function (filter, cb) {
-          if (typeof filter === "function") { cb = filter; }
-          return dual([], cb);
+          if (typeof filter === "function") { cb = filter; filter = null; }
+          var ctxs = [];
+          // Report the emulated offscreen document so callers that enumerate contexts
+          // before messaging it (Notion/Loom/Momentum) find it.
+          try {
+            var offUrl = chrome.runtime.__c2sOffscreen && chrome.runtime.__c2sOffscreen();
+            if (offUrl != null) {
+              var doc = { contextType: "OFFSCREEN_DOCUMENT", documentUrl: chrome.runtime.getURL ? chrome.runtime.getURL(offUrl) : offUrl, contextId: "c2s-offscreen", frameId: -1, tabId: -1, windowId: -1 };
+              var wantType = filter && filter.contextTypes;
+              if (!wantType || wantType.indexOf("OFFSCREEN_DOCUMENT") >= 0) ctxs.push(doc);
+            }
+          } catch (e) {}
+          return dual(ctxs, cb);
         },
         openOptionsPage: function (cb) {
           try {
