@@ -12,8 +12,55 @@ import { printIssues, countBlocking, summarizeManifestChanges, buildReportMarkdo
 import { run, info, ok, warn, fail, color, commandExists, setVerbose, setQuiet } from "./util.js";
 import { LSREGISTER, uninstallFromSafari, listSafariExtensions } from "./build/installer.js";
 import { detectXcodeTeam, defaultBundleId } from "./build/packager.js";
+import { verifyInSafari } from "./build/verify.js";
 import { isUrl, downloadExtension } from "./input/download.js";
 import type { Platforms } from "./types.js";
+
+// Option keys a config file may set. Mirrors the long-flag names in parseArgs so
+// a viaduct.config.json reads exactly like the CLI: { "bundle-id": "...", "team": "auto" }.
+// Excludes one-shot/meta flags (analyze, doctor, list, version, etc.) that make no
+// sense to persist. ponytail: hand-listed; add a key here when it's worth persisting.
+const CONFIG_KEYS = [
+  "output", "bundle-id", "app-name", "min-safari", "platforms", "ci",
+  "zip", "no-build", "open-xcode", "install", "install-dir",
+  "no-safari-restart", "team", "no-shim", "no-oauth-bridge", "keep-module",
+  "force", "strict", "verify",
+] as const;
+
+// Load a JSON config and overlay it onto parsed CLI values: a value the user
+// passed on the CLI always wins (we detect that via argv), config fills the rest.
+// Returns the config path used (for messaging) or null if none was loaded.
+function applyConfig(
+  values: Record<string, unknown>,
+  explicitPath: string | undefined,
+  argv: string[]
+): string | null {
+  const path = explicitPath ?? (existsSync("viaduct.config.json") ? "viaduct.config.json" : undefined);
+  if (!path) return null;
+  if (!existsSync(path)) {
+    fail(`Config file not found: ${path}`);
+    process.exit(2);
+  }
+  let cfg: Record<string, unknown>;
+  try {
+    cfg = JSON.parse(readFileSync(resolve(path), "utf-8"));
+  } catch (e) {
+    fail(`Could not parse ${path}: ${(e as Error).message}`);
+    process.exit(2);
+  }
+  const allowed = new Set<string>(CONFIG_KEYS);
+  for (const [key, val] of Object.entries(cfg)) {
+    if (!allowed.has(key)) {
+      warn(`Ignoring unknown config key "${key}" in ${path}.`);
+      continue;
+    }
+    // A flag the user typed (e.g. --bundle-id) overrides config. parseArgs doesn't
+    // record provenance, so scan argv for the long flag.
+    if (argv.includes(`--${key}`) || argv.some((a) => a.startsWith(`--${key}=`))) continue;
+    values[key] = val;
+  }
+  return path;
+}
 
 function pkgVersion(): string {
   try {
@@ -43,6 +90,7 @@ const HELP = `viaduct — convert a Chrome extension to a Safari Web Extension
 
 USAGE
   viaduct <input> [options]
+  viaduct <in1> <in2> …             # batch: convert several inputs in one run
   viaduct <input> --analyze         # report only, no conversion
   viaduct --doctor                  # check local toolchain
   viaduct --list                    # list registered Safari Web Extensions
@@ -67,6 +115,7 @@ OPTIONS
       --no-build            Generate the Xcode project but do not run xcodebuild
       --open-xcode          Open the generated .xcodeproj in Xcode when done
       --install             Install the built app to ~/Applications + register it with Safari
+      --verify              After --install, check Safari registered/enabled the extension
       --install-dir <dir>   Install target directory (default: ~/Applications)
       --no-safari-restart   With --install, don't quit/relaunch Safari or set the unsigned toggle
       --team <id>           Sign with an Apple Developer Team ID (real signing → the
@@ -82,6 +131,8 @@ OPTIONS
       --analyze             Analyze and report only (also previews the manifest rewrites)
       --json                With --analyze, print a machine-readable JSON report
       --report <file>       With --analyze, also write the report to <file> (.json if --json, else Markdown)
+      --config <file>       Load defaults from <file> (default: ./viaduct.config.json if present).
+                            JSON keyed by long-flag name; CLI flags override it.
       --doctor              Verify xcrun/packager/xcodebuild availability
       --list                List Safari Web Extensions registered with pluginkit
       --uninstall <name>    Remove the installed <name>.app + unregister it (use with --install-dir)
@@ -242,6 +293,8 @@ async function main(): Promise<void> {
         "install-dir": { type: "string" },
         "no-safari-restart": { type: "boolean", default: false },
         team: { type: "string" },
+        verify: { type: "boolean", default: false },
+        config: { type: "string" },
         "no-shim": { type: "boolean", default: false },
         "no-oauth-bridge": { type: "boolean", default: false },
         "keep-module": { type: "boolean", default: false },
@@ -268,6 +321,12 @@ async function main(): Promise<void> {
   const { values, positionals } = parsed;
   setVerbose(values.verbose);
   setQuiet(values.quiet && !values.verbose);
+
+  // Overlay config before validation so config-supplied bundle-id/team/etc. are
+  // validated like CLI ones. Meta flags (--version/--help/--doctor/--list/
+  // --uninstall/--analyze) run below and ignore config; that's fine.
+  const configPath = applyConfig(values as Record<string, unknown>, values.config, process.argv.slice(2));
+  if (configPath) info(`Using config ${configPath}`);
 
   if (values.version) {
     console.log(pkgVersion());
@@ -297,15 +356,17 @@ async function main(): Promise<void> {
     process.exit(uninstallFromSafari(name, values["install-dir"]) ? 0 : 1);
   }
 
-  const input = positionals[0];
-  if (!input) {
+  const inputs = positionals;
+  if (inputs.length === 0) {
     fail("Missing <input> (a .zip, .crx, extension directory, or URL).");
     console.log(HELP);
     process.exit(2);
   }
-  if (!isUrl(input) && !existsSync(input)) {
-    fail(`Input not found: ${input}`);
-    process.exit(1);
+  for (const input of inputs) {
+    if (!isUrl(input) && !existsSync(input)) {
+      fail(`Input not found: ${input}`);
+      process.exit(1);
+    }
   }
 
   const platforms = values.platforms as Platforms;
@@ -316,6 +377,11 @@ async function main(): Promise<void> {
 
   if (values.install && (values["no-build"] || values["temp-load"])) {
     fail("--install requires a build; remove --no-build / --temp-load.");
+    process.exit(2);
+  }
+
+  if (values.verify && !values.install) {
+    fail("--verify requires --install (it checks the installed extension).");
     process.exit(2);
   }
 
@@ -344,27 +410,25 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  let localInput = input;
-  if (isUrl(input)) {
-    info(`Downloading extension from ${input} …`);
-    const dlScratch = mkdtempSync(join(tmpdir(), "c2s-dl-"));
-    // Clean the download scratch on ANY exit (success or failure). The pipeline
-    // exits via process.exit on multiple paths, so a finally won't always run;
-    // an exit handler fires regardless and prevents leaking the downloaded archive.
-    process.on("exit", () => rmSync(dlScratch, { recursive: true, force: true }));
-    try {
-      localInput = await downloadExtension(input, dlScratch);
-    } catch (e) {
-      fail((e as Error).message);
-      process.exit(1);
+  // Single-file outputs can't hold multiple extensions, so forbid them in batch.
+  if (inputs.length > 1) {
+    if (values.output !== undefined) {
+      fail("--output names a single directory; omit it for batch (each extension gets its default ./<App>_Safari).");
+      process.exit(2);
     }
-    ok(`Downloaded → ${basename(localInput)}`);
+    if (values.report !== undefined) {
+      fail("--report names a single file; omit it for batch runs.");
+      process.exit(2);
+    }
+    if (values["app-name"] !== undefined || values["bundle-id"] !== undefined) {
+      fail("--app-name / --bundle-id apply to one extension; omit them for batch (names are derived per-extension).");
+      process.exit(2);
+    }
   }
 
-  if (values.analyze) process.exit(analyzeOnly(localInput, platforms, values.json, values.strict, values.report));
-
+  // Team detection is the same for every input; do it once up front.
   let team = values.team;
-  if (team === "auto" || (team === undefined && values.install)) {
+  if (!values.analyze && (team === "auto" || (team === undefined && values.install))) {
     const detected = detectXcodeTeam();
     if (detected) {
       team = detected;
@@ -375,63 +439,109 @@ async function main(): Promise<void> {
     }
   }
 
-  let result;
-  try {
-    result = convert({
-      input: localInput,
-      output: values.output,
-      bundleId: values["bundle-id"],
-      appName: values["app-name"],
-      minSafariVersion: values["min-safari"],
-      platforms,
-      copyResources: values.ci, // default false → symlink dev mode
-      tempLoadOnly: values["temp-load"],
-      generateShim: !values["no-shim"],
-      oauthBridge: !values["no-oauth-bridge"],
-      build: !values["no-build"],
-      install: values.install,
-      installDir: values["install-dir"],
-      safariRestart: !values["no-safari-restart"],
-      team,
-      force: values.force,
-      strict: values.strict,
-      clean: values.clean,
-      zip: values.zip,
-      openXcode: values["open-xcode"],
-      keepModuleBackground: values["keep-module"],
-    });
-  } catch (e) {
-    fail((e as Error).message);
-    process.exit(1);
+  // Process each input independently and remember whether it succeeded. One bad
+  // input doesn't abort the rest of a batch; the exit code is non-zero if any failed.
+  const batch = inputs.length > 1;
+  let anyFailed = false;
+  for (const input of inputs) {
+    if (batch) console.log(`\n${color("bold", `── ${basename(input)} ──`)}`);
+
+    let localInput = input;
+    if (isUrl(input)) {
+      info(`Downloading extension from ${input} …`);
+      const dlScratch = mkdtempSync(join(tmpdir(), "c2s-dl-"));
+      // Clean the download scratch on ANY exit (success or failure). The pipeline
+      // exits via process.exit on multiple paths, so a finally won't always run;
+      // an exit handler fires regardless and prevents leaking the downloaded archive.
+      process.on("exit", () => rmSync(dlScratch, { recursive: true, force: true }));
+      try {
+        localInput = await downloadExtension(input, dlScratch);
+      } catch (e) {
+        fail((e as Error).message);
+        if (!batch) process.exit(1);
+        anyFailed = true;
+        continue;
+      }
+      ok(`Downloaded → ${basename(localInput)}`);
+    }
+
+    if (values.analyze) {
+      const code = analyzeOnly(localInput, platforms, values.json, values.strict, values.report);
+      if (code !== 0) anyFailed = true;
+      continue;
+    }
+
+    let result;
+    try {
+      result = convert({
+        input: localInput,
+        output: values.output,
+        bundleId: values["bundle-id"],
+        appName: values["app-name"],
+        minSafariVersion: values["min-safari"],
+        platforms,
+        copyResources: values.ci, // default false → symlink dev mode
+        tempLoadOnly: values["temp-load"],
+        generateShim: !values["no-shim"],
+        oauthBridge: !values["no-oauth-bridge"],
+        build: !values["no-build"],
+        install: values.install,
+        installDir: values["install-dir"],
+        safariRestart: !values["no-safari-restart"],
+        team,
+        force: values.force,
+        strict: values.strict,
+        clean: values.clean,
+        zip: values.zip,
+        openXcode: values["open-xcode"],
+        keepModuleBackground: values["keep-module"],
+      });
+    } catch (e) {
+      fail((e as Error).message);
+      if (!batch) process.exit(1);
+      anyFailed = true;
+      continue;
+    }
+
+    console.log("");
+    if (result.success) {
+      ok(color("bold", `Done: ${result.extensionName}`));
+      if (result.installedAppPath) {
+        console.log(`  Installed: ${result.installedAppPath}`);
+        console.log("  Safari → Settings → Extensions → enable the extension.");
+        if (team) {
+          console.log("  Team-signed: stays enabled across Safari quits (no unsigned toggle).");
+          console.log("  Free personal team: re-run this command to re-sign before the ~7-day profile expires.");
+        } else {
+          console.log('  After each Safari restart, re-tick Develop → "Allow Unsigned Extensions".');
+        }
+      } else if (result.appPath) {
+        console.log(`  App:    ${result.appPath}`);
+        console.log(`  Install: re-run with --install, or  cp -R "${result.appPath}" ~/Applications/`);
+        console.log("  Then: Safari → Settings → Extensions → enable.");
+      } else if (result.xcodeProject) {
+        console.log(`  Project: ${result.xcodeProject}`);
+      } else if (result.stagedPath) {
+        console.log(`  Staged:  ${result.stagedPath}`);
+      }
+      if (result.zipPath) console.log(`  Zip:     ${result.zipPath}`);
+
+      if (values.verify && result.installedAppPath && result.resolvedBundleId) {
+        const v = verifyInSafari(result.resolvedBundleId);
+        if (!v.registered) anyFailed = true;
+      }
+    } else {
+      fail("Conversion did not complete. See messages above.");
+      anyFailed = true;
+    }
   }
 
-  console.log("");
-  if (result.success) {
-    ok(color("bold", `Done: ${result.extensionName}`));
-    if (result.installedAppPath) {
-      console.log(`  Installed: ${result.installedAppPath}`);
-      console.log("  Safari → Settings → Extensions → enable the extension.");
-      if (team) {
-        console.log("  Team-signed: stays enabled across Safari quits (no unsigned toggle).");
-        console.log("  Free personal team: re-run this command to re-sign before the ~7-day profile expires.");
-      } else {
-        console.log('  After each Safari restart, re-tick Develop → "Allow Unsigned Extensions".');
-      }
-    } else if (result.appPath) {
-      console.log(`  App:    ${result.appPath}`);
-      console.log(`  Install: re-run with --install, or  cp -R "${result.appPath}" ~/Applications/`);
-      console.log("  Then: Safari → Settings → Extensions → enable.");
-    } else if (result.xcodeProject) {
-      console.log(`  Project: ${result.xcodeProject}`);
-    } else if (result.stagedPath) {
-      console.log(`  Staged:  ${result.stagedPath}`);
-    }
-    if (result.zipPath) console.log(`  Zip:     ${result.zipPath}`);
-    process.exit(0);
-  } else {
-    fail("Conversion did not complete. See messages above.");
-    process.exit(1);
+  if (batch) {
+    const n = inputs.length;
+    if (anyFailed) fail(`Batch finished with failures (${n} input(s)). See messages above.`);
+    else ok(color("bold", `Batch complete: ${n} extension(s).`));
   }
+  process.exit(anyFailed ? 1 : 0);
 }
 
 main().catch((e) => {

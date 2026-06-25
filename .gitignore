@@ -17,7 +17,8 @@ build-output/
 DerivedData/
 *.appex
 *.app/
-build/
+# Root-only: don't catch the src/build/ source dir.
+/build/
 *.xcarchive
 *.ipa
 *.dSYM/
@@ -45,3 +46,8 @@ test extensions/
 
 # Editor / local MCP config
 .vscode/
+
+# Tests, per-extension reports, and project notes — kept local, not pushed
+test/
+reports/
+CLAUDE.md
