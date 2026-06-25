@@ -355,3 +355,70 @@ test("storage.session.setAccessLevel: backfilled on a frozen native session so i
   await new Promise((res) => chrome.storage.session.set({ k: 1 }, res));
   assert.equal(sessionData.k, 1, "native session.set still reaches the real backing store");
 });
+
+// ---- storage.session emulation (Safari <16.4 path: session absent → in-memory) ----
+test("storage.session: set/get structured-clone so callers can't mutate the store", async () => {
+  const chrome = setup(); // makeStore() has only local → session is emulated
+  const obj = { nested: { count: 1 } };
+  await chrome.storage.session.set({ state: obj });
+  obj.nested.count = 999; // mutate the object we passed in
+  const got = await chrome.storage.session.get("state");
+  assert.equal(got.state.nested.count, 1, "post-set mutation must not leak into the store");
+  got.state.nested.count = 42; // mutate what we got back
+  const again = await chrome.storage.session.get("state");
+  assert.equal(again.state.nested.count, 1, "mutating a get() result must not leak either");
+});
+
+test("storage.session.onChanged fires with oldValue/newValue diffs", async () => {
+  const chrome = setup();
+  const events = [];
+  chrome.storage.session.onChanged.addListener((changes) => events.push(changes));
+  await chrome.storage.session.set({ a: 1 });
+  await chrome.storage.session.set({ a: 2 });
+  await chrome.storage.session.set({ a: 2 }); // no-op, must not fire
+  await chrome.storage.session.remove("a");
+  assert.equal(events.length, 3, "set(new), set(changed), remove fire; unchanged set does not");
+  assert.deepEqual(events[0].a, { oldValue: undefined, newValue: 1 });
+  assert.deepEqual(events[1].a, { oldValue: 1, newValue: 2 });
+  assert.equal(events[2].a.oldValue, 2);
+  assert.ok(!("newValue" in events[2].a), "remove diff has no newValue");
+});
+
+test("runtime.getPlatformInfo and getContexts are backfilled (were missing → threw)", async () => {
+  const chrome = setup();
+  const info = await chrome.runtime.getPlatformInfo();
+  assert.equal(info.os, "mac");
+  assert.ok(info.arch);
+  const ctxs = await chrome.runtime.getContexts({});
+  assert.deepEqual(ctxs, [], "getContexts returns an empty list so callers fall through");
+  // callback form
+  const cbInfo = await new Promise((r) => chrome.runtime.getPlatformInfo(r));
+  assert.equal(cbInfo.os, "mac");
+});
+
+// ---- top-level throw guard: frozen absent namespace slots must not abort the shim ----
+test("frozen sidePanel/identity/notifications slots don't kill later shim patches", () => {
+  // Safari exposes absent namespaces as exotic non-writable slots: `chrome.sidePanel = {}`
+  // THROWS. The sidePanel/identity/notifications blocks do exactly that raw assign and sit
+  // in the unguarded window before the first inner-try block, so pre-guard the first throw
+  // aborted every later patch (storage.session, runtime.getPlatformInfo/getContexts, the
+  // DNR crash-strip). Model the hostile slots and assert those LATER patches still install.
+  const chrome = {
+    runtime: { lastError: null, getManifest: () => ({}), id: "x" },
+    storage: { local: { get: (k, cb) => cb({}), set: (o, cb) => cb && cb() } },
+    tabs: { create: () => Promise.resolve({}), query: (q, cb) => cb && cb([]) },
+  };
+  for (const k of ["sidePanel", "identity", "notifications"]) {
+    Object.defineProperty(chrome, k, { configurable: false, get() { return undefined; } }); // assign throws
+  }
+  const g = { chrome };
+  assert.doesNotThrow(() => {
+    new Function("chrome", "window", "self", "globalThis", shimSource())(chrome, { addEventListener() {} }, undefined, g);
+  }, "shim must not throw on frozen namespace slots");
+  // These run AFTER the unguarded raw-assign blocks. If a sidePanel/identity/notifications
+  // throw had escaped its block, the shim would have bailed before reaching them.
+  const c = g.chrome;
+  assert.ok(c.storage && c.storage.session, "late storage.session patch reached");
+  assert.equal(typeof c.runtime.getPlatformInfo, "function", "late runtime.getPlatformInfo reached");
+  assert.equal(typeof c.runtime.getContexts, "function", "late runtime.getContexts reached");
+});

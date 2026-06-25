@@ -735,13 +735,21 @@ var __C2S_DEBUG__ = false;
   // storage.sync has no iCloud sync in Safari; route it to local so data persists.
   // Only shim when sync is missing or non-functional — never clobber a browser
   // that exposes a real, working storage.sync.
+  // Per-block guard: this sits in the unguarded window before the first inner-try
+  // backfill block. If the mutableNamespace clone fails and the `|| api.storage`
+  // fallback hands back the frozen original, `__stg.sync = {…}` throws on Safari —
+  // which without this catch would abort EVERY later patch (notifications, debugger,
+  // the whole namespace backfill, and the DNR modifyHeaders strip that prevents a
+  // Safari browser crash). Contain it.
+  try {
   if (api.storage && api.storage.local &&
       (!api.storage.sync || typeof api.storage.sync.get !== "function")) {
     // Safari's storage namespace is frozen — a raw `api.storage.sync = {…}` throws
     // and (pre-guard) aborted the whole shim. Swap in an extensible clone first so
     // the assignment lands. local is read off the original (preserved by the clone).
     var __stg = mutableNamespace(api, "storage") || api.storage;
-    var local = __stg.local;
+    var local = __stg && __stg.local;
+    if (local && typeof local.get === "function") {
     // Bridge Chrome's callback form. When api is the webextension-polyfill
     // browser object, local.get/set/... are promise-ONLY and ignore a trailing
     // callback — so chrome.storage.sync.get(keys, cb) would never fire cb. Strip a
@@ -782,12 +790,17 @@ var __C2S_DEBUG__ = false;
         };
       })(),
     };
+    }
   }
+  } catch (__storageSyncErr) {}
 
   // sidePanel is absent; fall back to opening the panel HTML in a tab. Honor the
   // path the extension actually configured (via setOptions/open) instead of a
   // hardcoded "sidepanel.html" — extensions name the panel page differently
   // (panel.html, side_panel/index.html, …) and a fixed guess 404s on open().
+  // Per-block guard: `chrome.sidePanel = {…}` is a raw assign to the (frozen on Safari)
+  // chrome root — if it throws, every later patch incl. the DNR crash-strip is lost.
+  try {
   if (typeof chrome !== "undefined" && !chrome.sidePanel && chrome.tabs) {
     // Seed from the manifest's side_panel.default_path so an extension that relies
     // on the manifest default (never calling setOptions) still opens the right page.
@@ -845,9 +858,12 @@ var __C2S_DEBUG__ = false;
       getPanelBehavior: function () { return Promise.resolve({}); },
     };
   }
+  } catch (__sidePanelErr) {}
 
   // chrome.identity is unsupported; stub so calls reject instead of crashing.
   // Replace with a hosted OAuth2 redirect flow (see SAFARI_NOTES.md).
+  // Per-block guard: `chrome.identity = {…}` is a raw assign to the frozen chrome root.
+  try {
   if (typeof chrome !== "undefined" && !chrome.identity) {
     var unsupported = function () {
       return Promise.reject(new Error("chrome.identity is unsupported in Safari. Use a hosted OAuth2 flow."));
@@ -859,13 +875,19 @@ var __C2S_DEBUG__ = false;
       getRedirectURL: function () { return ""; },
     };
   }
+  } catch (__identityErr) {}
 
   // chrome.notifications: Safari exposes only a PARTIAL object (create/clear) and
   // omits the event objects (onClicked, onClosed, …). Module-eval that reads
   // chrome.notifications.onClicked.addListener throws and aborts SW registration.
   // Fill BOTH a missing object AND missing members on a partial one.
+  // Per-block guard: the `chrome.notifications = {}` fallback is a raw assign to the
+  // frozen chrome root; if it throws, fill a detached object so the event stubs still
+  // exist for anything that read them off our local `n` (and never abort the shim).
+  try {
   if (typeof chrome !== "undefined") {
-    var n = chrome.notifications || (chrome.notifications = {});
+    var n = chrome.notifications;
+    if (!n) { try { chrome.notifications = n = {}; } catch (e) { n = {}; } }
     if (typeof n.create !== "function") n.create = function (id, opts, cb) {
       // Chrome allows the id to be omitted: create(options, callback). Detect the
       // shifted form (first arg is the options object) and realign.
@@ -891,6 +913,7 @@ var __C2S_DEBUG__ = false;
     if (!n.onShowSettings) n.onShowSettings = event();
     if (!n.onPermissionLevelChanged) n.onPermissionLevelChanged = event();
   }
+  } catch (__notificationsErr) {}
 
   // Safari has no native tab-groups API. Chrome's tabGroups is just an
   // association of tab IDs + metadata (title/color/collapsed), so emulate it in
@@ -1746,22 +1769,63 @@ var __C2S_DEBUG__ = false;
     // semantics (string | array | object-with-defaults | null = everything).
     if (stg && !stg.session) {
       var sessMem = Object.create(null);
+      // Real chrome.storage.session structured-clones values in and out, so a caller
+      // that mutates an object it set (or one it got back) never touches the store.
+      // Without this the in-memory map handed out live references → phantom writes in
+      // any extension caching nested object state in session storage (common in MV3).
+      var sessClone = function (v) {
+        if (v == null || typeof v !== "object") return v;
+        try { return typeof structuredClone === "function" ? structuredClone(v) : JSON.parse(JSON.stringify(v)); }
+        catch (e) { try { return JSON.parse(JSON.stringify(v)); } catch (e2) { return v; } }
+      };
       var sessGet = function (keys) {
         var out = {};
-        if (keys == null) { for (var k in sessMem) out[k] = sessMem[k]; return out; }
+        if (keys == null) { for (var k in sessMem) out[k] = sessClone(sessMem[k]); return out; }
         if (typeof keys === "string") keys = [keys];
-        if (Array.isArray(keys)) { for (var i = 0; i < keys.length; i++) { if (keys[i] in sessMem) out[keys[i]] = sessMem[keys[i]]; } return out; }
-        for (var d in keys) out[d] = (d in sessMem) ? sessMem[d] : keys[d];
+        if (Array.isArray(keys)) { for (var i = 0; i < keys.length; i++) { if (keys[i] in sessMem) out[keys[i]] = sessClone(sessMem[keys[i]]); } return out; }
+        for (var d in keys) out[d] = (d in sessMem) ? sessClone(sessMem[d]) : keys[d];
         return out;
+      };
+      // Real onChanged event so session-driven reactive UI (popup re-reads when the SW
+      // writes) actually updates. set/remove/clear compute {oldValue,newValue} diffs and
+      // emit; also relay into the global storage.onChanged with areaName "session".
+      var sameJson = function (a, b) { try { return JSON.stringify(a) === JSON.stringify(b); } catch (e) { return a === b; } };
+      var sessOnChanged = eventList();
+      var sessEmit = function (changes) {
+        var hasAny = false; for (var _k in changes) { hasAny = true; break; }
+        if (!hasAny) return;
+        try { if (sessOnChanged) sessOnChanged._emit(changes); } catch (e) {}
+        try { if (stg.onChanged && typeof stg.onChanged._emit === "function") stg.onChanged._emit(changes, "session"); } catch (e) {}
       };
       setIfMissing(stg, "session", {
         get: function (keys, cb) { if (typeof keys === "function") { cb = keys; keys = null; } return dual(sessGet(keys), cb); },
-        set: function (items, cb) { for (var k in items) sessMem[k] = items[k]; return dual(undefined, cb); },
-        remove: function (keys, cb) { if (typeof keys === "string") keys = [keys]; if (Array.isArray(keys)) { for (var i = 0; i < keys.length; i++) delete sessMem[keys[i]]; } return dual(undefined, cb); },
-        clear: function (cb) { sessMem = Object.create(null); return dual(undefined, cb); },
+        set: function (items, cb) {
+          var changes = {};
+          for (var k in items) {
+            var nv = sessClone(items[k]);
+            if (!sameJson(sessMem[k], nv)) changes[k] = { oldValue: sessClone(sessMem[k]), newValue: sessClone(nv) };
+            sessMem[k] = nv;
+          }
+          sessEmit(changes);
+          return dual(undefined, cb);
+        },
+        remove: function (keys, cb) {
+          if (typeof keys === "string") keys = [keys];
+          var changes = {};
+          if (Array.isArray(keys)) { for (var i = 0; i < keys.length; i++) { var rk = keys[i]; if (rk in sessMem) { changes[rk] = { oldValue: sessClone(sessMem[rk]) }; delete sessMem[rk]; } } }
+          sessEmit(changes);
+          return dual(undefined, cb);
+        },
+        clear: function (cb) {
+          var changes = {};
+          for (var ck in sessMem) changes[ck] = { oldValue: sessClone(sessMem[ck]) };
+          sessMem = Object.create(null);
+          sessEmit(changes);
+          return dual(undefined, cb);
+        },
         getBytesInUse: function (k, cb) { if (typeof k === "function") { cb = k; } return dual(0, cb); },
         setAccessLevel: function (o, cb) { return dual(undefined, cb); },
-        onChanged: event(),
+        onChanged: sessOnChanged || event(),
       });
     }
     // Safari (16.4+) SHIPS chrome.storage.session, but WITHOUT setAccessLevel — that's
@@ -2659,6 +2723,19 @@ var __C2S_DEBUG__ = false;
       fill(chrome.runtime, {
         requestUpdateCheck: function (cb) { return dual({ status: "no_update" }, cb); },
         setUninstallURL: function (u, cb) { return dual(undefined, cb); },
+        // MV3 platform probe — heavily called (≈24 sites in the corpus) by bundles
+        // that branch on OS/arch. Safari runs only on Apple platforms; report mac+arm64
+        // (close enough — code paths gate features, they don't need byte-exact arch).
+        // Missing entirely, this threw TypeError and aborted whatever read it at eval.
+        getPlatformInfo: function (cb) { return dual({ os: "mac", arch: "arm64", nacl_arch: "arm64" }, cb); },
+        // MV3 context enumeration (≈40 sites — Notion/Loom/Momentum use it to find the
+        // offscreen doc / SW before messaging it). Safari has no offscreen/SW-context
+        // registry to enumerate; return an empty list so callers fall through to their
+        // "no such context, create/skip" branch instead of throwing on undefined().
+        getContexts: function (filter, cb) {
+          if (typeof filter === "function") { cb = filter; }
+          return dual([], cb);
+        },
         openOptionsPage: function (cb) {
           try {
             var m = chrome.runtime.getManifest ? chrome.runtime.getManifest() : null;
