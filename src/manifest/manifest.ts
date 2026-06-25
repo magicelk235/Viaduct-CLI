@@ -257,7 +257,12 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
     if (perm in UNSUPPORTED_PERMISSIONS) {
       const shimmed = SHIMMED_PERMISSIONS.has(perm);
       issues.push({
-        severity: "warning",
+        // A shimmed permission's capability still works (the shim emulates the API),
+        // so it's informational, not a warning — matching the severity the same
+        // capability gets in UNSUPPORTED_APIS. Telling authors a working feature
+        // "will be removed" at warning level is the over-flagging the project guards
+        // against. Only a genuinely-dropped (unshimmed) permission stays a warning.
+        severity: shimmed ? "info" : "warning",
         category: "permission",
         message: shimmed
           ? `Permission "${perm}" is removed (Safari rejects it), but the shim emulates the API so it keeps working.`
@@ -627,7 +632,10 @@ export function collectReferencedPaths(m: Manifest): Set<string> {
   add((m as { sidebar_action?: { default_panel?: unknown } }).sidebar_action?.default_panel);
   add((m as { storage?: { managed_schema?: unknown } }).storage?.managed_schema);
 
-  // web_accessible_resources: MV2 string[] or MV3 [{resources: string[]}].
+  // web_accessible_resources: MV2 string[], MV3 [{resources: string[]}], or a bare
+  // string (invalid but hand-edited manifests produce it — transformManifest wraps
+  // it, so stage it here too or the referenced file is dropped).
+  if (typeof m.web_accessible_resources === "string") add(m.web_accessible_resources);
   for (const entry of arr(m.web_accessible_resources)) {
     if (typeof entry === "string") add(entry);
     else for (const r of arr((entry as { resources?: unknown })?.resources)) add(r);
@@ -705,6 +713,15 @@ export function transformManifest(
   // `browser_action` — injecting an `action` key into an MV2 manifest makes Safari
   // reject it at load (same rule the popup-wiring below relies on). (MV3 dropped the
   // show-only-on-some-pages distinction; Safari treats both as a plain action.)
+  // Treat an empty `action: {}` / `browser_action: {}` as absent — migration tools
+  // leave these stubs behind, and an empty object must not block the page_action
+  // fold (which would silently drop the page_action's real default_popup) nor pin
+  // the wrong toolbar key below.
+  const nonEmpty = (v: unknown): boolean =>
+    typeof v === "object" && v !== null && Object.keys(v as object).length > 0;
+  if (out.action && !nonEmpty(out.action)) delete out.action;
+  if (out.browser_action && !nonEmpty(out.browser_action)) delete out.browser_action;
+
   if (out.page_action && !out.action && !out.browser_action) {
     const foldKey = mv === 3 ? "action" : "browser_action";
     out[foldKey] = out.page_action as Manifest["action"];
@@ -732,6 +749,12 @@ export function transformManifest(
   // MV3 requires web_accessible_resources to be an array of {resources, matches}
   // objects. A bare MV2 string[] makes Safari reject the manifest at load. Wrap
   // the flat list, exposing it to all URLs (the MV2 default visibility).
+  // A bare-string web_accessible_resources ("inject.js") is invalid even under MV2,
+  // but hand edits / loose tooling produce it. Normalize to a one-element array so
+  // the wrapping below applies and collectReferencedPaths stages the file.
+  if (typeof out.web_accessible_resources === "string") {
+    out.web_accessible_resources = [out.web_accessible_resources] as unknown as Manifest["web_accessible_resources"];
+  }
   if (mv === 3 && Array.isArray(out.web_accessible_resources)) {
     const flat = out.web_accessible_resources as unknown[];
     // Handle mixed arrays per-entry: a bare string[] is MV2-style, but hand-edited
@@ -752,11 +775,18 @@ export function transformManifest(
     safari: { strict_min_version: opts.minSafariVersion ?? "15.4" },
   };
 
-  // Ensure the toolbar button does something: wire a popup if one exists. Pick the
-  // key valid for this manifest version — MV2 has no `action` (only browser_action),
-  // so injecting `action` there produces a manifest Safari rejects at load.
-  const defaultActionKey = mv === 3 ? "action" : "browser_action";
-  const actionKey = out.action ? "action" : out.browser_action ? "browser_action" : defaultActionKey;
+  // Ensure the toolbar button does something: wire a popup if one exists. Normalize
+  // to the key VALID for this manifest version rather than trusting the input's
+  // shape — MV2 must use `browser_action` (Safari rejects `action` in an MV2
+  // manifest), MV3 must use `action` (Safari ignores `browser_action` under MV3, so
+  // a popup wired there would be dropped). Migrate a mismatched existing key so its
+  // contents (e.g. an author-set default_popup) survive into the right slot.
+  const actionKey = mv === 3 ? "action" : "browser_action";
+  const wrongKey = mv === 3 ? "browser_action" : "action";
+  if (out[wrongKey] && !out[actionKey]) {
+    out[actionKey] = out[wrongKey] as Manifest["action"];
+    delete out[wrongKey];
+  }
   const action = (out[actionKey] as Manifest["action"]) ?? {};
   if (!action.default_popup) {
     for (const candidate of ["popup.html", "sidepanel.html", "panel.html", "index.html"]) {
