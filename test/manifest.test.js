@@ -81,6 +81,19 @@ test("analyzeManifest marks unsupported permissions for removal", () => {
   assert.ok(!permissionsToRemove.includes("tabs"));
 });
 
+test("analyzeManifest strips Safari-unrecognized webRequest/DNR permission variants", () => {
+  // These real-world tokens (Bitwarden/LastPass/Urban VPN use webRequestAuthProvider;
+  // Tampermonkey uses declarativeNetRequestWithHostAccess) aren't recognized by Safari.
+  // Left in the manifest they're dead at best; strip them so the manifest stays clean.
+  const { permissionsToRemove } = analyzeManifest({
+    manifest_version: 3,
+    permissions: ["webRequest", "webRequestAuthProvider", "declarativeNetRequestWithHostAccess"],
+  });
+  assert.ok(permissionsToRemove.includes("webRequestAuthProvider"));
+  assert.ok(permissionsToRemove.includes("declarativeNetRequestWithHostAccess"));
+  assert.ok(!permissionsToRemove.includes("webRequest"), "plain webRequest stays (degrades, still loads)");
+});
+
 test("analyzeManifest tags shim-backed removed permissions as shimmed", () => {
   const { issues } = analyzeManifest({
     manifest_version: 3,

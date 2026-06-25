@@ -13,6 +13,8 @@ export const UNSUPPORTED_PERMISSIONS: Record<string, string> = {
   tabGroups: "Safari has no native tabGroups API; the shim emulates it in memory (no tab-bar coloring).",
   offscreen: "Safari has no offscreen documents API; use the service worker or web workers.",
   webRequestBlocking: "Blocking webRequest is unsupported; use declarativeNetRequest.",
+  webRequestAuthProvider: "Safari can't provide credentials for onAuthRequired (proxy/HTTP auth) via webRequest; the listener still fires read-only, but handle auth in-page or natively.",
+  declarativeNetRequestWithHostAccess: "Safari doesn't recognize this DNR variant token; declare plain declarativeNetRequest (rules still apply on hosts the extension already has access to).",
   gcm: "chrome.gcm is Chrome-only; relay via APNs in the host app or poll with chrome.alarms.",
   tts: "Permission dropped, but the shim routes chrome.tts to the Web Speech API (speechSynthesis), so speak/stop/pause keep working.",
   ttsEngine: "TTS engine API unavailable.",
