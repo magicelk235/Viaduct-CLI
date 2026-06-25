@@ -21,8 +21,12 @@ function unzipTo(zipPath: string, destDir: string): void {
 }
 
 /**
- * Guard against zip-slip: ensure every extracted entry resolves inside destDir.
- * ditto does not sanitize `../` entries, so a crafted archive could write outside.
+ * Guard against zip-slip. Both extractors (`ditto -x -k` and `unzip`) already
+ * sanitize `../` path entries — verified: a crafted archive's `../../escape`
+ * entry lands inside destDir, not the parent. So this walk's real job is the
+ * SYMLINK vector: an in-tree symlink whose realpath stays inside passes a naive
+ * location check yet still lets later cpSync staging follow it out of the package.
+ * It also backstops any future extractor that's less strict about path entries.
  */
 function assertNoPathEscape(destDir: string): void {
   const root = realpathSync(resolve(destDir));

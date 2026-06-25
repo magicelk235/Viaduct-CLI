@@ -172,6 +172,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
         manifestVersion: result.manifestVersion,
         platforms: opts.platforms,
         removedPermissions: permissionsToRemove,
+        strict: opts.strict,
       },
       issues
     );

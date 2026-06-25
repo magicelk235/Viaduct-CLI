@@ -11,7 +11,11 @@ const COLORS = {
   bold: "\x1b[1m",
 } as const;
 
-const useColor = process.stdout.isTTY && !process.env.NO_COLOR;
+// Diagnostics (info/ok/warn/fail) all write to stderr, so gate color on stderr's
+// TTY-ness, not stdout's — otherwise `cmd 2>/dev/null` piping leaves color codes
+// on a redirected stdout, or suppresses them when only stderr is a terminal.
+// ponytail: stderr-only gate; split per-stream if stdout output ever needs color.
+const useColor = process.stderr.isTTY && !process.env.NO_COLOR;
 
 export function color(c: keyof typeof COLORS, s: string): string {
   return useColor ? `${COLORS[c]}${s}${RESET}` : s;
