@@ -404,6 +404,9 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
       continue;
     }
     const rel = relative(extPath, file);
+    // One lazy newline index per file, shared by all checks below (each builds its
+    // offset table on first call, then reuses it).
+    const lineAt = makeLineResolver(content);
 
     // _favicon / chrome://favicon has no Safari equivalent. One note is enough.
     if (!faviconNoted) {
@@ -415,7 +418,7 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
           category: "api",
           message: "Favicon access via chrome://favicon / _favicon has no Safari equivalent.",
           file: rel,
-          line: makeLineResolver(content)(m.index),
+          line: lineAt(m.index),
           fix: "Fetch favicons directly (e.g. <link> from the page) or drop the favicon UI.",
         });
       }
@@ -432,7 +435,7 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
           category: "api",
           message: "Hardcoded chrome-extension://<id> URL found; Safari uses a different per-install origin, so it will not resolve.",
           file: rel,
-          line: makeLineResolver(content)(m.index),
+          line: lineAt(m.index),
           fix: "Build extension URLs with chrome.runtime.getURL(path) instead of hardcoding the id.",
         });
       }
@@ -450,7 +453,7 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
           category: "api",
           message: `Link to "${m[0]}" has no Safari equivalent (no chrome://extensions/shortcuts or settings page).`,
           file: rel,
-          line: makeLineResolver(content)(m.index),
+          line: lineAt(m.index),
           fix: "Shortcuts are edited in Safari → Settings → Extensions; show that hint instead of linking the chrome:// page (the shim swallows the dead navigation).",
         });
       }

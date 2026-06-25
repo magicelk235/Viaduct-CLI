@@ -98,7 +98,6 @@ export interface ConvertOptions {
   safariRestart: boolean;
   /** Apple Developer Team ID to sign with (real signing → persists across Safari quits). */
   team?: string;
-  verbose: boolean;
 }
 
 export interface ConvertResult {
