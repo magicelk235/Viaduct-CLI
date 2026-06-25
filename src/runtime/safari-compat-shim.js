@@ -1904,7 +1904,11 @@ var __C2S_DEBUG__ = false;
           items.push(item);
           dlCreated._emit(shallow(item));
           // No progress signal from WebKit → resolve to complete on the next tick.
+          // Bail if the caller already canceled/paused this download synchronously —
+          // otherwise we'd resurrect an interrupted item and emit a bogus
+          // in_progress→complete transition from a now-stale `previous` state.
           var complete = function () {
+            if (item.state !== "in_progress") return;
             item.state = "complete"; item.endTime = nowIso();
             dlChanged._emit({ id: id, state: { previous: "in_progress", current: "complete" } });
           };
@@ -2894,7 +2898,21 @@ var __C2S_DEBUG__ = false;
         var st = typeof r.status === "number" ? r.status : 200;
         if (st < 200 || st > 599) st = 502; // out-of-range (incl. 0) → Bad Gateway
         if (st === 204 || st === 205 || st === 304) bytes = null;
-        return new Response(bytes, { status: st, statusText: r.statusText || "", headers: r.headers || {} });
+        // The host delivers already-decoded bytes; forwarding its content-encoding/
+        // content-length verbatim makes the consumer's .json()/.text() try to inflate
+        // a plain body (or trust a length that no longer matches) → decode failure.
+        // Strip those hop-by-hop/transport headers; keep the rest (content-type etc.).
+        var respHeaders = {};
+        try {
+          var src = r.headers || {};
+          for (var hk in src) {
+            if (!Object.prototype.hasOwnProperty.call(src, hk)) continue;
+            var lk = hk.toLowerCase();
+            if (lk === "content-encoding" || lk === "content-length" || lk === "transfer-encoding") continue;
+            respHeaders[hk] = src[hk];
+          }
+        } catch (e) { respHeaders = {}; }
+        return new Response(bytes, { status: st, statusText: r.statusText || "", headers: respHeaders });
       });
       });
     }
@@ -2929,16 +2947,38 @@ var __C2S_DEBUG__ = false;
         var willProxy = shouldProxy(url);
         dbg("[c2s] fetch", url, "proxyEnabled=" + proxyEnabled, "willProxy=" + willProxy, "ctx=" + (isBackground ? "bg" : "page"));
         if (!willProxy) return attempt;
-        // Capture request shape once for a possible proxy retry.
+        // Capture request shape once for a possible proxy retry. Headers and body can
+        // live on EITHER the init bag OR a Request input — read both, init winning per
+        // the fetch spec. A Request's body (and a non-string init.body) is only
+        // recoverable by reading it async; the first fetch already consumed `input`'s
+        // body, so clone it BEFORE that read. We resolve the body to a string promise
+        // so a 401/403 proxy retry resends the real payload instead of dropping it.
         var reqMethod = (init && init.method) || (typeof input !== "string" && input && input.method) || "GET";
-        var reqHeaders = headersToObj(init && init.headers ? new Headers(init.headers) : null);
-        var reqBody = (init && typeof init.body === "string") ? init.body : null;
+        var reqHeaders = headersToObj(
+          (init && init.headers) ? new Headers(init.headers)
+            : (typeof input !== "string" && input && input.headers) ? new Headers(input.headers)
+            : null
+        );
+        var reqBodyP = (function () {
+          try {
+            if (init && typeof init.body === "string") return Promise.resolve(init.body);
+            if (init && init.body && typeof init.body.toString === "function" && (typeof URLSearchParams !== "undefined" && init.body instanceof URLSearchParams)) return Promise.resolve(init.body.toString());
+            // A Request input (or any non-string body) — clone before the first fetch
+            // consumed it and read as text. Cloning a string-input fetch is a no-op.
+            if (typeof input !== "string" && input && typeof input.clone === "function" && !(init && "body" in init)) {
+              return input.clone().text().catch(function () { return null; });
+            }
+          } catch (e) {}
+          return Promise.resolve(null);
+        })();
         var viaProxy = function () {
           dbg("[c2s] PROXY retry ->", url);
+          return reqBodyP.then(function (reqBody) {
           return proxyFetch(url, reqMethod, reqHeaders, reqBody).then(
             function (r) { dbg("[c2s] PROXY result", url, "status=" + r.status); return r; },
             function (err) { dbg("[c2s] PROXY failed", url, String((err && err.message) || err)); throw err; }
           );
+          });
         };
         // A blocked cross-origin request surfaces as a rejected fetch (TypeError),
         // which is the real "Origin rejected" signal. A 401/403 is ALSO retried

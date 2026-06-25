@@ -14,7 +14,7 @@ export const UNSUPPORTED_PERMISSIONS: Record<string, string> = {
   offscreen: "Safari has no offscreen documents API; use the service worker or web workers.",
   webRequestBlocking: "Blocking webRequest is unsupported; use declarativeNetRequest.",
   gcm: "chrome.gcm is Chrome-only; relay via APNs in the host app or poll with chrome.alarms.",
-  tts: "Text-to-speech API unavailable; bridge to AVSpeechSynthesizer natively or use Web Speech API.",
+  tts: "Permission dropped, but the shim routes chrome.tts to the Web Speech API (speechSynthesis), so speak/stop/pause keep working.",
   ttsEngine: "TTS engine API unavailable.",
   platformKeys: "platformKeys unavailable.",
   "enterprise.platformKeys": "enterprise.platformKeys unavailable.",
@@ -27,7 +27,7 @@ export const UNSUPPORTED_PERMISSIONS: Record<string, string> = {
   contentSettings: "chrome.contentSettings has no Safari equivalent; drop.",
   browsingData: "chrome.browsingData has no Safari equivalent; drop.",
   management: "chrome.management has no Safari equivalent; drop or move to the native host app.",
-  power: "chrome.power has no Safari equivalent; use IOKit natively or drop.",
+  power: "Permission dropped, but the shim backs chrome.power.requestKeepAwake with the Screen Wake Lock API (navigator.wakeLock).",
   "system.cpu": "chrome.system.cpu has no Safari equivalent; native bridge or drop.",
   "system.memory": "chrome.system.memory has no Safari equivalent; native bridge or drop.",
   "system.storage": "chrome.system.storage has no Safari equivalent; native bridge or drop.",
@@ -63,7 +63,7 @@ export const UNSUPPORTED_PERMISSIONS: Record<string, string> = {
  * keeps working at runtime. These get a "shimmed" tag instead of a bare "removed"
  * warning, so the author isn't misled into thinking the capability is gone.
  * Only list permissions the shim functionally backs; APIs that merely reject
- * gracefully (debugger, tabCapture, tts, …) do NOT belong here.
+ * gracefully (debugger, tabCapture, …) do NOT belong here.
  */
 export const SHIMMED_PERMISSIONS = new Set([
   "tabGroups",
@@ -72,6 +72,13 @@ export const SHIMMED_PERMISSIONS = new Set([
   "sessions",
   "topSites",
   "search",
+  // Real shim implementations (not graceful no-ops): tts → Web Speech
+  // (speechSynthesis), power → Screen Wake Lock (navigator.wakeLock). See
+  // safari-compat-shim.js §chrome.tts / §chrome.power. (`notifications` is shimmed
+  // too via Notification(), but it isn't a stripped permission — Safari keeps the
+  // permission — so it never reaches this set.)
+  "tts",
+  "power",
 ]);
 
 /** chrome.* API call patterns flagged during JS scans. */
