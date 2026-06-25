@@ -838,6 +838,43 @@ var __C2S_DEBUG__ = false;
   }
   } catch (__storageSyncErr) {}
 
+  // Per-area onChanged (chrome.storage.local.onChanged / .sync.onChanged), Chrome 73+.
+  // Safari exposes only the GLOBAL storage.onChanged; the per-area event is absent, so
+  // `chrome.storage.local.onChanged.addListener(...)` reads `.addListener` off undefined
+  // → TypeError. DarkReader's StateManager registers exactly this at init, so the SW
+  // init path throws. Backfill each missing per-area onChanged as a relay of the global
+  // storage.onChanged filtered to that area, single-arg (changes) to match Chrome. The
+  // area object is frozen on Safari, so clone it via mutableNamespace before attaching.
+  // Own guard: must never abort the rest of the shim.
+  try {
+    if (api.storage && (api.storage.local || api.storage.sync)) {
+      var __stg2 = mutableNamespace(api, "storage") || api.storage;
+      var globalOnChanged = __stg2 && __stg2.onChanged;
+      var relayArea = function (areaKey) {
+        var area = mutableNamespace(__stg2, areaKey);
+        if (!area || area.onChanged) return; // missing area, or already has the event
+        var subs = [];
+        if (globalOnChanged && typeof globalOnChanged.addListener === "function") {
+          globalOnChanged.addListener(function (changes, areaName) {
+            if (areaName !== areaKey) return;
+            subs.slice().forEach(function (fn) { try { fn(changes); } catch (e) {} });
+          });
+        }
+        try {
+          area.onChanged = {
+            addListener: function (fn) { if (typeof fn === "function" && subs.indexOf(fn) < 0) subs.push(fn); },
+            removeListener: function (fn) { var i = subs.indexOf(fn); if (i >= 0) subs.splice(i, 1); },
+            hasListener: function (fn) { return subs.indexOf(fn) >= 0; },
+          };
+        } catch (e) {}
+      };
+      if (__stg2 && __stg2.local) relayArea("local");
+      // sync's per-area onChanged is already synthesized above when sync itself is
+      // shimmed; only relay here if a native sync exists but lacks the per-area event.
+      if (__stg2 && __stg2.sync && typeof __stg2.sync.get === "function") relayArea("sync");
+    }
+  } catch (__storageAreaOnChangedErr) {}
+
   // sidePanel is absent; fall back to opening the panel HTML in a tab. Honor the
   // path the extension actually configured (via setOptions/open) instead of a
   // hardcoded "sidepanel.html" — extensions name the panel page differently
@@ -916,7 +953,21 @@ var __C2S_DEBUG__ = false;
       launchWebAuthFlow: unsupported,
       getAuthToken: unsupported,
       removeCachedAuthToken: function (d, cb) { if (cb) cb(); return Promise.resolve(); },
+      clearAllCachedAuthTokens: function (cb) { if (typeof cb === "function") { cb(); return; } return Promise.resolve(); },
       getRedirectURL: function () { return ""; },
+      // getProfileUserInfo is a read, not an auth grant — return an empty profile so
+      // callers like `getProfileUserInfo({accountStatus}).then(i => i.email)` resolve
+      // (empty email) instead of throwing "is not a function".
+      getProfileUserInfo: function (details, cb) {
+        var info = { email: "", id: "" };
+        if (typeof details === "function") { details(info); return; }
+        if (typeof cb === "function") { cb(info); return; }
+        return Promise.resolve(info);
+      },
+      // Reading chrome.identity.AccountStatus.ANY must yield a string, not throw on
+      // `.ANY` of undefined.
+      AccountStatus: { ANY: "ANY", ASSOCIATED: "ASSOCIATED" },
+      onSignInChanged: event(),
     };
   }
   } catch (__identityErr) {}
@@ -1094,6 +1145,115 @@ var __C2S_DEBUG__ = false;
           chrome.tabs.setZoomSettings = function (tabId, settings, cb) { if (typeof settings === "function") cb = settings; return zoomDual(undefined, cb); };
         }
         if (!chrome.tabs.onZoomChange) chrome.tabs.onZoomChange = event();
+
+        // Other Chrome-only chrome.tabs methods Safari omits. Real extensions call
+        // these directly (UrbanVPN, GoogleTranslate, ClaudeChrome, Requestly,
+        // SessionBuddy); an undefined method throws "is not a function" when invoked
+        // (often inside an awaited async call → rejected promise that breaks the
+        // feature). Backfill inert dual stubs that resolve instead of throwing. Where a
+        // close behaviour exists in Safari, approximate it; otherwise resolve a benign
+        // value. Only fill what the platform is missing.
+        if (typeof chrome.tabs.detectLanguage !== "function") {
+          // No per-tab language engine in WebKit; mirror i18n.detectLanguage and return
+          // the ISO "und" (undetermined) code so callers get a string, not a throw.
+          chrome.tabs.detectLanguage = function (tabId, cb) { if (typeof tabId === "function") cb = tabId; return zoomDual("und", cb); };
+        }
+        if (typeof chrome.tabs.goBack !== "function") {
+          // Drive history.back() in the target tab via scripting (the shim already uses
+          // chrome.scripting.executeScript). Resolve regardless so awaiting callers don't
+          // hang/throw.
+          chrome.tabs.goBack = function (tabId, cb) {
+            if (typeof tabId === "function") { cb = tabId; tabId = undefined; }
+            try {
+              if (typeof tabId === "number" && chrome.scripting && chrome.scripting.executeScript) {
+                return chrome.scripting.executeScript({ target: { tabId: tabId }, func: function () { history.back(); } })
+                  .then(function () { return zoomDual(undefined, cb); }, function () { return zoomDual(undefined, cb); });
+              }
+            } catch (e) {}
+            return zoomDual(undefined, cb);
+          };
+        }
+        if (typeof chrome.tabs.goForward !== "function") {
+          chrome.tabs.goForward = function (tabId, cb) {
+            if (typeof tabId === "function") { cb = tabId; tabId = undefined; }
+            try {
+              if (typeof tabId === "number" && chrome.scripting && chrome.scripting.executeScript) {
+                return chrome.scripting.executeScript({ target: { tabId: tabId }, func: function () { history.forward(); } })
+                  .then(function () { return zoomDual(undefined, cb); }, function () { return zoomDual(undefined, cb); });
+              }
+            } catch (e) {}
+            return zoomDual(undefined, cb);
+          };
+        }
+        if (typeof chrome.tabs.highlight !== "function") {
+          // No multi-tab highlight in Safari; map highlight({windowId,tabs:index|[index]})
+          // to activating the first targeted tab, then resolve a Window-ish object.
+          chrome.tabs.highlight = function (info, cb) {
+            if (typeof info === "function") { cb = info; info = null; }
+            var winId = info && info.windowId;
+            var idxs = info && info.tabs != null ? (Array.isArray(info.tabs) ? info.tabs : [info.tabs]) : null;
+            try {
+              if (idxs && idxs.length && typeof chrome.tabs.query === "function") {
+                return chrome.tabs.query({ windowId: winId }, function (ts) {
+                  var first = (ts || []).filter(function (t) { return idxs.indexOf(t.index) >= 0; })[0];
+                  if (first && typeof chrome.tabs.update === "function") { try { chrome.tabs.update(first.id, { active: true }); } catch (e) {} }
+                  zoomDual({ id: winId, tabs: idxs }, cb);
+                });
+              }
+            } catch (e) {}
+            return zoomDual({ id: winId, tabs: idxs }, cb);
+          };
+        }
+        if (typeof chrome.tabs.discard !== "function") {
+          // No programmatic tab-discard in Safari; resolve a tab-shaped object (real
+          // extensions await it but tolerate it being a no-op) instead of throwing.
+          chrome.tabs.discard = function (tabId, cb) {
+            if (typeof tabId === "function") { cb = tabId; tabId = undefined; }
+            return zoomDual({ id: typeof tabId === "number" ? tabId : NONE, discarded: true }, cb);
+          };
+        }
+        // MV2 tabs.executeScript/insertCSS/removeCSS (removed in MV3, absent in Safari).
+        // Some bundles (e.g. LastPass) still call the tabs.* form without an MV-guard;
+        // delegate to chrome.scripting so they resolve instead of throwing. Defensive —
+        // cheap and same dual-stub shape as the rest.
+        if (typeof chrome.tabs.executeScript !== "function") {
+          chrome.tabs.executeScript = function (tabId, details, cb) {
+            if (typeof tabId === "object" && tabId !== null) { cb = details; details = tabId; tabId = undefined; }
+            if (typeof details === "function") { cb = details; details = {}; }
+            details = details || {};
+            try {
+              if (chrome.scripting && chrome.scripting.executeScript && typeof tabId === "number") {
+                var opts = { target: { tabId: tabId, allFrames: !!details.allFrames } };
+                if (details.file) opts.files = [details.file];
+                else if (details.code) opts.func = new Function(details.code);
+                return chrome.scripting.executeScript(opts).then(
+                  function (r) { return zoomDual(r && r.map(function (x) { return x.result; }), cb); },
+                  function () { return zoomDual([], cb); }
+                );
+              }
+            } catch (e) {}
+            return zoomDual([], cb);
+          };
+        }
+        var __cssDelegate = function (insert) {
+          return function (tabId, details, cb) {
+            if (typeof tabId === "object" && tabId !== null) { cb = details; details = tabId; tabId = undefined; }
+            if (typeof details === "function") { cb = details; details = {}; }
+            details = details || {};
+            try {
+              var fn = chrome.scripting && (insert ? chrome.scripting.insertCSS : chrome.scripting.removeCSS);
+              if (fn && typeof tabId === "number") {
+                var opts = { target: { tabId: tabId, allFrames: !!details.allFrames } };
+                if (details.file) opts.files = [details.file];
+                else if (details.code) opts.css = details.code;
+                return fn.call(chrome.scripting, opts).then(function () { return zoomDual(undefined, cb); }, function () { return zoomDual(undefined, cb); });
+              }
+            } catch (e) {}
+            return zoomDual(undefined, cb);
+          };
+        };
+        if (typeof chrome.tabs.insertCSS !== "function") chrome.tabs.insertCSS = __cssDelegate(true);
+        if (typeof chrome.tabs.removeCSS !== "function") chrome.tabs.removeCSS = __cssDelegate(false);
       }
 
       // Expose tab.groupId on tabs.get/query results so reading code sees membership.
@@ -1698,6 +1858,17 @@ var __C2S_DEBUG__ = false;
       wrapActionSetter("setBadgeBackgroundColor");
       wrapActionSetter("setTitle");
       wrapActionSetter("setIcon");
+
+      // Chrome-only chrome.action methods Safari does not expose. UrbanVPN awaits
+      // setBadgeTextColor inside its badge-update flow; an undefined method throws "is
+      // not a function" and rejects the whole flow. Backfill inert dual stubs (Safari
+      // has no configurable badge text color), guarded so a native method is untouched.
+      if (typeof chrome.action.setBadgeTextColor !== "function") {
+        chrome.action.setBadgeTextColor = function (details, cb) { return dual(undefined, cb); };
+      }
+      if (typeof chrome.action.getBadgeTextColor !== "function") {
+        chrome.action.getBadgeTextColor = function (details, cb) { if (typeof details === "function") cb = details; return dual({ color: [0, 0, 0, 255] }, cb); };
+      }
     }
 
     // MV2 aliases: browserAction/pageAction code running on an MV3/Safari manifest.
@@ -2659,6 +2830,54 @@ var __C2S_DEBUG__ = false;
       function shallowCopy(o) { var r = {}; for (var k in o) r[k] = o[k]; return r; }
       function rejectOrCb(err, cb) { if (typeof cb === "function") { setLastErr({ message: err.message }); cb(); return undefined; } return Promise.reject(err); }
     })();
+
+    // chrome.scripting DYNAMIC content-script registration (registerContentScripts /
+    // getRegisteredContentScripts / updateContentScripts / unregisterContentScripts),
+    // Chrome 96+. Safari's native chrome.scripting has executeScript/insert|removeCSS
+    // but omits the dynamic-registration sub-API, so UrbanVPN's
+    // `await chrome.scripting.getRegisteredContentScripts(...)` calls undefined and the
+    // awaited rejection breaks its stream-creation path. Safari's chrome.scripting is a
+    // frozen exotic slot (assignment no-ops), so swap in a mutable clone (preserving the
+    // bound native methods) and add the missing methods backed by an in-memory registry,
+    // mirroring the userScripts emulation above. ponytail: registry is coherent but does
+    // NOT actually inject (WebKit has no dynamic content-script API); map to a real impl
+    // if Safari ever ships one.
+    if (chrome.scripting && typeof chrome.scripting.getRegisteredContentScripts !== "function") {
+      var __sc = mutableNamespace(chrome, "scripting");
+      if (__sc) (function () {
+        var reg = {}; // id -> RegisteredContentScript
+        var copy = function (o) { var r = {}; for (var k in o) r[k] = o[k]; return r; };
+        var rejectOr = function (err, cb) { if (typeof cb === "function") { setLastErr({ message: err.message }); cb(); return undefined; } return Promise.reject(err); };
+        fill(__sc, {
+          registerContentScripts: function (list, cb) {
+            var arr = Array.isArray(list) ? list : [];
+            for (var i = 0; i < arr.length; i++) { var s = arr[i]; if (!s || !s.id) return rejectOr(new Error("Invalid content script id."), cb); if (reg[s.id]) return rejectOr(new Error("Duplicate script id: " + s.id), cb); }
+            for (var j = 0; j < arr.length; j++) reg[arr[j].id] = copy(arr[j]);
+            return dual(undefined, cb);
+          },
+          getRegisteredContentScripts: function (filter, cb) {
+            if (typeof filter === "function") { cb = filter; filter = null; }
+            var ids = filter && filter.ids;
+            var out = [];
+            for (var id in reg) { if (!ids || ids.indexOf(id) >= 0) out.push(copy(reg[id])); }
+            return dual(out, cb);
+          },
+          updateContentScripts: function (list, cb) {
+            var arr = Array.isArray(list) ? list : [];
+            for (var i = 0; i < arr.length; i++) { var s = arr[i]; if (!s || !reg[s.id]) return rejectOr(new Error("No content script with id: " + (s && s.id)), cb); }
+            for (var j = 0; j < arr.length; j++) { var u = arr[j]; var cur = reg[u.id]; for (var k in u) cur[k] = u[k]; }
+            return dual(undefined, cb);
+          },
+          unregisterContentScripts: function (filter, cb) {
+            if (typeof filter === "function") { cb = filter; filter = null; }
+            var ids = filter && filter.ids;
+            if (ids && ids.length) { for (var i = 0; i < ids.length; i++) delete reg[ids[i]]; }
+            else reg = {};
+            return dual(undefined, cb);
+          },
+        });
+      })();
+    }
     chrome.dom = chrome.dom || {};
     fill(chrome.dom, {
       openOrClosedShadowRoot: function (el) { return (el && el.shadowRoot) || null; },
