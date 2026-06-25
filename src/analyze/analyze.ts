@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, existsSync, realpathSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import type { Issue, Manifest, Platforms } from "../types.js";
-import { UNSUPPORTED_APIS, parseJsonc, resolveI18nString } from "../manifest/manifest.js";
+import { UNSUPPORTED_APIS, parseJsonc, resolveI18nStringStrict } from "../manifest/manifest.js";
 
 /**
  * Recursive file finder. Dirent-based so each entry costs no extra stat (only
@@ -366,16 +366,18 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
     }
   }
 
-  // __MSG_key__ placeholders in name/description must resolve to a real message,
-  // or Chrome AND Safari display the literal "__MSG_appName__" as the extension
-  // name (and the App Store rejects a placeholder name). resolveI18nString returns
-  // undefined when the key is missing from every locale's messages.json.
+  // __MSG_key__ placeholders in name/description must resolve to a real message in
+  // the DEFAULT locale, or Chrome AND Safari display the literal "__MSG_appName__" as
+  // the extension name (and the App Store rejects a placeholder name). Use the strict
+  // resolver: Chrome localizes manifest fields from default_locale only — a key that
+  // exists in another locale but not the default one is still rendered literally, so
+  // the lenient cross-locale resolver would hide a real failure here.
   for (const [field, raw] of [
     ["name", manifest.name],
     ["description", manifest.description],
   ] as const) {
     if (typeof raw === "string" && /^__MSG_.+__$/.test(raw)) {
-      const resolved = resolveI18nString(raw, extPath, manifest.default_locale);
+      const resolved = resolveI18nStringStrict(raw, extPath, manifest.default_locale);
       if (resolved === undefined || resolved === raw) {
         issues.push({
           severity: "error",

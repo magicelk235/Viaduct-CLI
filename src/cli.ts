@@ -27,6 +27,18 @@ const CONFIG_KEYS = [
   "force", "strict", "verify",
 ] as const;
 
+// Boolean-typed config keys (mirror the `type: "boolean"` entries in parseArgs). A
+// config value for these must be a real boolean: a string like "false" is truthy in
+// JS and would silently flip the flag ON. The rest are string-typed.
+const BOOLEAN_CONFIG_KEYS = new Set<string>([
+  "ci", "zip", "no-build", "open-xcode", "install", "no-safari-restart",
+  "no-shim", "no-oauth-bridge", "keep-module", "force", "strict", "verify",
+]);
+
+// Config keys that also have a short CLI alias. Used to detect "the user typed it on
+// the CLI" — argv carries the short form (`-o`), never `--output`, in that case.
+const CONFIG_SHORT_ALIAS: Record<string, string> = { output: "o" };
+
 // Load a JSON config and overlay it onto parsed CLI values: a value the user
 // passed on the CLI always wins (we detect that via argv), config fills the rest.
 // Returns the config path used (for messaging) or null if none was loaded.
@@ -54,9 +66,27 @@ function applyConfig(
       warn(`Ignoring unknown config key "${key}" in ${path}.`);
       continue;
     }
+    // Validate the value against the flag's declared type, exactly as a typed CLI flag
+    // would be. A boolean key set to a string ({"install":"false"}) is truthy in JS and
+    // would silently enable the feature — reject it instead of copying it verbatim.
+    if (BOOLEAN_CONFIG_KEYS.has(key)) {
+      if (typeof val !== "boolean") {
+        warn(`Ignoring config "${key}": expected true/false, got ${JSON.stringify(val)}.`);
+        continue;
+      }
+    } else if (typeof val !== "string") {
+      warn(`Ignoring config "${key}": expected a string, got ${JSON.stringify(val)}.`);
+      continue;
+    }
     // A flag the user typed (e.g. --bundle-id) overrides config. parseArgs doesn't
-    // record provenance, so scan argv for the long flag.
-    if (argv.includes(`--${key}`) || argv.some((a) => a.startsWith(`--${key}=`))) continue;
+    // record provenance, so scan argv for the long flag — and the short alias (-o),
+    // which is the form argv actually carries for aliased flags.
+    const short = CONFIG_SHORT_ALIAS[key];
+    if (
+      argv.includes(`--${key}`) ||
+      argv.some((a) => a.startsWith(`--${key}=`)) ||
+      (short !== undefined && argv.includes(`-${short}`))
+    ) continue;
     values[key] = val;
   }
   return path;
@@ -362,12 +392,8 @@ async function main(): Promise<void> {
     console.log(HELP);
     process.exit(2);
   }
-  for (const input of inputs) {
-    if (!isUrl(input) && !existsSync(input)) {
-      fail(`Input not found: ${input}`);
-      process.exit(1);
-    }
-  }
+  // Existence is checked per-input inside the loop below so one bad input doesn't
+  // abort the rest of a batch (matches the mid-batch download-failure handling).
 
   const platforms = values.platforms as Platforms;
   if (!["all", "macos", "ios"].includes(platforms)) {
@@ -443,17 +469,32 @@ async function main(): Promise<void> {
   // input doesn't abort the rest of a batch; the exit code is non-zero if any failed.
   const batch = inputs.length > 1;
   let anyFailed = false;
+  // Download scratch dirs in flight. Each is removed per-iteration in a finally, but a
+  // process.exit() on an error path skips that finally — a single exit handler drains
+  // whatever is still tracked, so nothing leaks no matter which path exits. (One
+  // handler, not one-per-input: avoids Node's MaxListenersExceededWarning on big
+  // URL batches and frees each archive as soon as its conversion finishes.)
+  const liveScratch = new Set<string>();
+  process.on("exit", () => { for (const d of liveScratch) rmSync(d, { recursive: true, force: true }); });
   for (const input of inputs) {
     if (batch) console.log(`\n${color("bold", `── ${basename(input)} ──`)}`);
 
+    // Per-input existence check (batch-aware): a missing local path fails just this
+    // input and the batch continues, mirroring the download-failure handling below.
+    if (!isUrl(input) && !existsSync(input)) {
+      fail(`Input not found: ${input}`);
+      if (!batch) process.exit(1);
+      anyFailed = true;
+      continue;
+    }
+
     let localInput = input;
+    let dlScratch: string | undefined;
+    try {
     if (isUrl(input)) {
       info(`Downloading extension from ${input} …`);
-      const dlScratch = mkdtempSync(join(tmpdir(), "c2s-dl-"));
-      // Clean the download scratch on ANY exit (success or failure). The pipeline
-      // exits via process.exit on multiple paths, so a finally won't always run;
-      // an exit handler fires regardless and prevents leaking the downloaded archive.
-      process.on("exit", () => rmSync(dlScratch, { recursive: true, force: true }));
+      dlScratch = mkdtempSync(join(tmpdir(), "c2s-dl-"));
+      liveScratch.add(dlScratch);
       try {
         localInput = await downloadExtension(input, dlScratch);
       } catch (e) {
@@ -526,13 +567,31 @@ async function main(): Promise<void> {
       }
       if (result.zipPath) console.log(`  Zip:     ${result.zipPath}`);
 
-      if (values.verify && result.installedAppPath && result.resolvedBundleId) {
-        const v = verifyInSafari(result.resolvedBundleId);
-        if (!v.registered) anyFailed = true;
+      // The build succeeded but the requested install didn't land — that's a failure
+      // for the user's intent, so exit non-zero (the warning already printed above).
+      if (result.installFailed) anyFailed = true;
+
+      if (values.verify) {
+        if (result.installedAppPath && result.resolvedBundleId) {
+          const v = verifyInSafari(result.resolvedBundleId);
+          if (!v.registered) anyFailed = true;
+        } else {
+          // --verify was requested but there's nothing installed to verify (install
+          // failed). Don't silently skip it — that's the check the user asked for.
+          fail("--verify could not run: the extension was not installed.");
+          anyFailed = true;
+        }
       }
     } else {
       fail("Conversion did not complete. See messages above.");
       anyFailed = true;
+    }
+    } finally {
+      // Free this input's downloaded archive now (not deferred to process exit), so a
+      // long batch doesn't accumulate every download's scratch dir on disk. A `continue`
+      // above still runs this; only a process.exit() skips it (the exit handler covers
+      // that path via liveScratch).
+      if (dlScratch) { rmSync(dlScratch, { recursive: true, force: true }); liveScratch.delete(dlScratch); }
     }
   }
 
