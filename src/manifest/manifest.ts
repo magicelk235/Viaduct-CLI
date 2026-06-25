@@ -112,6 +112,41 @@ export function resolveI18nString(value: string | undefined, extPath: string, de
   return undefined;
 }
 
+/**
+ * Strict variant for the analyzer's placeholder check. Chrome substitutes manifest
+ * __MSG_ placeholders ONLY from the default_locale's messages.json — it does NOT apply
+ * the runtime UI-locale fallback to manifest fields. So a key present in en but missing
+ * from default_locale 'de' is NOT substituted: Chrome/Safari render the literal token.
+ * resolveI18nString's broad cross-locale fallback would find the 'en' value and hide
+ * that, so the analyzer must resolve against default_locale only. Returns the resolved
+ * message, or undefined if the key is absent from the default locale (the real error
+ * condition). The lenient resolveI18nString stays the right choice for deriving a
+ * human label (a real name beats a literal token), but not for correctness checking.
+ */
+export function resolveI18nStringStrict(value: string | undefined, extPath: string, defaultLocale?: string): string | undefined {
+  if (!value) return value;
+  const ref = /^__MSG_(.+?)__$/.exec(value);
+  if (!ref) return value;
+  // No default_locale declared → Chrome can't localize the manifest at all; the token
+  // stays literal, so treat as unresolved.
+  if (!defaultLocale) return undefined;
+  const key = ref[1].toLowerCase();
+  const p = join(extPath, "_locales", defaultLocale, "messages.json");
+  if (!existsSync(p)) return undefined;
+  try {
+    const msgs = parseJsonc<Record<string, { message?: string }>>(readFileSync(p, "utf-8"));
+    for (const k of Object.keys(msgs)) {
+      if (k.toLowerCase() === key) {
+        const msg = msgs[k]?.message;
+        if (typeof msg === "string" && msg.trim()) return msg.trim();
+      }
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
 // Compatibility data tables live in compat-data.ts; imported for internal use
 // and re-exported so existing importers (analyze.ts, report.ts) keep their path.
 import { UNSUPPORTED_PERMISSIONS, SHIMMED_PERMISSIONS, UNSUPPORTED_APIS } from "./compat-data.js";
