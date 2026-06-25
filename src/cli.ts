@@ -6,7 +6,7 @@ import { join, resolve, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { convert } from "./convert.js";
 import { extractExtension } from "./input/extract.js";
-import { loadManifest, analyzeManifest, resolveI18nString, transformManifest } from "./manifest/manifest.js";
+import { loadManifest, analyzeManifest, resolveI18nString, transformManifest, DEFAULT_MIN_SAFARI_VERSION } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
 import { printIssues, countBlocking, summarizeManifestChanges, buildReportMarkdown } from "./analyze/report.js";
 import { run, info, ok, warn, fail, color, commandExists, setVerbose, setQuiet } from "./util.js";
@@ -57,7 +57,7 @@ OPTIONS
   -o, --output <dir>        Output directory (default: ./<AppName>_Safari)
       --bundle-id <id>      Reverse-DNS bundle id (default: com.viaduct.<app>)
       --app-name <name>     Host app name (default: extension name)
-      --min-safari <ver>    Safari strict_min_version (default: 15.4; use 18.4 for world:MAIN)
+      --min-safari <ver>    Safari strict_min_version (default: ${DEFAULT_MIN_SAFARI_VERSION}; use 18.4 for world:MAIN)
       --platforms <p>       all | macos | ios            (default: macos)
       --ci                  Clean-copy resources into the project (CI/TestFlight-safe).
                             Default symlinks resources instead, for live dev edits.

@@ -85,7 +85,7 @@ export interface ConvertOptions {
   zip?: boolean;
   /** Open the generated .xcodeproj in Xcode when done. */
   openXcode?: boolean;
-  /** Safari strict_min_version for browser_specific_settings (default 15.4). */
+  /** Safari strict_min_version for browser_specific_settings (default: DEFAULT_MIN_SAFARI_VERSION in manifest.ts). */
   minSafariVersion?: string;
   keepModuleBackground: boolean;
   /** Wire the Safari OAuth/externally_connectable bridge (default on). */
