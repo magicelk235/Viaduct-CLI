@@ -117,6 +117,14 @@ export function resolveI18nString(value: string | undefined, extPath: string, de
 import { UNSUPPORTED_PERMISSIONS, SHIMMED_PERMISSIONS, UNSUPPORTED_APIS } from "./compat-data.js";
 export { UNSUPPORTED_PERMISSIONS, SHIMMED_PERMISSIONS, UNSUPPORTED_APIS };
 
+/**
+ * Default Safari strict_min_version when --min-safari is not passed. 15.4 is the
+ * floor for Manifest V3 web extensions; bump only with a matching note in the CLI
+ * help. Single source of truth — referenced by the transform default and the help
+ * text so they can't drift apart.
+ */
+export const DEFAULT_MIN_SAFARI_VERSION = "15.4";
+
 export interface ManifestAnalysis {
   issues: Issue[];
   permissionsToRemove: string[];
@@ -772,7 +780,7 @@ export function transformManifest(
 
   out.browser_specific_settings = {
     ...(out.browser_specific_settings ?? {}),
-    safari: { strict_min_version: opts.minSafariVersion ?? "15.4" },
+    safari: { strict_min_version: opts.minSafariVersion ?? DEFAULT_MIN_SAFARI_VERSION },
   };
 
   // Ensure the toolbar button does something: wire a popup if one exists. Normalize
