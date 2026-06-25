@@ -92,6 +92,66 @@ test("analyzeManifest tags shim-backed removed permissions as shimmed", () => {
   assert.ok(offscreen && !offscreen.shimmed);
 });
 
+test("analyzeManifest reports a shim-backed permission as info, not a scary warning", () => {
+  // A permission the shim emulates keeps working at runtime, so flagging it as a
+  // warning ("will be removed") misleads the author. notifications/tts/power were
+  // added to SHIMMED_PERMISSIONS — verify they downgrade to info while a truly
+  // dropped permission stays a warning.
+  const { issues } = analyzeManifest({
+    manifest_version: 3,
+    permissions: ["tts", "power", "offscreen"],
+  });
+  for (const p of ["tts", "power"]) {
+    const i = issues.find((x) => x.category === "permission" && x.message.includes(`"${p}"`));
+    assert.equal(i?.severity, "info", `${p} should be info`);
+    assert.equal(i?.shimmed, true, `${p} should be shimmed`);
+  }
+  const off = issues.find((x) => x.category === "permission" && x.message.includes('"offscreen"'));
+  assert.equal(off?.severity, "warning");
+});
+
+test("transformManifest: MV2 manifest with an `action` key migrates to browser_action (Safari rejects MV2 action)", () => {
+  const out = transformManifest(
+    { manifest_version: 2, version: "1.0", action: { default_title: "X" } },
+    [], NO_EXT, XF
+  );
+  assert.equal(out.action, undefined, "no `action` key in an MV2 manifest");
+  assert.deepEqual(out.browser_action, { default_title: "X" });
+});
+
+test("transformManifest: MV3 manifest with only browser_action migrates to action", () => {
+  const out = transformManifest(
+    { manifest_version: 3, version: "1.0", browser_action: { default_title: "Y" } },
+    [], NO_EXT, XF
+  );
+  assert.equal(out.browser_action, undefined);
+  assert.deepEqual(out.action, { default_title: "Y" });
+});
+
+test("transformManifest: an empty action:{} does not block the page_action fold", () => {
+  const out = transformManifest(
+    { manifest_version: 3, version: "1.0", action: {}, page_action: { default_popup: "p.html" } },
+    [], NO_EXT, XF
+  );
+  // The empty action must be treated as absent so page_action's real popup survives.
+  assert.equal(out.page_action, undefined);
+  assert.equal(out.action?.default_popup, "p.html");
+});
+
+test("transformManifest: bare-string web_accessible_resources is wrapped into MV3 object form", () => {
+  const out = transformManifest(
+    { manifest_version: 3, version: "1.0", web_accessible_resources: "inject.js" },
+    [], NO_EXT, XF
+  );
+  assert.ok(Array.isArray(out.web_accessible_resources));
+  assert.deepEqual(out.web_accessible_resources[0].resources, ["inject.js"]);
+});
+
+test("collectReferencedPaths: a bare-string web_accessible_resources is staged", () => {
+  const got = collectReferencedPaths({ manifest_version: 3, web_accessible_resources: "inject.js" });
+  assert.ok(got.has("inject.js"), "the WAR file must be collected for staging");
+});
+
 test("analyzeManifest errors on an invalid content-script match pattern", () => {
   const { issues } = analyzeManifest({
     manifest_version: 3,

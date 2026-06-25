@@ -1,4 +1,4 @@
-import { cpSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, writeFileSync, lstatSync } from "node:fs";
+import { cpSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, writeFileSync, lstatSync, statSync, realpathSync, copyFileSync } from "node:fs";
 import { basename, join, dirname, resolve, relative, sep } from "node:path";
 import { cleanExtendedAttributes } from "./extract.js";
 
@@ -78,6 +78,28 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
       return true;
     },
   });
+
+  // The filter above drops ALL symlinks (verbatim-copied links 404 in Safari and
+  // leak the build host's layout). But a manifest-referenced asset that happens to
+  // be a symlink in the source (common with pnpm/monorepo asset linking) is a real
+  // runtime dependency — dropping it 404s the page that needs it. For kept paths
+  // only, dereference the link and copy the actual target file (staying inside the
+  // source tree) so the bytes ship without the dangling-link hazard.
+  for (const rel of keep) {
+    const srcLink = join(root, rel);
+    let lst;
+    try { lst = lstatSync(srcLink); } catch { continue; }
+    if (!lst.isSymbolicLink()) continue;
+    let target;
+    try {
+      target = realpathSync(srcLink);
+      // Only follow links whose target stays inside the source tree.
+      if (target !== root && !target.startsWith(root + sep)) continue;
+      if (!statSync(target).isFile()) continue;
+    } catch { continue; }
+    const dest = join(stageDir, rel);
+    try { mkdirSync(dirname(dest), { recursive: true }); copyFileSync(target, dest); } catch { /* best effort */ }
+  }
 
   cleanExtendedAttributes(stageDir);
 }

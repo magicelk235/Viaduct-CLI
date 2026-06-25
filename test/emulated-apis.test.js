@@ -75,6 +75,25 @@ test("downloads: erase removes matching items and fires onErased", async () => {
   assert.equal((await chrome.downloads.search({})).length, 0);
 });
 
+test("downloads: cancel before the deferred complete() keeps the item interrupted", async () => {
+  // download() resolves to "complete" on a microtask. A synchronous cancel() must
+  // win — the deferred complete() must not resurrect the canceled item or emit a
+  // bogus in_progress->complete transition from a stale previous state.
+  const chrome = setup();
+  const changed = [];
+  chrome.downloads.onChanged.addListener((d) => changed.push(d.state.current));
+  // Use the callback form so we get the id synchronously and can cancel BEFORE the
+  // deferred complete() microtask runs (awaiting the promise would let complete()
+  // settle first, never exercising the guard).
+  let id;
+  chrome.downloads.download({ url: "https://x.test/c.zip" }, (i) => { id = i; });
+  chrome.downloads.cancel(id);
+  await tick();
+  const [item] = await chrome.downloads.search({ id });
+  assert.equal(item.state, "interrupted", "canceled download stays interrupted");
+  assert.ok(!changed.includes("complete"), "no spurious complete transition emitted");
+});
+
 // ---- readingList ----
 test("readingList: add/query/update/remove with events", async () => {
   const chrome = setup();
