@@ -2,6 +2,7 @@ import { writeFileSync, readFileSync, readdirSync, copyFileSync, existsSync } fr
 import { join, dirname } from "node:path";
 import type { Manifest } from "../types.js";
 import { TEMPLATE_DIR, RUNTIME_DIR } from "../paths.js";
+import { resolveI18nString } from "../manifest/manifest.js";
 
 export const SHIM_FILENAME = "safari-compat-shim.js";
 export const POLYFILL_FILENAME = "browser-polyfill.min.js";
@@ -253,10 +254,12 @@ export function convertServiceWorkerToBackgroundPage(dir: string, manifest: Mani
   // so the now-undefined global is never invoked. CSP-safe and generic.
   const importTags = hoistImportScripts(dir, sw);
 
-  // manifest.name is raw (may be unresolved "__MSG_*__" or contain <,>,& — e.g.
-  // "Save to Notion <Beta>"). Escape it so a stray "<" / "</title>" can't break
-  // out of the title and corrupt the background page's HTML.
-  const title = String(manifest.name ?? "Extension")
+  // manifest.name may be an unresolved "__MSG_*__" i18n key (Honey: "__MSG_Honey_Title__")
+  // — resolve it from _locales first so the title isn't a raw placeholder. Then escape:
+  // the name can still contain <,>,& (e.g. "Save to Notion <Beta>"), so a stray "<" /
+  // "</title>" must not break out of the title and corrupt the background page's HTML.
+  const resolvedName = resolveI18nString(manifest.name, dir, manifest.default_locale) ?? manifest.name;
+  const title = String(resolvedName ?? "Extension")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
