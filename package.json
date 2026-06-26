@@ -19,7 +19,6 @@
     "start": "node dist/cli.js",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test test/*.test.js",
-    "corpus": "npm run build && node scripts/corpus.mjs",
     "prepare": "npm run build",
     "prepublishOnly": "npm run build"
   },
