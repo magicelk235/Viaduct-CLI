@@ -422,6 +422,15 @@ export function detectXcodeTeam(): string | null {
   return ids[0] ?? null;
 }
 
+/**
+ * Sanitize a raw extension name into an app name. Strips whitespace plus path/scheme
+ * separators — the result becomes a directory name, an xcodebuild scheme, and part of
+ * the bundle id. Falls back to "Extension" when nothing survives.
+ */
+export function deriveAppName(rawName: string): string {
+  return rawName.replace(/[\s/\\:]+/g, "") || "Extension";
+}
+
 export function defaultBundleId(appName: string): string {
   // Strip non-alphanumerics, then drop any leading digits: a CFBundleIdentifier
   // segment that starts with a digit (e.g. "123App") is rejected by parts of

@@ -9,9 +9,9 @@ import type { Issue } from "../types.js";
 export const UNSUPPORTED_PERMISSIONS: Record<string, string> = {
   identity: "Safari lacks chrome.identity; use a hosted web OAuth2 flow + window.postMessage.",
   debugger: "chrome.debugger (CDP) is unsupported; build a Web Inspector Extension (devtools_page).",
-  sidePanel: "Safari has no sidePanel API; falling back to an action popup.",
+  sidePanel: "Safari has no native sidePanel API; the shim emulates it (open via the action popover on Safari 17.4+, tab fallback on older; setOptions/getOptions/setPanelBehavior).",
   tabGroups: "Safari has no native tabGroups API; the shim emulates it in memory (no tab-bar coloring).",
-  offscreen: "Safari has no offscreen documents API; use the service worker or web workers.",
+  offscreen: "Safari has no offscreen documents API; the shim emulates it via an extension-origin iframe (createDocument/close/hasDocument/getContexts) so SW→offscreen messaging keeps working. The offscreen doc still has no DOM in a true SW context.",
   webRequestBlocking: "Blocking webRequest is unsupported; use declarativeNetRequest.",
   webRequestAuthProvider: "Safari can't provide credentials for onAuthRequired (proxy/HTTP auth) via webRequest; the listener still fires read-only, but handle auth in-page or natively.",
   declarativeNetRequestWithHostAccess: "Safari doesn't recognize this DNR variant token; declare plain declarativeNetRequest (rules still apply on hosts the extension already has access to).",
@@ -74,6 +74,11 @@ export const SHIMMED_PERMISSIONS = new Set([
   "sessions",
   "topSites",
   "search",
+  // sidePanel → action popover (Safari 17.4+) / tab fallback; offscreen → extension-
+  // origin iframe. Both emulated in safari-compat-shim.js, so flag them shimmed, not
+  // bare-removed.
+  "sidePanel",
+  "offscreen",
   // Real shim implementations (not graceful no-ops): tts → Web Speech
   // (speechSynthesis), power → Screen Wake Lock (navigator.wakeLock). See
   // safari-compat-shim.js §chrome.tts / §chrome.power. (`notifications` is shimmed
@@ -110,14 +115,15 @@ export const UNSUPPORTED_APIS: Record<
     fix: "Use APNs in the native host app, or poll via chrome.alarms + fetch.",
   },
   "chrome.notifications": {
-    severity: "warning",
-    message: "chrome.notifications is missing in Safari.",
-    fix: "Bridge to native notifications via sendNativeMessage, or inject a DOM banner.",
+    severity: "info",
+    message: "chrome.notifications is backed by the Web Notification API (create + clear/update/getAll/getPermissionLevel and all events).",
+    fix: "No action needed; banners fire once notification permission is granted. Call Notification.requestPermission() if you haven't.",
+    shimmed: true,
   },
   "chrome.contextMenus": {
-    severity: "warning",
-    message: "chrome.contextMenus is unsupported on Safari iOS.",
-    fix: "Register a 'contextmenu' listener in a content script and relay via runtime.sendMessage.",
+    severity: "info",
+    message: "chrome.contextMenus works natively on macOS Safari but is absent on iOS (no right-click surface).",
+    fix: "Fine for macOS-only targets. For iOS, register a 'contextmenu' listener in a content script and relay via runtime.sendMessage.",
   },
   "cookies.onChanged": {
     severity: "warning",
