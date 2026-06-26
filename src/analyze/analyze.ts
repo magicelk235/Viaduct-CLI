@@ -136,18 +136,19 @@ function scanJsContent(content: string, rel: string, issues: Issue[]): void {
   // Chrome-version sniffing out of navigator.userAgent. Safari's UA has no Chrome
   // token, so the match returns null/undefined and the dependent feature silently
   // dies (e.g. download URLs built from the sniffed version). The shim appends a
-  // synthetic Chrome token to navigator.userAgent inside extension contexts, so
-  // this is auto-resolved — flag it as info/shimmed so the behaviour is visible.
+  // synthetic Chrome token ONLY in content scripts running on http(s) pages — it
+  // deliberately leaves popup/options/background UAs truthful (see safari-compat-shim
+  // §UA spoof, guarded by `!__isExtPage`). So a sniff in extension-page code is NOT
+  // resolved; flag it as a warning that still fails there.
   const ua = UA_CHROME_SNIFF_RE.exec(content);
   if (ua) {
     issues.push({
-      severity: "info",
+      severity: "warning",
       category: "api",
       message: "navigator.userAgent Chrome-version sniff detected; Safari's UA omits the Chrome token.",
       file: rel,
       line: lineAt(ua.index),
-      fix: "The shim appends a synthetic Chrome/120.0.0.0 token to navigator.userAgent in extension contexts, so the sniff resolves. Remove the dependency if you can.",
-      shimmed: true,
+      fix: "The shim spoofs a Chrome token only in content scripts on http(s) pages; popup/options/background sniffs stay truthful and still fail. Remove the UA dependency.",
     });
   }
 

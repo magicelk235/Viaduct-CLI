@@ -44,7 +44,10 @@ function shouldExclude(name: string): boolean {
  * exclusion rule — otherwise a web-accessible LICENSE.txt or a .map served to a
  * page would be dropped and 404 in Safari.
  */
-export function stageExtension(sourceDir: string, stageDir: string, keep: Set<string> = new Set()): void {
+// Returns the manifest-referenced asset paths that could NOT be staged (a kept symlink
+// whose target escaped the tree, vanished, or failed to copy). The caller warns on
+// these — otherwise they 404 in Safari with no build-time signal.
+export function stageExtension(sourceDir: string, stageDir: string, keep: Set<string> = new Set()): string[] {
   if (existsSync(stageDir)) rmSync(stageDir, { recursive: true, force: true });
   mkdirSync(stageDir, { recursive: true });
 
@@ -91,6 +94,7 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
   // runtime dependency — dropping it 404s the page that needs it. For kept paths
   // only, dereference the link and copy the actual target file (staying inside the
   // source tree) so the bytes ship without the dangling-link hazard.
+  const dropped: string[] = [];
   for (const rel of keep) {
     const srcLink = join(root, rel);
     let lst;
@@ -102,14 +106,16 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
       // Only follow links whose target stays inside the source tree (compare against
       // the realpath'd root so a symlinked ancestor like /tmp→/private/tmp doesn't
       // make an in-tree target look external).
-      if (target !== realRoot && !target.startsWith(realRoot + sep)) continue;
-      if (!statSync(target).isFile()) continue;
-    } catch { continue; }
+      if (target !== realRoot && !target.startsWith(realRoot + sep)) { dropped.push(rel); continue; }
+      if (!statSync(target).isFile()) { dropped.push(rel); continue; }
+    } catch { dropped.push(rel); continue; }
     const dest = join(stageDir, rel);
-    try { mkdirSync(dirname(dest), { recursive: true }); copyFileSync(target, dest); } catch { /* best effort */ }
+    try { mkdirSync(dirname(dest), { recursive: true }); copyFileSync(target, dest); }
+    catch { dropped.push(rel); }
   }
 
   cleanExtendedAttributes(stageDir);
+  return dropped;
 }
 
 const SOURCEMAP_RE = /[ \t]*\/\/[#@] sourceMappingURL=(\S+)[ \t]*\r?$/gm;
@@ -179,10 +185,10 @@ export function stripDanglingSourcemaps(stageDir: string): number {
 // a regex is enough and can't mangle unrelated code. If a bundle ever aliased the enum
 // object itself (`const W = chrome.scripting.ExecutionWorld`) we'd need AST work — add
 // then.
-const ENUM_VALUES: Record<string, Record<string, string>> = {
-  ExecutionWorld: { ISOLATED: "ISOLATED", MAIN: "MAIN" },
-  RegistrationWorld: { ISOLATED: "ISOLATED", MAIN: "MAIN" },
-};
+// ExecutionWorld and RegistrationWorld are identical enums whose value === member
+// name, so this is just an allowlist of valid members (any unknown member is left
+// untouched). If a future enum ever has value !== name, switch back to a name→value map.
+const ENUM_MEMBERS = new Set(["ISOLATED", "MAIN"]);
 // e.g.  chrome.scripting.ExecutionWorld.ISOLATED  |  browser["scripting"].RegistrationWorld.MAIN
 const ENUM_RE =
   /\b(?:chrome|browser)\s*(?:\.\s*scripting|\[\s*["']scripting["']\s*\])\s*\.\s*(ExecutionWorld|RegistrationWorld)\s*\.\s*([A-Z_]+)\b/g;
@@ -197,11 +203,10 @@ export function inlineImmutableEnums(stageDir: string): number {
       continue;
     }
     let changed = false;
-    const next = content.replace(ENUM_RE, (whole, enumName: string, member: string) => {
-      const val = ENUM_VALUES[enumName]?.[member];
-      if (val == null) return whole; // unknown member — leave it untouched
+    const next = content.replace(ENUM_RE, (whole, _enumName: string, member: string) => {
+      if (!ENUM_MEMBERS.has(member)) return whole; // unknown member — leave it untouched
       changed = true;
-      return JSON.stringify(val); // "ISOLATED"
+      return JSON.stringify(member); // "ISOLATED"
     });
     if (changed) {
       writeFileSync(file, next, "utf-8");

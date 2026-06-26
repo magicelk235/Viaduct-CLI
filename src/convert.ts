@@ -21,6 +21,7 @@ import {
   pluginkitStatus,
   unsignedExtensionsAllowed,
   defaultBundleId,
+  deriveAppName,
 } from "./build/packager.js";
 import { printIssues, countBlocking, writeReportFile } from "./analyze/report.js";
 import { info, ok, warn, fail, moveBundle, run } from "./util.js";
@@ -73,9 +74,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
       return result;
     }
 
-    // Strip whitespace plus path/scheme separators — the name becomes a directory
-    // name, an xcodebuild scheme, and part of the bundle id.
-    const appName = (opts.appName ?? result.extensionName).replace(/[\s/\\:]+/g, "") || "Extension";
+    const appName = deriveAppName(opts.appName ?? result.extensionName);
     const bundleId = opts.bundleId ?? defaultBundleId(appName);
     result.resolvedBundleId = bundleId;
 
@@ -89,7 +88,10 @@ export function convert(opts: ConvertOptions): ConvertResult {
     // Persistent staged dir (NOT in scratch) so dev-mode symlinks survive cleanup.
     const stageDir = join(outputDir, "staged_extension");
     info("Staging clean extension assets …");
-    stageExtension(extPath, stageDir, collectReferencedPaths(manifest));
+    const droppedAssets = stageExtension(extPath, stageDir, collectReferencedPaths(manifest));
+    for (const a of droppedAssets) {
+      warn(`Manifest-referenced asset not staged (broken/external symlink or copy error): ${a} — it will 404 in Safari.`);
+    }
 
     // Safari's chrome.scripting is an immutable host slot — the shim can't add the
     // ExecutionWorld/RegistrationWorld enums, so bundles reading
@@ -107,6 +109,11 @@ export function convert(opts: ConvertOptions): ConvertResult {
     const rerouted = rewriteRuntimeIdUrlMatchers(stageDir);
     if (rerouted > 0) ok(`Rewrote runtime.id-based port matchers in ${rerouted} script(s)`);
 
+    // Derived once and shared by the shim allowlist (below) and the Swift native
+    // allowlist (later). transformManifest deep-clones its input, so the value is
+    // identical at both points — no reason to recompute.
+    const proxyHosts = deriveProxyHosts(manifest);
+
     let shimFile: string | undefined;
     let polyfillFile: string | undefined;
     if (opts.generateShim) {
@@ -114,7 +121,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
       if (polyfillFile) ok("Bundled webextension-polyfill (browser.* promises on all browsers)");
       shimFile = writeShim(stageDir, {
         chromeOrigin: chromeId ? `chrome-extension://${chromeId}` : "",
-        proxyHosts: deriveProxyHosts(manifest),
+        proxyHosts,
       });
       const n = injectShimIntoHtmlPages(stageDir, polyfillFile);
       if (n > 0) ok(`Shim${polyfillFile ? " + polyfill" : ""} injected into ${n} HTML page(s)`);
@@ -159,7 +166,9 @@ export function convert(opts: ConvertOptions): ConvertResult {
       const isSidePanel =
         (!!panelPath && stripFrag(panelPath) === base) ||
         /(^|\/)side[_-]?panel\.html$/i.test(base);
-      injectPopupSizing(stageDir, popupFile, isSidePanel);
+      // `base` is the fragment/query-stripped on-disk filename; popupFile may carry a
+      // #/? that would make injectPopupSizing's readFileSync miss the real file.
+      injectPopupSizing(stageDir, base, isSidePanel);
     }
     result.stagedPath = stageDir;
     ok(`Staged → ${stageDir}`);
@@ -223,7 +232,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
     // Install the native HTTP proxy handler so requests to the extension's own
     // backends can be sent with the Chrome origin (the in-browser shim can't set
     // it). Generic: hosts/origin derived from the manifest, no-op if none.
-    const proxyHosts = deriveProxyHosts(manifest);
+    // Reuses the proxyHosts derived above for the shim allowlist.
     if (proxyHosts.length > 0) {
       writeNativeProxyHandler(xcodeproj, chromeId ? `chrome-extension://${chromeId}` : "", proxyHosts);
       ok(`Native proxy handler wired for ${proxyHosts.length} backend host(s)`);
