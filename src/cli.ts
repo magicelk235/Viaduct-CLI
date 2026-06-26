@@ -11,7 +11,7 @@ import { scanExtension } from "./analyze/analyze.js";
 import { printIssues, countBlocking, summarizeManifestChanges, buildReportMarkdown } from "./analyze/report.js";
 import { run, info, ok, warn, fail, color, commandExists, setVerbose, setQuiet } from "./util.js";
 import { LSREGISTER, uninstallFromSafari, listSafariExtensions } from "./build/installer.js";
-import { detectXcodeTeam, defaultBundleId } from "./build/packager.js";
+import { detectXcodeTeam, defaultBundleId, deriveAppName } from "./build/packager.js";
 import { verifyInSafari } from "./build/verify.js";
 import { isUrl, downloadExtension } from "./input/download.js";
 import type { Platforms } from "./types.js";
@@ -24,7 +24,7 @@ const CONFIG_KEYS = [
   "output", "bundle-id", "app-name", "min-safari", "platforms", "ci",
   "zip", "no-build", "open-xcode", "install", "install-dir",
   "no-safari-restart", "team", "no-shim", "no-oauth-bridge", "keep-module",
-  "force", "strict", "verify",
+  "force", "strict", "verify", "clean",
 ] as const;
 
 // Boolean-typed config keys (mirror the `type: "boolean"` entries in parseArgs). A
@@ -32,7 +32,7 @@ const CONFIG_KEYS = [
 // JS and would silently flip the flag ON. The rest are string-typed.
 const BOOLEAN_CONFIG_KEYS = new Set<string>([
   "ci", "zip", "no-build", "open-xcode", "install", "no-safari-restart",
-  "no-shim", "no-oauth-bridge", "keep-module", "force", "strict", "verify",
+  "no-shim", "no-oauth-bridge", "keep-module", "force", "strict", "verify", "clean",
 ]);
 
 // Config keys that also have a short CLI alias. Used to detect "the user typed it on
@@ -203,6 +203,7 @@ function analyzeOnly(
   platforms: Platforms,
   json: boolean,
   strict: boolean,
+  keepModuleBackground: boolean,
   reportPath?: string
 ): number {
   const scratch = mkdtempSync(join(tmpdir(), "viaduct-"));
@@ -228,7 +229,7 @@ function analyzeOnly(
     // Preview the real manifest rewrites the converter would apply. transformManifest
     // deep-clones its input and only reads from extPath, so this is side-effect-free.
     const transformed = transformManifest(manifest, permissionsToRemove, extPath, {
-      keepModuleBackground: false,
+      keepModuleBackground,
     });
     const changes = summarizeManifestChanges(manifest, transformed);
 
@@ -245,7 +246,7 @@ function analyzeOnly(
         if (i.shimmed) shimmed++;
         else if (i.autoFixed) autoFixed++;
       }
-      const appName = name.replace(/[\s/\\:]+/g, "") || "Extension";
+      const appName = deriveAppName(name);
       const payload = {
         name,
         appName,
@@ -266,7 +267,7 @@ function analyzeOnly(
       console.log(out);
       if (reportPath) writeAnalyzeReport(reportPath, out);
     } else {
-      printIssues(issues);
+      printIssues(issues, strict);
       if (changes.length > 0) {
         console.log(`\n${color("blue", `Manifest changes the converter would apply (${changes.length})`)}`);
         for (const c of changes) console.log(`  • ${c}`);
@@ -446,6 +447,12 @@ async function main(): Promise<void> {
       fail("--report names a single file; omit it for batch runs.");
       process.exit(2);
     }
+    if (values.json) {
+      // Each input prints a standalone JSON object, so a batch stream is multiple
+      // top-level objects — unparseable by `jq`. Run inputs one at a time for JSON.
+      fail("--json emits one object per extension; run a single extension at a time for parseable JSON.");
+      process.exit(2);
+    }
     if (values["app-name"] !== undefined || values["bundle-id"] !== undefined) {
       fail("--app-name / --bundle-id apply to one extension; omit them for batch (names are derived per-extension).");
       process.exit(2);
@@ -475,9 +482,10 @@ async function main(): Promise<void> {
   // handler, not one-per-input: avoids Node's MaxListenersExceededWarning on big
   // URL batches and frees each archive as soon as its conversion finishes.)
   const liveScratch = new Set<string>();
-  process.on("exit", () => { for (const d of liveScratch) rmSync(d, { recursive: true, force: true }); });
+  // One dir failing to remove (EPERM/EBUSY) must not abort cleanup of the rest.
+  process.on("exit", () => { for (const d of liveScratch) { try { rmSync(d, { recursive: true, force: true }); } catch {} } });
   for (const input of inputs) {
-    if (batch) console.log(`\n${color("bold", `── ${basename(input)} ──`)}`);
+    if (batch) console.error(`\n${color("bold", `── ${basename(input)} ──`)}`);
 
     // Per-input existence check (batch-aware): a missing local path fails just this
     // input and the batch continues, mirroring the download-failure handling below.
@@ -507,7 +515,7 @@ async function main(): Promise<void> {
     }
 
     if (values.analyze) {
-      const code = analyzeOnly(localInput, platforms, values.json, values.strict, values.report);
+      const code = analyzeOnly(localInput, platforms, values.json, values.strict, values["keep-module"], values.report);
       if (code !== 0) anyFailed = true;
       continue;
     }
@@ -574,7 +582,10 @@ async function main(): Promise<void> {
       if (values.verify) {
         if (result.installedAppPath && result.resolvedBundleId) {
           const v = verifyInSafari(result.resolvedBundleId);
-          if (!v.registered) anyFailed = true;
+          // A registered-but-disabled extension won't run — fail the verify the user
+          // asked for. enabled===null is best-effort-unknown (verify.ts contract), not a
+          // failure.
+          if (!v.registered || v.enabled === false) anyFailed = true;
         } else {
           // --verify was requested but there's nothing installed to verify (install
           // failed). Don't silently skip it — that's the check the user asked for.

@@ -294,6 +294,26 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
     }
   });
 
+  // Same "Safari silently drops a malformed pattern" failure mode as content-script
+  // matches, but for host access: a bad host_permission grants NO host access in
+  // Safari with no error. Validate both required and optional host lists.
+  for (const key of ["host_permissions", "optional_host_permissions"] as const) {
+    const hosts = Array.isArray(m[key]) ? (m[key] as unknown[]) : [];
+    for (const pat of hosts) {
+      if (typeof pat !== "string") continue;
+      const err = matchPatternError(pat);
+      if (err) {
+        issues.push({
+          severity: "error",
+          category: "permission",
+          message: `Invalid match pattern "${pat}" in ${key}: ${err}.`,
+          file: "manifest.json",
+          fix: "Safari grants no host access for a malformed pattern; correct or remove it.",
+        });
+      }
+    }
+  }
+
   // Set-dedupe: a permission listed in BOTH permissions and optional_permissions
   // would otherwise produce two identical issues.
   for (const perm of new Set(allPerms)) {
@@ -590,9 +610,12 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
     });
   }
 
+  // Under MV3 a host pattern in `permissions` grants NO access (flagged separately as
+  // misplaced above), so don't also count it as "broad host access" — that's the exact
+  // contradiction. Only MV2 puts host patterns in `permissions` legitimately.
   const hosts = [
     ...(Array.isArray(m.host_permissions) ? m.host_permissions : []),
-    ...(Array.isArray(m.permissions) ? m.permissions : []),
+    ...((m.manifest_version ?? 2) < 3 && Array.isArray(m.permissions) ? m.permissions : []),
   ];
   if (hosts.some((h) => h === "<all_urls>" || h === "*://*/*" || h === "http://*/*" || h === "https://*/*")) {
     issues.push({

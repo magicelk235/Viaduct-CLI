@@ -21,6 +21,9 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
   const removedPerms = (before.permissions ?? []).filter((p) => !(after.permissions ?? []).includes(p));
   if (removedPerms.length) out.push(`Removed permission(s): ${removedPerms.map((p) => `\`${p}\``).join(", ")}.`);
 
+  const removedOptPerms = (before.optional_permissions ?? []).filter((p) => !(after.optional_permissions ?? []).includes(p));
+  if (removedOptPerms.length) out.push(`Removed optional permission(s): ${removedOptPerms.map((p) => `\`${p}\``).join(", ")}.`);
+
   if (before.background?.persistent !== false && after.background?.persistent === false)
     out.push("Background made non-persistent (MV2 → Safari).");
   if (before.background?.type === "module" && after.background?.type === undefined)
@@ -65,9 +68,22 @@ const ORDER: Severity[] = ["error", "warning", "info"];
 const LABEL: Record<Severity, string> = { error: "ERROR", warning: "WARN", info: "INFO" };
 const HUE: Record<Severity, "red" | "yellow" | "blue"> = { error: "red", warning: "yellow", info: "blue" };
 
-export function printIssues(issues: Issue[]): void {
+// When `strict` is provided, append a convertible/blocking verdict line matching the
+// markdown report and the exit code — so `--analyze` terminal output agrees with both
+// and --strict has a visible effect. Omit it (mid-pipeline convert calls) for no verdict.
+export function printIssues(issues: Issue[], strict?: boolean): void {
+  const verdict = () => {
+    if (strict === undefined) return;
+    const blocking = countBlocking(issues, strict);
+    console.log(
+      blocking === 0
+        ? color("green", "\n✅ Convertible — no blocking issues.")
+        : color("red", `\n⛔ ${blocking} blocking issue(s)${strict ? " (--strict: warnings count as blocking)" : ""}.`),
+    );
+  };
   if (issues.length === 0) {
     console.log(color("green", "No compatibility issues found."));
+    verdict();
     return;
   }
   const bySeverity: Record<Severity, Issue[]> = { error: [], warning: [], info: [] };
@@ -108,6 +124,7 @@ export function printIssues(issues: Issue[]): void {
     shimmed ? `${shimmed} shimmed` : null,
   ].filter(Boolean);
   console.log(`\n${parts.join(color("dim", " · "))}${tally.length ? color("green", ` (${tally.join(", ")})`) : ""}`);
+  verdict();
 }
 
 export function countBlocking(issues: Issue[], strict = false): number {

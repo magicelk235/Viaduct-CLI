@@ -38,7 +38,8 @@ export function extractStoreId(url: string): string | undefined {
 
 // Google's CRX endpoint gates responses on prodversion; too stale a value risks it
 // declining newer extensions. Keep this within a major or two of current Chrome stable.
-const CRX_PRODVERSION = "131.0";
+// Override via VIADUCT_CRX_PRODVERSION when the default goes stale and the endpoint declines.
+const CRX_PRODVERSION = process.env.VIADUCT_CRX_PRODVERSION || "131.0";
 
 /** Build the clients2 CRX download endpoint (302-redirects to the real CRX). */
 export function crxEndpoint(id: string): string {
@@ -52,7 +53,6 @@ export function crxEndpoint(id: string): string {
 
 interface HttpResult {
   buffer: Buffer;
-  finalUrl: string;
   contentType: string;
 }
 
@@ -120,7 +120,6 @@ function httpGet(url: string, redirectsLeft = MAX_REDIRECTS): Promise<HttpResult
       res.on("end", () => {
         done(() => resolve({
           buffer: Buffer.concat(chunks),
-          finalUrl: url,
           contentType: String(res.headers["content-type"] ?? ""),
         }));
       });
@@ -134,15 +133,19 @@ function httpGet(url: string, redirectsLeft = MAX_REDIRECTS): Promise<HttpResult
   });
 }
 
-/** Sniff CRX/ZIP magic; fall back to the URL's extension. */
-function inferKind(buf: Buffer, url: string): "crx" | "zip" {
+/** Sniff CRX/ZIP magic; fall back to the URL's extension. `url` may be "" (store
+ * downloads have no trustworthy suffix — magic bytes are authoritative there). */
+function inferKind(buf: Buffer, url: string, contentType = ""): "crx" | "zip" {
   if (buf.subarray(0, 4).toString("ascii") === "Cr24") return "crx";
   if (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04) {
     return "zip";
   }
+  // Magic didn't match. An HTML error/captcha page (content-type text/html, or a
+  // leading "<") is the common culprit — say so instead of trusting a misleading suffix.
+  const looksHtml = /text\/html/i.test(contentType) || buf.subarray(0, 1).toString("ascii") === "<";
   const lower = url.toLowerCase();
-  if (lower.endsWith(".crx")) return "crx";
-  if (lower.endsWith(".zip")) return "zip";
+  if (!looksHtml && lower.endsWith(".crx")) return "crx";
+  if (!looksHtml && lower.endsWith(".zip")) return "zip";
   throw new Error(
     "Downloaded file is not a CRX or ZIP (got an unexpected response, e.g. an HTML error page).",
   );
@@ -164,7 +167,7 @@ export async function downloadExtension(url: string, scratchDir: string): Promis
     );
   }
 
-  const { buffer } = await httpGet(fetchUrl);
+  const { buffer, contentType } = await httpGet(fetchUrl);
   // Google's CRX endpoint answers 204/empty for extensions it won't serve on
   // demand (often the largest or policy-gated ones). httpGet treats that as a
   // successful empty body; without this guard inferKind falls back to the URL
@@ -181,7 +184,7 @@ export async function downloadExtension(url: string, scratchDir: string): Promis
     }
     throw new Error(`Downloaded an empty response from ${url} (no extension package returned).`);
   }
-  const kind = inferKind(buffer, storeId ? "store.crx" : url);
+  const kind = inferKind(buffer, storeId ? "" : url, contentType);
   const dest = join(scratchDir, `download.${kind}`);
   writeFileSync(dest, buffer);
   return dest;

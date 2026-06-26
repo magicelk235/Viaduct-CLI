@@ -538,15 +538,16 @@ var __C2S_DEBUG__ = false;
         var list = discListeners.slice();
         for (var i = 0; i < list.length; i++) { try { list[i](); } catch (e) {} }
       }
+      var CONNECT_RETRY_MS = 150, CONNECT_MAX_WAIT_MS = 6000; // single source for the giveUp ceiling
       function tryConnect() {
         if (real || closed) return;
-        if (++attempts > 40) { giveUp(); return; } // ~6s ceiling
+        if (++attempts * CONNECT_RETRY_MS >= CONNECT_MAX_WAIT_MS) { giveUp(); return; }
         // Wake the background page; a one-shot message forces Safari to spin it up.
         if (nativeSend) { try { var r = nativeSend({ __c2s_wake__: 1 }); if (r && typeof r.then === "function") r.then(function () {}, function () {}); } catch (e) {} }
         var p = null;
         try { p = nativeConnect.apply(rt, connectArgs); } catch (e) { p = null; }
         if (p) { wireReal(p); return; }
-        setTimeout(tryConnect, 150);
+        setTimeout(tryConnect, CONNECT_RETRY_MS);
       }
       tryConnect();
       // The proxy Port: same shape as a real Port, forwards to `real` once available.
@@ -790,6 +791,15 @@ var __C2S_DEBUG__ = false;
       };
     };
     __stg.sync = {
+      // Chrome's documented sync quotas. Settings-sync libraries read these to chunk
+      // large values before set(); against `undefined` the size gate is always false
+      // and `Math.floor(len/QUOTA)` is NaN, producing malformed writes. (sync is backed
+      // by local here, so these are advisory — but callers still read them.)
+      QUOTA_BYTES: 102400,
+      QUOTA_BYTES_PER_ITEM: 8192,
+      MAX_ITEMS: 512,
+      MAX_WRITE_OPERATIONS_PER_HOUR: 1800,
+      MAX_WRITE_OPERATIONS_PER_MINUTE: 120,
       get: syncFwd(local.get),
       set: syncFwd(local.set),
       remove: syncFwd(local.remove),
@@ -1965,9 +1975,15 @@ var __C2S_DEBUG__ = false;
           if (typeof name === "object") { cb = info; info = name; name = ""; }
           if (typeof info === "function") { cb = info; info = undefined; }
           info = info || {};
-          var when = info.when != null ? info.when : Date.now() + (info.delayInMinutes != null ? info.delayInMinutes : (info.periodInMinutes || 0)) * 60000;
+          // Chrome floors the RECURRING period at 1 minute in packed extensions; an
+          // unclamped sub-minute period re-arms setTimeout every few ms and pins the
+          // background page. The initial delay/when is left unclamped (Chrome only
+          // floors the period, not the first fire).
+          var period = info.periodInMinutes ? Math.max(info.periodInMinutes, 1) : null;
+          var firstDelay = info.delayInMinutes != null ? info.delayInMinutes : (period || 0);
+          var when = info.when != null ? info.when : Date.now() + firstDelay * 60000;
           var prev = alarmReg[name]; if (prev) clearTimeout(prev.t);
-          armAlarm(alarmReg[name] = { name: name, when: when, period: info.periodInMinutes || null });
+          armAlarm(alarmReg[name] = { name: name, when: when, period: period });
           return dual(undefined, cb);
         },
         get: function (name, cb) { var a = alarmReg[name || ""]; return dual(a ? alarmInfo(a) : undefined, cb); },
@@ -2097,6 +2113,7 @@ var __C2S_DEBUG__ = false;
         try { if (stg.onChanged && typeof stg.onChanged._emit === "function") stg.onChanged._emit(changes, "session"); } catch (e) {}
       };
       setIfMissing(stg, "session", {
+        QUOTA_BYTES: 10485760,
         get: function (keys, cb) { if (typeof keys === "function") { cb = keys; keys = null; } return dual(sessGet(keys), cb); },
         set: function (items, cb) {
           var changes = {};
@@ -2148,7 +2165,7 @@ var __C2S_DEBUG__ = false;
     // resolver REJECT — and since the setAccessLevel await is unguarded, the
     // rejection still breaks bg init. Clearing it guarantees the success path.
     var c2sSetAccessLevel = function (o, cb) {
-      try { if (chrome.runtime) chrome.runtime.lastError = null; } catch (e) {}
+      setLastErr(null); // helper guards the read-only-getter hosts where a bare assign throws
       return dual(undefined, cb);
     };
     var sess = stg ? mutableNamespace(stg, "session") : null;
@@ -2789,11 +2806,31 @@ var __C2S_DEBUG__ = false;
       chrome.declarativeContent = {
         PageStateMatcher: DCtor, ShowAction: DCtor, ShowPageAction: DCtor, SetIcon: DCtor,
         RequestContentScript: DCtor,
-        onPageChanged: {
-          addRules: function (r, cb) { return dual([], cb); },
-          removeRules: function (ids, cb) { return dual(undefined, cb); },
-          getRules: function (ids, cb) { if (typeof ids === "function") { cb = ids; } return dual([], cb); },
-        },
+        // Rules never fire (no navigation watcher on Safari), but addRules MUST resolve
+        // the added Rule[] with assigned ids so getRules round-trips — Chrome's contract.
+        onPageChanged: (function () {
+          var rules = [];
+          var nextId = 0;
+          return {
+            addRules: function (r, cb) {
+              var added = (r || []).map(function (rule) {
+                return Object.assign({}, rule, { id: rule.id || ("dc_" + (++nextId)) });
+              });
+              rules = rules.concat(added);
+              return dual(added, cb);
+            },
+            removeRules: function (ids, cb) {
+              if (typeof ids === "function") { cb = ids; ids = null; }
+              rules = ids ? rules.filter(function (x) { return ids.indexOf(x.id) === -1; }) : [];
+              return dual(undefined, cb);
+            },
+            getRules: function (ids, cb) {
+              if (typeof ids === "function") { cb = ids; ids = null; }
+              var out = ids ? rules.filter(function (x) { return ids.indexOf(x.id) !== -1; }) : rules.slice();
+              return dual(out, cb);
+            },
+          };
+        })(),
       };
     }
 
@@ -3431,9 +3468,15 @@ var __C2S_DEBUG__ = false;
     if (isBackground && api.runtime && api.runtime.onMessage && proxyHosts.length > 0) {
       api.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
         if (!msg || msg.__c2sProxyRelay !== true || !msg.req) return;
-        sendToHost(msg.req).then(function (r) { sendResponse(r); },
-                                 function (e) { sendResponse({ error: String((e && e.message) || e) }); });
-        return true; // async response
+        // Safari ignores `return true` for an async sendResponse and drops the reply,
+        // hanging the page-side relay (no timeout) until proxyFetch throws "empty reply".
+        // Returning the Promise is the contract Safari honors; sendResponse is kept for
+        // Chrome, which honors the callback. Every other async onMessage path returns a
+        // Promise — this listener must too.
+        return sendToHost(msg.req).then(
+          function (r) { try { sendResponse(r); } catch (e) {} return r; },
+          function (e) { var p = { error: String((e && e.message) || e) }; try { sendResponse(p); } catch (_) {} return p; }
+        );
       });
     }
 
