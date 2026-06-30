@@ -10,6 +10,11 @@ import type { Manifest, Issue } from "../types.js";
  * the "//" in an "https://…" URL), then hands clean JSON to JSON.parse.
  */
 export function parseJsonc<T = unknown>(text: string): T {
+  // Strip a leading UTF-8 BOM (U+FEFF). Node's readFileSync('utf-8') leaves it in
+  // place and it is none of "/,; so it survives the scan and makes JSON.parse throw
+  // on the first char. BOMs are common in Windows-edited manifests / messages.json,
+  // and Chrome's own loader tolerates them — match that.
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
   let out = "";
   let inString = false;
   let escaped = false;
@@ -454,11 +459,19 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
   // it for "remote script-src" would false-flag legitimate sandbox allowances.
   // A bare string is the MV2 form, which maps to extension_pages.
   const cspObj = m.content_security_policy;
+  // A malformed-but-parseable manifest can set extension_pages to a non-string
+  // (object/number/array); coerce anything that isn't a string to "" so the
+  // .includes()/.matchAll() below can't throw and abort the analyzer.
   const csp =
     typeof cspObj === "string"
       ? cspObj
-      : (cspObj?.extension_pages ?? "");
-  if (csp.includes("unsafe-eval")) {
+      : typeof cspObj?.extension_pages === "string"
+        ? cspObj.extension_pages
+        : "";
+  // Match the standalone 'unsafe-eval' token, not the substring inside the
+  // distinct, valid 'wasm-unsafe-eval' keyword (WebAssembly compilation, which
+  // Safari supports and which does NOT enable eval()).
+  if (/(?:^|[\s;'"])unsafe-eval(?:[\s;'"]|$)/.test(csp)) {
     issues.push({
       severity: "warning",
       category: "manifest",
@@ -691,7 +704,7 @@ export function collectReferencedPaths(m: Manifest): Set<string> {
   add(m.devtools_page);
   for (const p of Object.values(m.chrome_url_overrides ?? {})) add(p);
   for (const p of arr(m.sandbox?.pages)) add(p);
-  for (const r of m.declarative_net_request?.rule_resources ?? []) add(r?.path);
+  for (const r of arr(m.declarative_net_request?.rule_resources) as Array<{ path?: unknown }>) add(r?.path);
   // side_panel.default_path: the shim opens this page at runtime (see shim.ts),
   // so a miss here drops the panel HTML and open() 404s in Safari.
   add((m as { side_panel?: { default_path?: unknown } }).side_panel?.default_path);
@@ -767,7 +780,9 @@ export function transformManifest(
   }
 
   const mv = out.manifest_version ?? 2;
-  if (mv === 2 && out.background) {
+  // Guard the type, not just truthiness: a hand-edited manifest can set background to
+  // a primitive, and assigning .persistent on a string throws in strict mode (ESM).
+  if (mv === 2 && out.background && typeof out.background === "object") {
     out.background.persistent = false;
   }
   if (mv === 3 && out.background?.type === "module" && !opts.keepModuleBackground) {

@@ -83,12 +83,17 @@
           return next === "" || next === "/" || next === "?" || next === "#";
         }
         function onNav(d) {
-          if (d.tabId !== tabId) return;
+          // Only the auth tab's TOP-LEVEL navigation may complete the flow. Chrome's
+          // launchWebAuthFlow watches its dedicated auth window's main frame; without
+          // the frameId===0 check a sub-iframe navigating to a URL that startsWith the
+          // redirect target would resolve the flow with a frame-controlled URL the
+          // caller then parses for the OAuth code/token.
+          if (d.tabId !== tabId || d.frameId !== 0) return;
           DBG("[idpoly] nav", d.url);
           if (captured(d.url)) finish(resolve, d.url);
         }
         function onErr(d) {
-          if (d.tabId !== tabId) return;
+          if (d.tabId !== tabId || d.frameId !== 0) return;
           DBG("[idpoly] navERR", d.url, d.error);
           if (captured(d.url)) finish(resolve, d.url);
         }

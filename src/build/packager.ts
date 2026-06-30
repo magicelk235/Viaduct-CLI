@@ -335,9 +335,13 @@ export function buildXcodeProject(
     rmSync(derived, { recursive: true, force: true });
     return null;
   }
-  const productsDir = join(derived, "Build", "Products", "Release");
+  // Search the whole Products dir, not just Release/: macOS lands the app in
+  // "Release", but an iOS build puts it in the SDK-suffixed "Release-iphoneos"
+  // sibling — a hardcoded "Release" path finds no .app for iOS, so the build
+  // reads as failed. The name match below still prevents a wrong-platform bundle.
+  const productsDir = join(derived, "Build", "Products");
   const apps = findFiles(productsDir, (n) => n.endsWith(".app"), 4);
-  // Match the app we built by name; a multi-platform Release dir can hold several .app
+  // Match the app we built by name; a multi-platform Products dir can hold several .app
   // bundles, and readdir order is not guaranteed, so [0] could be the wrong one — never
   // fall back to an arbitrary bundle (it could be the iOS app for a macOS build).
   const built = apps.find((p) => basename(p) === `${appName}.app`);
@@ -369,15 +373,27 @@ export interface BundleVerification {
  * Read the BUILT bundle Info.plists and confirm the identifiers match intent.
  * This is the check v2 lacked: it patched the project but never verified the
  * compiled .appex, so Safari registered the packager-default id.
+ *
+ * Handles BOTH bundle layouts: a macOS app nests everything under `Contents/`
+ * (Contents/Info.plist, Contents/PlugIns/Foo.appex/Contents/Info.plist); an iOS
+ * `.app` is flat (Info.plist + PlugIns/Foo.appex/Info.plist at the root).
+ * Detecting the layout per-bundle keeps iOS builds from spuriously failing — the
+ * old macOS-only `Contents/` paths returned null for every iOS app, which
+ * convert.ts then treats as a fatal bundle-id mismatch and aborts the build.
  */
 export function verifyBuiltBundleId(appPath: string, bundleId: string): BundleVerification {
   const expectedAppId = bundleId;
   const expectedExtId = `${bundleId}.Extension`;
-  const appId = plistValue(join(appPath, "Contents", "Info.plist"), "CFBundleIdentifier");
+  // macOS bundles hold Info.plist under Contents/; iOS bundles are flat. Resolve
+  // the dir that actually carries Info.plist for each bundle (app and appex).
+  const plistDir = (base: string) =>
+    existsSync(join(base, "Contents", "Info.plist")) ? join(base, "Contents") : base;
+  const appDir = plistDir(appPath);
+  const appId = plistValue(join(appDir, "Info.plist"), "CFBundleIdentifier");
 
-  const appexes = findFiles(join(appPath, "Contents", "PlugIns"), (n) => n.endsWith(".appex"), 1);
+  const appexes = findFiles(join(appDir, "PlugIns"), (n) => n.endsWith(".appex"), 1);
   const extId = appexes.length
-    ? plistValue(join(appexes[0], "Contents", "Info.plist"), "CFBundleIdentifier")
+    ? plistValue(join(plistDir(appexes[0]), "Info.plist"), "CFBundleIdentifier")
     : null;
 
   return {
