@@ -18,10 +18,15 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
 
   if (before.version !== after.version) out.push(`Version \`${before.version}\` → \`${after.version}\` (Apple format).`);
 
-  const removedPerms = (before.permissions ?? []).filter((p) => !(after.permissions ?? []).includes(p));
+  // A malformed manifest can set permissions to a non-array (a bare string,
+  // an object); guard with Array.isArray so .filter()/.includes() never throw
+  // and abort the --analyze run, matching the array guards used elsewhere.
+  const permList = (m: Manifest, key: "permissions" | "optional_permissions"): string[] =>
+    Array.isArray(m[key]) ? (m[key] as string[]) : [];
+  const removedPerms = permList(before, "permissions").filter((p) => !permList(after, "permissions").includes(p));
   if (removedPerms.length) out.push(`Removed permission(s): ${removedPerms.map((p) => `\`${p}\``).join(", ")}.`);
 
-  const removedOptPerms = (before.optional_permissions ?? []).filter((p) => !(after.optional_permissions ?? []).includes(p));
+  const removedOptPerms = permList(before, "optional_permissions").filter((p) => !permList(after, "optional_permissions").includes(p));
   if (removedOptPerms.length) out.push(`Removed optional permission(s): ${removedOptPerms.map((p) => `\`${p}\``).join(", ")}.`);
 
   if (before.background?.persistent !== false && after.background?.persistent === false)

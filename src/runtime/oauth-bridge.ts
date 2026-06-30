@@ -100,7 +100,13 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest, chromeId?
   //    exactly the set of pages allowed to message the extension). Without any
   //    such origins the page↔SW handshake can never fire, so don't emit the
   //    page-bridge files — they'd just be dead weight in the package.
-  const matches = manifest.externally_connectable?.matches ?? [];
+  // The raw manifest is unguarded JSON.parse output, so externally_connectable.matches
+  // may be a non-array (a bare string). Coerce to [] — a non-array can't be spread into
+  // content_scripts.matches and would crash on matches.join() below; falling into the
+  // skip branch is the correct, safe behavior.
+  const matches = Array.isArray(manifest.externally_connectable?.matches)
+    ? manifest.externally_connectable!.matches
+    : [];
   if (matches.length === 0) {
     notes.push("chrome.identity shim emitted; page bridge skipped (no externally_connectable.matches to wire).");
     return notes;
