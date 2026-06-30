@@ -85,7 +85,10 @@ function applyConfig(
     if (
       argv.includes(`--${key}`) ||
       argv.some((a) => a.startsWith(`--${key}=`)) ||
-      (short !== undefined && argv.includes(`-${short}`))
+      // The short alias appears as the bare token `-o` OR Node's attached form
+      // `-ofoo` (a single argv token). Match both so an explicit `-ofoo` isn't
+      // silently overridden by a config value for the same key.
+      (short !== undefined && argv.some((a) => a === `-${short}` || a.startsWith(`-${short}`)))
     ) continue;
     values[key] = val;
   }

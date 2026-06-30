@@ -110,9 +110,14 @@ function headInsertIndex(html: string): number {
   const re = /<head[^>]*>/gi;
   let m: RegExpExecArray | null;
   while ((m = re.exec(html)) !== null) {
-    // Inside a comment if the last "<!--" before this point has no "-->" after it.
+    // Inside a comment if the last "<!--" before this point has no "-->" before
+    // the head tag. indexOf returning -1 means the comment is never closed at
+    // all (unterminated) — still inside it, so skip this head too.
     const open = html.lastIndexOf("<!--", m.index);
-    if (open !== -1 && html.indexOf("-->", open) > m.index) continue;
+    if (open !== -1) {
+      const close = html.indexOf("-->", open);
+      if (close === -1 || close > m.index) continue;
+    }
     return m.index + m[0].length;
   }
   return -1;
@@ -381,7 +386,12 @@ function hoistImportScripts(dir: string, swPath: string): string {
   // outer ")" dangling after the no-op replacement and broke the bundle with a
   // SyntaxError. Scan for the balanced closing paren instead (string-literal and
   // comment aware), so the WHOLE call is replaced regardless of nesting.
-  const callOpenRe = /\bimportScripts\s*\(/g;
+  // Also consume an optional `<receiver>.` prefix (self./globalThis./window./this.)
+  // so the whole member-call `self.importScripts(...)` — the idiomatic Workbox /
+  // TS-WebWorker form — is replaced as one span. Matching only `importScripts(`
+  // (\b sits between the "." and "i") would leave the receiver behind and emit the
+  // syntax error `self.void 0`, breaking the entire background module.
+  const callOpenRe = /(?:\b(?:self|globalThis|window|this)\s*\.\s*)?\bimportScripts\s*\(/g;
   let neutralized = 0;
   let out = "";
   let last = 0;

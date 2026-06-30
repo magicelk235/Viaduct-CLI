@@ -62,7 +62,13 @@ function httpGet(url: string, redirectsLeft = MAX_REDIRECTS): Promise<HttpResult
     // buffered `end` (which would resolve with the truncated buffer) can both
     // fire, and whichever lands second is a silent no-op. Settle exactly once.
     let settled = false;
-    const done = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
+    // Wall-clock deadline for the whole download. req.setTimeout below is only a
+    // socket IDLE timeout: a slow-drip server sending a few bytes every <TIMEOUT_MS
+    // never trips it and could hold the request open far past TIMEOUT_MS. This hard
+    // deadline (cleared on any settle) enforces the advertised bound. Armed after req
+    // is created, below.
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const done = (fn: () => void) => { if (!settled) { settled = true; if (deadline) clearTimeout(deadline); fn(); } };
     // isUrl() permits http:// too; https.get throws ERR_INVALID_PROTOCOL on it
     // synchronously. Pick the matching agent so an http:// input downloads (or
     // fails) gracefully instead of with a cryptic internal TypeError.
@@ -127,8 +133,12 @@ function httpGet(url: string, redirectsLeft = MAX_REDIRECTS): Promise<HttpResult
     });
 
     req.setTimeout(TIMEOUT_MS, () => {
-      req.destroy(new Error(`Timed out after ${TIMEOUT_MS}ms fetching ${url}`));
+      req.destroy(new Error(`No data for ${TIMEOUT_MS}ms fetching ${url}`));
     });
+    // Total wall-clock deadline (idle timeout above can't bound a slow-drip response).
+    deadline = setTimeout(() => {
+      req.destroy(new Error(`Timed out after ${TIMEOUT_MS}ms fetching ${url}`));
+    }, TIMEOUT_MS);
     req.on("error", (e) => done(() => reject(e)));
   });
 }
