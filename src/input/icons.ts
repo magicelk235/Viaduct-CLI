@@ -113,9 +113,10 @@ export function synthesizePlaceholderIcons(stageDir: string, manifest: Manifest,
   }
   manifest.icons = icons;
 
-  // Wire the toolbar button to the same set if an action exists. (existingAction
-  // had no default_icon — checked above — so this always assigns when present.)
-  if (existingAction && !existingAction.default_icon) existingAction.default_icon = { ...icons };
+  // Wire the toolbar button to the same set if an action exists. Reaching here
+  // means the line-105 guard found no usable default_icon (absent, or an empty
+  // {}), so assign unconditionally — a truthiness check would skip the {} case.
+  if (existingAction) existingAction.default_icon = { ...icons };
 
   return SIZES;
 }

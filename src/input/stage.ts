@@ -99,7 +99,10 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
     const srcLink = join(root, rel);
     let lst;
     try { lst = lstatSync(srcLink); } catch { continue; }
-    if (!lst.isSymbolicLink()) continue;
+    // Skip only when it's a plain file cpSync already staged. A non-link that never
+    // got staged means an ancestor directory was a symlink (dropped by the filter),
+    // so fall through and dereference it via realpathSync below.
+    if (!lst.isSymbolicLink() && existsSync(join(stageDir, rel))) continue;
     let target;
     try {
       target = realpathSync(srcLink);
@@ -118,7 +121,7 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
   return dropped;
 }
 
-const SOURCEMAP_RE = /[ \t]*\/\/[#@] sourceMappingURL=(\S+)[ \t]*\r?$/gm;
+const SOURCEMAP_RE = /^[ \t]*\/\/[#@] sourceMappingURL=(\S+)[ \t]*\r?$/gm;
 
 function walkScripts(dir: string, acc: string[] = []): string[] {
   let entries;
