@@ -86,6 +86,17 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest, chromeId?
   copyFileSync(join(TEMPLATE_DIR, BRIDGE_POLYFILL), join(stageDir, BRIDGE_POLYFILL));
   substituteExtId(join(stageDir, BRIDGE_POLYFILL), chromeId);
 
+  // launchWebAuthFlow watches the auth tab via chrome.webNavigation; Chrome
+  // extensions using identity typically don't declare it, so add it here (only for
+  // identity users — an unused permission on every extension draws review scrutiny)
+  // or the polyfill's onBeforeNavigate wiring throws (webNavigation is undefined).
+  const usesIdentity = Array.isArray(manifest.permissions) &&
+    manifest.permissions.some((p) => typeof p === "string" && (p === "identity" || p.startsWith("identity.")));
+  if (usesIdentity) {
+    if (!Array.isArray(manifest.permissions)) manifest.permissions = [];
+    if (!manifest.permissions.includes("webNavigation")) manifest.permissions.push("webNavigation");
+  }
+
   // 2. The SW (or its loader) must run the polyfill FIRST so the bridge receiver
   //    and chrome.identity shim install before the bundle evaluates.
   injectPolyfillImport(stageDir, sw);

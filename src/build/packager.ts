@@ -77,9 +77,13 @@ export function patchProjectBundleIds(xcodeproj: string, bundleId: string): void
   let content = readFileSync(pbxproj, "utf-8");
   const extId = `${bundleId}.Extension`;
 
-  // Extension targets carry a ".Extension" suffix in the generated id.
+  // Extension targets carry a ".Extension" suffix in the generated id. Skip the
+  // exact app id: a user bundle id that itself ends in ".Extension" (allowed by
+  // BUNDLE_ID_RE) would otherwise be rewritten to the appex id on a re-run,
+  // leaving both targets identical and failing verifyBuiltBundleId.
+  const escapedBundleId = bundleId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   content = content.replace(
-    /PRODUCT_BUNDLE_IDENTIFIER = "?[\w.\-$()]+\.Extension"?;/g,
+    new RegExp(`PRODUCT_BUNDLE_IDENTIFIER = "?(?!${escapedBundleId}"?;)[\\w.\\-$()]+\\.Extension"?;`, "g"),
     `PRODUCT_BUNDLE_IDENTIFIER = "${extId}";`
   );
   // Remaining ones are the app target(s). The value-scoped negative lookahead
@@ -158,7 +162,7 @@ import SafariServices
 import Foundation
 import os.log
 
-class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
+class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling, URLSessionTaskDelegate {
     // Backends the extension declares it talks to; only these may be proxied.
     static let allowHosts: Set<String> = [${hostsLiteral}]
     // Origin the in-browser shim cannot set (Safari forbids it). "" → none.
@@ -210,7 +214,11 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
         let cfg = URLSessionConfiguration.default
         cfg.httpShouldSetCookies = false
         cfg.httpCookieAcceptPolicy = .never
-        let session = URLSession(configuration: cfg)
+        // Follow redirects only within the allowlist: URLSession copies our Cookie/
+        // Origin headers onto the redirected request, so an open/hostile redirect
+        // would leak the Safari session cookie off-allowlist. The delegate below
+        // vetoes any cross-host hop that isn't allowlisted.
+        let session = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
         let task = session.dataTask(with: req) { data, response, error in
             if let error = error {
                 self.reply(context, ["error": error.localizedDescription])
@@ -228,6 +236,16 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
             ])
         }
         task.resume()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        if let host = request.url?.host, Self.hostAllowed(host) {
+            completionHandler(request)
+        } else {
+            // Refuse the redirect; the shim receives the 3xx status/headers instead of
+            // silently forwarding credentials to an off-allowlist host.
+            completionHandler(nil)
+        }
     }
 
     static func hostAllowed(_ host: String) -> Bool {

@@ -77,10 +77,22 @@ function makeLineResolver(content: string): (index: number) => number {
 const API_PATTERNS = Object.entries(UNSUPPORTED_APIS).map(([api, info]) => {
   const name = api.replace(/\\b/g, "");
   if (api.includes("\\")) {
-    return { name, literal: null as string | null, re: new RegExp(api.replace(/\./g, "\\.")), info };
+    // Widen a chrome. prefix to (?:chrome|browser). — polyfill code says browser.*.
+    const source = api.replace(/\./g, "\\.").replace(/^chrome\\\./, "(?:chrome|browser)\\.");
+    return { name, literal: null as string | null, re: new RegExp(source), info };
   }
   return { name, literal: api, re: null as RegExp | null, info };
 });
+
+// webextension-polyfill extensions write browser.identity etc. — probe both prefixes.
+function indexOfApi(content: string, literal: string): number {
+  const a = content.indexOf(literal);
+  if (!literal.startsWith("chrome.")) return a;
+  const b = content.indexOf("browser." + literal.slice("chrome.".length));
+  if (a === -1) return b;
+  if (b === -1) return a;
+  return Math.min(a, b);
+}
 const FAVICON_RE = /chrome:\/\/favicon|[/'"]_favicon\//;
 // A hardcoded chrome-extension://<32-char-id>/ URL. Chrome's id is stable; Safari
 // assigns a different random extension origin per install, so any such literal
@@ -92,7 +104,7 @@ const HARDCODED_EXT_URL_RE = /chrome-extension:\/\/[a-p]{32}\b/;
 // Safari — the navigation just errors. The shim swallows it at runtime, but the
 // author still needs to add their own "edit in Safari → Settings → Extensions" UI.
 const CHROME_SETTINGS_URL_RE = /chrome:\/\/(extensions|settings)\b/;
-const BLOCKING_WEBREQUEST_RE = /chrome\.webRequest\.on\w+/;
+const BLOCKING_WEBREQUEST_RE = /(?:chrome|browser)\.webRequest\.on\w+/;
 // Detect code that pulls a Chrome version token out of the UA string — the telltale
 // of UA version sniffing (e.g. /Chrome\/(\d+)/, /Chrom(e|ium)\/([0-9]+)\./). The
 // version capture is what breaks on Safari (no Chrome token). We match two robust
@@ -108,14 +120,13 @@ const BACKGROUND_FILE_RE = /(background|service[-_]?worker)/i;
 // works fine in Safari, so don't warn on it (it fires on most extensions). Only
 // tabs.connect — the tab/frame-targeting side — hits the bug.
 const CONNECT_RE = /tabs\.connect\s*\(/;
-const IMPORT_SCRIPTS_RE = /\bimportScripts\s*\(/;
 
 function scanJsContent(content: string, rel: string, issues: Issue[]): void {
   const lineAt = makeLineResolver(content);
 
   const hits: Array<{ name: string; at: number; info: (typeof API_PATTERNS)[number]["info"] }> = [];
   for (const { name, literal, re, info } of API_PATTERNS) {
-    const at = literal !== null ? content.indexOf(literal) : re!.exec(content)?.index ?? -1;
+    const at = literal !== null ? indexOfApi(content, literal) : re!.exec(content)?.index ?? -1;
     if (at >= 0) hits.push({ name, at, info });
   }
   for (const h of hits) {
@@ -197,28 +208,39 @@ function scanJsContent(content: string, rel: string, issues: Issue[]): void {
   // undefined global is never invoked. So static literals are auto-fixed (info);
   // only dynamic args (a variable/expression we can't statically hoist) lose their
   // imported code and need a manual rewrite (warning).
-  const is = IMPORT_SCRIPTS_RE.exec(content);
-  if (is) {
-    const argList = /\bimportScripts\s*\(([^)]*)\)/.exec(content.slice(is.index))?.[1] ?? "";
-    // Static only when every arg is a bare string literal we can hoist verbatim
-    // (e.g. "a.js", 'b.js', "a.js", "b.js"). Anything else — a variable, a
-    // concat (base + "a.js"), a getURL("x") call — can't be statically hoisted
-    // and silently loses its imported code, so it must warn, not reassure.
-    const STATIC_LITERAL_LIST = /^\s*(?:(["'])[^"']*\1\s*,\s*)*(["'])[^"']*\2\s*$/;
-    const dynamic = argList.trim() !== "" && !STATIC_LITERAL_LIST.test(argList);
-    issues.push(dynamic ? {
+  // The converter neutralizes EVERY importScripts call, so a static first call
+  // must not mask later dynamic ones (webpack/Workbox SWs commonly do a static
+  // precache import first, then a dynamic chunk-loader call).
+  // Static only when every arg is a bare string literal we can hoist verbatim
+  // (e.g. "a.js", 'b.js'). Anything else — a variable, a concat (base + "a.js"),
+  // a getURL("x") call — can't be statically hoisted and silently loses its
+  // imported code, so it must warn, not reassure.
+  const STATIC_LITERAL_LIST = /^\s*(?:(["'])[^"']*\1\s*,\s*)*(["'])[^"']*\2\s*$/;
+  const IS_CALL_RE = /\bimportScripts\s*\(([^)]*)\)/g;
+  let isFirstAt = -1;
+  let isDynamicAt = -1;
+  for (let m; (m = IS_CALL_RE.exec(content)); ) {
+    if (isFirstAt === -1) isFirstAt = m.index;
+    const argList = m[1] ?? "";
+    if (argList.trim() !== "" && !STATIC_LITERAL_LIST.test(argList)) {
+      isDynamicAt = m.index;
+      break;
+    }
+  }
+  if (isFirstAt !== -1) {
+    issues.push(isDynamicAt !== -1 ? {
       severity: "warning",
       category: "background",
       message: "importScripts() with a dynamic (non-literal) argument can't be hoisted; the imported code won't run in the converted background page.",
       file: rel,
-      line: lineAt(is.index),
+      line: lineAt(isDynamicAt),
       fix: 'Replace the dynamic importScripts(expr) with static ES imports (import "./a.js";) at the top of the worker.',
     } : {
       severity: "info",
       category: "background",
       message: "importScripts() targets are auto-hoisted into background.html as classic scripts; the calls are neutralized.",
       file: rel,
-      line: lineAt(is.index),
+      line: lineAt(isFirstAt),
     });
   }
 

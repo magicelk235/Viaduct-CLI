@@ -223,7 +223,7 @@ export function analyzeCommands(commands: Record<string, unknown>): Issue[] {
   const issues: Issue[] = [];
   for (const [name, def] of Object.entries(commands)) {
     const suggested = (def as { suggested_key?: unknown } | undefined)?.suggested_key;
-    if (suggested === undefined) continue; // user can still bind it manually in Safari
+    if (suggested == null) continue; // undefined or null → user can still bind it manually in Safari
     // suggested_key is either a string (all platforms) or a per-platform map.
     const chords =
       typeof suggested === "string"
@@ -489,7 +489,7 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
   for (const dm of csp.matchAll(scriptSrc)) {
     for (const token of dm[1].trim().split(/\s+/)) {
       // A bare "*" (or scheme-wildcard like https://*) whitelists the whole network.
-      if (token === "*" || /^(https?:|\/\/|wss?:|\*:)/i.test(token) || /^[a-z0-9.-]+\.[a-z]{2,}(?::\d+)?$/i.test(token)) {
+      if (token === "*" || /^(https?:|\/\/|wss?:|\*:)/i.test(token) || /^(?:\*\.)?[a-z0-9.-]+\.[a-z]{2,}(?::\d+)?$/i.test(token)) {
         remoteSrc.add(token);
       }
     }
@@ -774,6 +774,12 @@ export function transformManifest(
 
   const removeSet = new Set(permissionsToRemove);
   if (Array.isArray(out.permissions)) out.permissions = out.permissions.filter((p) => !removeSet.has(p));
+  // Safari rejects the declarativeNetRequestWithHostAccess token, but either token
+  // grants the DNR API. If we stripped the variant and no plain declarativeNetRequest
+  // remains, add it so a DNR-only extension keeps its rulesets.
+  if (removeSet.has("declarativeNetRequestWithHostAccess") && Array.isArray(out.permissions) && !out.permissions.includes("declarativeNetRequest")) {
+    out.permissions.push("declarativeNetRequest");
+  }
   if (Array.isArray(out.optional_permissions)) {
     out.optional_permissions = out.optional_permissions.filter((p) => !removeSet.has(p));
     if (out.optional_permissions.length === 0) delete out.optional_permissions;
@@ -851,9 +857,13 @@ export function transformManifest(
     }
   }
 
+  const existingSafari = (out.browser_specific_settings as { safari?: { strict_min_version?: string } } | undefined)?.safari;
   out.browser_specific_settings = {
     ...(out.browser_specific_settings ?? {}),
-    safari: { strict_min_version: opts.minSafariVersion ?? DEFAULT_MIN_SAFARI_VERSION },
+    safari: {
+      ...(existingSafari ?? {}),
+      strict_min_version: opts.minSafariVersion ?? existingSafari?.strict_min_version ?? DEFAULT_MIN_SAFARI_VERSION,
+    },
   };
 
   // Ensure the toolbar button does something: wire a popup if one exists. Normalize
@@ -886,6 +896,9 @@ export function transformManifest(
   if ((opts.shimFile || opts.polyfillFile) && Array.isArray(out.content_scripts)) {
     for (const cs of out.content_scripts) {
       if (!Array.isArray(cs.js)) continue;
+      // MAIN-world scripts run in the page context where chrome/browser don't exist;
+      // the bundled webextension-polyfill throws at top level there. Leave them alone.
+      if ((cs as { world?: string }).world === "MAIN") continue;
       if (opts.shimFile && !cs.js.includes(opts.shimFile)) cs.js.unshift(opts.shimFile);
       if (opts.polyfillFile && !cs.js.includes(opts.polyfillFile)) cs.js.unshift(opts.polyfillFile);
     }

@@ -1862,7 +1862,7 @@ var __C2S_DEBUG__ = false;
 
     // dual(value, cb): honor Chrome's callback form AND return a promise otherwise.
     var dual = function (value, cb) {
-      if (typeof cb === "function") { try { cb(value); } catch (e) {} return; }
+      if (typeof cb === "function") { setLastErr(null); try { cb(value); } catch (e) {} return; }
       return Promise.resolve(value);
     };
 
@@ -1919,7 +1919,7 @@ var __C2S_DEBUG__ = false;
         chrome.action.setBadgeTextColor = function (details, cb) { return dual(undefined, cb); };
       }
       if (typeof chrome.action.getBadgeTextColor !== "function") {
-        chrome.action.getBadgeTextColor = function (details, cb) { if (typeof details === "function") cb = details; return dual({ color: [0, 0, 0, 255] }, cb); };
+        chrome.action.getBadgeTextColor = function (details, cb) { if (typeof details === "function") cb = details; return dual([0, 0, 0, 255], cb); };
       }
     }
 
@@ -1964,10 +1964,11 @@ var __C2S_DEBUG__ = false;
           return;
         }
         a.t = setTimeout(function () {
+          var info = alarmInfo(a); // capture the elapsed fire time before re-arm mutates a.when
           if (a.period) { a.when = Date.now() + a.period * 60000; armAlarm(a); }
           else delete alarmReg[a.name];
           var asnap = alarmList.slice(); // snapshot: a one-shot listener that unregisters itself mustn't skip the next
-          for (var i = 0; i < asnap.length; i++) { try { asnap[i](alarmInfo(a)); } catch (e) {} }
+          for (var i = 0; i < asnap.length; i++) { try { asnap[i](info); } catch (e) {} }
         }, Math.max(0, remaining));
       };
       chrome.alarms = {
@@ -2063,7 +2064,13 @@ var __C2S_DEBUG__ = false;
         var __tabsQuery = chrome.tabs.query.bind(chrome.tabs);
         var __wrapTabsQuery = function (info, cb) {
           if (info && typeof info === "object" && typeof info.windowId === "number" && info.windowId < 0) {
-            try { var c = {}; for (var k in info) c[k] = info[k]; delete c.windowId; info = c; } catch (e) {}
+            try {
+              var c = {}; for (var k in info) c[k] = info[k];
+              var wasCurrent = c.windowId === -2; // WINDOW_ID_CURRENT
+              delete c.windowId;
+              if (wasCurrent) c.currentWindow = true; // preserve the current-window filter
+              info = c;
+            } catch (e) {}
           }
           try { return __tabsQuery(info, cb); }
           catch (e) { try { return __tabsQuery({}, cb); } catch (e2) { return dual([], cb); } }
@@ -2312,7 +2319,7 @@ var __C2S_DEBUG__ = false;
             item.state = "complete"; item.endTime = nowIso();
             dlChanged._emit({ id: id, state: { previous: "in_progress", current: "complete" } });
           };
-          if (typeof Promise !== "undefined") Promise.resolve().then(complete); else complete();
+          setTimeout(complete, 0); // macrotask: let the caller await the id and register onChanged first
           return dual(id, cb);
         },
         search: function (q, cb) {
@@ -2352,9 +2359,10 @@ var __C2S_DEBUG__ = false;
         var text = (opts && opts.text) || "";
         var url = "https://www.google.com/search?q=" + encodeURIComponent(text);
         try {
-          if (chrome.tabs && chrome.tabs.create) {
-            if (opts && opts.disposition === "CURRENT_TAB" && chrome.tabs.update) chrome.tabs.update({ url: url });
-            else chrome.tabs.create({ url: url });
+          if (chrome.tabs) {
+            var disp = (opts && opts.disposition) || "CURRENT_TAB"; // Chrome's default
+            if (disp === "CURRENT_TAB" && chrome.tabs.update) chrome.tabs.update({ url: url });
+            else if (chrome.tabs.create) chrome.tabs.create({ url: url });
           }
         } catch (e) {}
         return dual(undefined, cb);
@@ -2436,7 +2444,7 @@ var __C2S_DEBUG__ = false;
         var n = nodes[id]; if (!n) return null;
         var o = { id: n.id, title: n.title || "", index: n.index || 0, dateAdded: n.dateAdded };
         if (n.parentId != null) o.parentId = n.parentId;
-        if (n.url != null) o.url = n.url; else o.children = childIds(id).slice();
+        if (n.url != null) o.url = n.url;
         return o;
       };
       var childIds = function (parentId) {
@@ -2445,7 +2453,7 @@ var __C2S_DEBUG__ = false;
         ids.sort(function (a, b) { return (nodes[a].index || 0) - (nodes[b].index || 0); });
         return ids;
       };
-      var subtree = function (id) { var o = pub(id); if (o && o.children) { o.children = childIds(id).map(subtree); } return o; };
+      var subtree = function (id) { var o = pub(id); if (o && o.url == null) { o.children = childIds(id).map(subtree); } return o; };
       var reindex = function (parentId) { var ids = childIds(parentId); for (var i = 0; i < ids.length; i++) nodes[ids[i]].index = i; };
 
       fill(chrome.bookmarks, {
@@ -2981,7 +2989,7 @@ var __C2S_DEBUG__ = false;
         resetWorldConfiguration: function (p, cb) { if (typeof p === "function") { cb = p; } return dual(undefined, cb); },
       });
       function shallowCopy(o) { var r = {}; for (var k in o) r[k] = o[k]; return r; }
-      function rejectOrCb(err, cb) { if (typeof cb === "function") { setLastErr({ message: err.message }); cb(); return undefined; } return Promise.reject(err); }
+      function rejectOrCb(err, cb) { if (typeof cb === "function") { setLastErr({ message: err.message }); try { cb(); } finally { setLastErr(null); } return undefined; } return Promise.reject(err); }
     })();
 
     // chrome.scripting DYNAMIC content-script registration (registerContentScripts /
@@ -3000,7 +3008,7 @@ var __C2S_DEBUG__ = false;
       if (__sc) (function () {
         var reg = {}; // id -> RegisteredContentScript
         var copy = function (o) { var r = {}; for (var k in o) r[k] = o[k]; return r; };
-        var rejectOr = function (err, cb) { if (typeof cb === "function") { setLastErr({ message: err.message }); cb(); return undefined; } return Promise.reject(err); };
+        var rejectOr = function (err, cb) { if (typeof cb === "function") { setLastErr({ message: err.message }); try { cb(); } finally { setLastErr(null); } return undefined; } return Promise.reject(err); };
         fill(__sc, {
           registerContentScripts: function (list, cb) {
             var arr = Array.isArray(list) ? list : [];
@@ -3266,7 +3274,7 @@ var __C2S_DEBUG__ = false;
   // below already covers. Strip modifyHeaders rules out of update{Session,Dynamic}Rules
   // so the crash never arms; block/redirect/allow rules pass through untouched.
   if (hasChrome && chrome.declarativeNetRequest) {
-    var dnrNs = chrome.declarativeNetRequest;
+    var dnrNs = mutableNamespace(chrome, "declarativeNetRequest") || chrome.declarativeNetRequest;
     // Chrome exposes string-enum objects + onRuleMatchedDebug on the DNR namespace
     // that Safari omits. Module-eval code reads e.g. RuleActionType.MODIFY_HEADERS
     // (Claude) or onRuleMatchedDebug.addListener (URL Blocker) at top level, which
@@ -3291,11 +3299,13 @@ var __C2S_DEBUG__ = false;
     var wrapDnrUpdate = function (name) {
       var orig = dnrNs[name];
       if (typeof orig !== "function" || orig.__c2sWrapped) return;
-      dnrNs[name] = function (opts, cb) {
+      var wrapped = function (opts, cb) {
         try { opts = stripModifyHeaders(opts); } catch (e) {}
         return orig.call(dnrNs, opts, cb);
       };
-      dnrNs[name].__c2sWrapped = true;
+      // Bare assignment can silently no-op (or throw) on Safari's exotic DNR slot;
+      // only mark it wrapped once the install is verified to have taken.
+      if (installOverride(dnrNs, name, wrapped)) wrapped.__c2sWrapped = true;
     };
     wrapDnrUpdate("updateSessionRules");
     wrapDnrUpdate("updateDynamicRules");
@@ -3494,9 +3504,15 @@ var __C2S_DEBUG__ = false;
             init = Object.assign({}, base, { headers: h });
           }
         } catch (e) { /* fall through with original args */ }
+        var willProxy = shouldProxy(url);
+        // A Request's body is disturbed synchronously by the first fetch, so clone it
+        // BEFORE calling _fetch — a clone taken afterward throws "body already used".
+        var bodyClone = null;
+        if (willProxy && typeof input !== "string" && input && typeof input.clone === "function" && !(init && "body" in init)) {
+          try { bodyClone = input.clone(); } catch (e) {}
+        }
         var self_ = this;
         var attempt = _fetch.call(self_, input, init);
-        var willProxy = shouldProxy(url);
         dbg("[c2s] fetch", url, "proxyEnabled=" + proxyEnabled, "willProxy=" + willProxy, "ctx=" + (isBackground ? "bg" : "page"));
         if (!willProxy) return attempt;
         // Capture request shape once for a possible proxy retry. Headers and body can
@@ -3515,11 +3531,8 @@ var __C2S_DEBUG__ = false;
           try {
             if (init && typeof init.body === "string") return Promise.resolve(init.body);
             if (init && init.body && typeof init.body.toString === "function" && (typeof URLSearchParams !== "undefined" && init.body instanceof URLSearchParams)) return Promise.resolve(init.body.toString());
-            // A Request input (or any non-string body) — clone before the first fetch
-            // consumed it and read as text. Cloning a string-input fetch is a no-op.
-            if (typeof input !== "string" && input && typeof input.clone === "function" && !(init && "body" in init)) {
-              return input.clone().text().catch(function () { return null; });
-            }
+            // Read the clone captured before the first fetch (see above).
+            if (bodyClone) return bodyClone.text().catch(function () { return null; });
           } catch (e) {}
           return Promise.resolve(null);
         })();

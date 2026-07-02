@@ -47,7 +47,9 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
 
   if (Array.isArray(before.web_accessible_resources) && Array.isArray(after.web_accessible_resources)) {
     const beforeHadStrings = (before.web_accessible_resources as unknown[]).some((e) => typeof e === "string");
-    if (beforeHadStrings) out.push("Wrapped MV2 `web_accessible_resources` strings into MV3 objects.");
+    // The transform only wraps on MV3; an untouched MV2 string list is not a change.
+    const afterHasStrings = (after.web_accessible_resources as unknown[]).some((e) => typeof e === "string");
+    if (beforeHadStrings && !afterHasStrings) out.push("Wrapped MV2 `web_accessible_resources` strings into MV3 objects.");
   }
 
   if (!hasSafariSettings(before) && hasSafariSettings(after))

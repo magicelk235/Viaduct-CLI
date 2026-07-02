@@ -15,7 +15,8 @@
   // extension's OWN id. Derive it from the live runtime so this works for ANY
   // converted extension instead of a single hardcoded id. Fall back to the
   // build-time placeholder only if runtime.id is somehow unavailable.
-  var EXT_ID = (api.runtime && api.runtime.id) || "__C2S_EXTENSION_ID__";
+  var EXT_ID = "__C2S_EXTENSION_ID__";
+  if (EXT_ID === "__C2S_" + "EXTENSION_ID__") EXT_ID = (api.runtime && api.runtime.id) || "";
   var REDIRECT_BASE = "https://" + EXT_ID + ".chromiumapp.org/";
   DBG("[idpoly] loaded. native identity?", !!api.identity,
               "tabs?", !!api.tabs, "webNavigation?", !!api.webNavigation,
@@ -58,6 +59,10 @@
       } catch (e) { /* keep default */ }
       DBG("[idpoly] redirectTarget", redirectTarget);
 
+      if (!api.tabs || !api.webNavigation) {
+        reject(new Error("launchWebAuthFlow requires the tabs + webNavigation APIs, which are unavailable"));
+        return;
+      }
       // DEBUG: always visible so you can see the authorize result.
       api.tabs.create({ url: authUrl, active: true }, function (tab) {
         if (api.runtime.lastError || !tab) {
@@ -69,8 +74,13 @@
         var settled = false;
         DBG("[idpoly] auth tab", tabId, "url", authUrl);
         var timer = setTimeout(function () {
-          DBGW("[idpoly] TIMEOUT (tab left open for inspection)", tabId);
-          if (!settled) { settled = true; cleanup(); reject(new Error("launchWebAuthFlow timeout")); }
+          DBGW("[idpoly] TIMEOUT", tabId);
+          if (!settled) {
+            settled = true;
+            cleanup();
+            try { api.tabs.remove(tabId, function () { void api.runtime.lastError; }); } catch (e) {}
+            reject(new Error("launchWebAuthFlow timeout"));
+          }
         }, 120000);
 
         function captured(url) {
@@ -149,8 +159,10 @@
     var cb = arguments.length && typeof arguments[arguments.length - 1] === "function"
            ? arguments[arguments.length - 1] : null;
     if (cb) {
+      // Chrome scopes runtime.lastError to the callback's duration only. Set it,
+      // invoke cb, then clear it — a persistent lastError misreports every later call.
       try { if (api.runtime) api.runtime.lastError = { message: "getAuthToken unsupported" }; } catch (e) {}
-      try { cb(undefined); } catch (e) {}
+      try { cb(undefined); } finally { try { if (api.runtime) delete api.runtime.lastError; } catch (e) {} }
       return;
     }
     return Promise.reject(new Error("getAuthToken unsupported"));

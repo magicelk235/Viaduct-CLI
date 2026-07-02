@@ -410,6 +410,11 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
+  if (values.install && platforms === "ios") {
+    fail("--install targets macOS Safari; use --platforms macos or all.");
+    process.exit(2);
+  }
+
   if (values.verify && !values.install) {
     fail("--verify requires --install (it checks the installed extension).");
     process.exit(2);

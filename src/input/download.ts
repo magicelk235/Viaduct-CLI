@@ -93,7 +93,13 @@ function httpGet(url: string, redirectsLeft = MAX_REDIRECTS): Promise<HttpResult
           done(() => reject(new Error(`Too many redirects fetching ${url}`)));
           return;
         }
-        const next = new URL(location, url);
+        let next: URL;
+        try {
+          next = new URL(location, url);
+        } catch {
+          done(() => reject(new Error(`Invalid redirect Location "${location}" from ${url}`)));
+          return;
+        }
         // Only follow https redirects; an untrusted endpoint must not be able to
         // redirect the fetch to http:// (or another scheme) and reach an internal host.
         if (next.protocol !== "https:") {

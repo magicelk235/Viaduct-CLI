@@ -107,7 +107,7 @@ export function deriveProxyHosts(manifest: Manifest): string[] {
  * dead page). Returns -1 when there's no usable head tag.
  */
 function headInsertIndex(html: string): number {
-  const re = /<head[^>]*>/gi;
+  const re = /<head(?=[\s/>])[^>]*>/gi;
   let m: RegExpExecArray | null;
   while ((m = re.exec(html)) !== null) {
     // Inside a comment if the last "<!--" before this point has no "-->" before
@@ -316,15 +316,10 @@ export function matchBalancedParen(src: string, open: number): number {
         i++;
       }
     } else if (c === "/" && (src[i + 1] === "/" || src[i + 1] === "*")) {
-      // Comment — but only if `/` isn't actually starting a regex literal. After a
-      // value (identifier/number/`)`/`]`), `/` is division and `//`/`/*` is a real
-      // comment; in an expression position (after `(`,`,`,`=`,`[`,operators, or at
-      // the start) a leading `/` begins a regex whose first char may be `/` or `*`
-      // (e.g. /[/*]/), which must NOT be read as a comment.
-      if (startsRegex(prev)) {
-        i = skipRegex(src, i);
-        if (i < 0) return -1;
-      } else if (src[i + 1] === "/") {
+      // Always a comment: a regex literal's first body char can never be `/` or `*`
+      // (RegularExpressionFirstChar excludes both — even /[/*]/ starts with `[`), so
+      // `//` and `/*` are unconditionally comments regardless of expression position.
+      if (src[i + 1] === "/") {
         const nl = src.indexOf("\n", i);
         if (nl < 0) return -1;
         i = nl;

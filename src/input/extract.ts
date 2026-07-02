@@ -149,9 +149,10 @@ function sniffArchiveKind(path: string): "crx" | "zip" | null {
 export function extractExtension(inputPath: string, scratchDir: string): string {
   const stat = statSync(inputPath);
   if (stat.isDirectory()) {
-    const root = resolveExtensionRoot(inputPath);
-    cleanExtendedAttributes(root);
-    return root;
+    // Don't run `xattr -cr` on the user's own source tree — it's irreversible and
+    // this path is also hit by read-only --analyze. The staged copy gets cleaned
+    // in stageExtension() instead.
+    return resolveExtensionRoot(inputPath);
   }
 
   const destDir = join(scratchDir, "extension");
