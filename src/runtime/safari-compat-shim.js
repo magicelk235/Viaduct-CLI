@@ -226,16 +226,15 @@ var __C2S_DEBUG__ = false;
     };
   }
 
-  // importScripts() in the SW bundle is handled at STAGING time (the imported
-  // files are hoisted into background.html as classic <script> tags before the SW
-  // module, and the calls are neutralized) — see convertServiceWorkerToBackgroundPage.
-  // A runtime polyfill can't help: the default extension CSP is script-src 'self',
-  // which forbids eval(), so a fetch+eval importScripts throws EvalError and the SW
-  // still aborts before its onConnect listeners register. Defining a no-op here as a
-  // belt-and-suspenders guard for any call the staging rewrite missed.
-  if (typeof self !== "undefined" && typeof self.importScripts !== "function") {
-    try { self.importScripts = function () {}; } catch (e) {}
-  }
+  // importScripts() in the SW bundle is handled ENTIRELY at staging time: the
+  // imported files are hoisted into background.html as classic <script> tags
+  // (recursively — hoisted files' own calls too) and every call is neutralized;
+  // webpack's dynamic chunk loader is covered by pre-registering the chunks.
+  // Deliberately NO runtime no-op here: defining self.importScripts in a page
+  // makes the standard `typeof importScripts === "function"` worker-detection
+  // idiom lie, and libraries then take their worker path in a document (live
+  // failure: crxviewer's Prism glue overwrote its page-loaded Prism with a stub
+  // and died on Prism.hooks).
 
   // requestIdleCallback / cancelIdleCallback are missing in Safari worker and some
   // extension contexts. uBlock's contentscript calls self.requestIdleCallback(...)
@@ -525,6 +524,22 @@ var __C2S_DEBUG__ = false;
         try { for (var k = 0; k < queued.length; k++) p.postMessage(queued[k]); } catch (e) {}
         queued = [];
       }
+      // Safari returns a truthy port even when the background is still asleep; it
+      // just disconnects a tick later. Treat a real port as CONFIRMED only once it
+      // survives a tick (or delivers a message). If it dies early, drop it and keep
+      // retrying — otherwise the very first (dead) native port is committed and the
+      // caller is stuck with a disconnected channel.
+      function confirmReal(p) {
+        if (closed) { try { p.disconnect(); } catch (e) {} return; }
+        var early = true;
+        var died = false;
+        try { p.onDisconnect.addListener(function () { if (early) died = true; }); } catch (e) {}
+        setTimeout(function () {
+          early = false;
+          if (died || real || closed) { if (died && !real && !closed) setTimeout(tryConnect, CONNECT_RETRY_MS); return; }
+          wireReal(p);
+        }, 60);
+      }
       var attempts = 0;
       function giveUp() {
         // No real port arrived within the ceiling (truly listener-less channel, or a
@@ -546,7 +561,7 @@ var __C2S_DEBUG__ = false;
         if (nativeSend) { try { var r = nativeSend({ __c2s_wake__: 1 }); if (r && typeof r.then === "function") r.then(function () {}, function () {}); } catch (e) {} }
         var p = null;
         try { p = nativeConnect.apply(rt, connectArgs); } catch (e) { p = null; }
-        if (p) { wireReal(p); return; }
+        if (p) { confirmReal(p); return; }
         setTimeout(tryConnect, CONNECT_RETRY_MS);
       }
       tryConnect();
@@ -569,9 +584,11 @@ var __C2S_DEBUG__ = false;
     }
     function wrapped() {
       var args = Array.prototype.slice.call(arguments);
-      // Fast path: if a listener is already live, the native call succeeds — use it
-      // directly so we add zero overhead to the common (background-awake) case.
-      try { return nativeConnect.apply(rt, args); }
+      // Fast path: if a listener is already live, the native call succeeds AND the
+      // port stays open — use it directly so we add zero overhead to the common
+      // (background-awake) case.
+      var p;
+      try { p = nativeConnect.apply(rt, args); }
       catch (e) {
         // The "no onConnect listeners" throw → background asleep. Return a proxy that
         // wakes it and connects for real. Any other error: re-throw (real bug).
@@ -583,6 +600,76 @@ var __C2S_DEBUG__ = false;
         if (/onConnect|receiving end|message port closed|could not establish/i.test(msg)) return makeProxyPort(args);
         throw e;
       }
+      // Safari variant of "background asleep": connect() does NOT throw — it returns
+      // a port that immediately disconnects (the non-persistent background wasn't
+      // running to accept it, and Safari tears the channel down before it wakes,
+      // instead of queuing like Chrome). The caller (MetaMask's UI stream) then
+      // waits forever for a first message → "Background connection unresponsive".
+      // Detect the early disconnect and transparently swap in the wake-and-retry
+      // proxy, replaying whatever listeners/sends the caller attached in between.
+      return withEarlyDisconnectFallback(p, args);
+    }
+
+    // Wrap a freshly-returned native port so that if it disconnects before ever
+    // delivering a message (the Safari asleep-background race), we hand the caller
+    // a proxy port that wakes the background and reconnects — WITHOUT the caller
+    // noticing (its listeners/queued sends are migrated). If the port behaves
+    // (stays open or delivers a message), the wrapper is a pass-through.
+    function withEarlyDisconnectFallback(nativePort, connectArgs) {
+      // Caller listeners are held HERE, never attached to the native port directly,
+      // so the native port's early disconnect can't reach them (that disconnect is
+      // ours to absorb). We fan out to whichever port is active — the native one at
+      // first, the proxy after a swap. onMessage/onDisconnect from the active port
+      // dispatch to the caller's lists.
+      var swapped = null;       // the proxy port, once we fall back
+      var settled = false;      // got a message OR swapped → stop watching for early-disc
+      var gotMessage = false;
+      var closedByCaller = false;
+      var msgListeners = [];
+      var discListeners = [];
+      var queued = [];          // sends before any real port is usable
+      function fanMsg() { var a = [].slice.call(arguments); var s = msgListeners.slice(); for (var i = 0; i < s.length; i++) { try { s[i].apply(null, a); } catch (e) {} } }
+      function fanDisc() { var s = discListeners.slice(); for (var i = 0; i < s.length; i++) { try { s[i](); } catch (e) {} } }
+      function bind(port) {
+        try { port.onMessage.addListener(function () { gotMessage = true; settled = true; fanMsg.apply(null, arguments); }); } catch (e) {}
+        try {
+          port.onDisconnect.addListener(function () {
+            if (port === nativePort && !gotMessage && !closedByCaller) { onEarlyDisconnect(); return; } // absorb — swap instead
+            fanDisc();
+          });
+        } catch (e) {}
+      }
+      function onEarlyDisconnect() {
+        if (settled || closedByCaller) return;
+        settled = true;
+        swapped = makeProxyPort(connectArgs); // wakes bg, retries connect
+        bind(swapped);
+        for (var i = 0; i < queued.length; i++) { try { swapped.postMessage(queued[i]); } catch (e) {} }
+        queued = [];
+      }
+      try { bind(nativePort); } catch (e) { return nativePort; } // can't observe → pass-through
+      function active() { return swapped || nativePort; }
+      return {
+        name: nativePort.name,
+        postMessage: function (m) {
+          // Before the swap the native port may already be dead; buffer so nothing
+          // is lost, then replay onto the proxy. After a message proves the native
+          // port good, send directly.
+          if (!swapped && !gotMessage && !closedByCaller) { queued.push(m); try { nativePort.postMessage(m); } catch (e) {} return; }
+          try { return active().postMessage(m); } catch (e) {}
+        },
+        disconnect: function () { closedByCaller = true; try { return active().disconnect(); } catch (e) {} },
+        onMessage: {
+          addListener: function (f) { if (typeof f === "function") msgListeners.push(f); },
+          removeListener: function (f) { var i = msgListeners.indexOf(f); if (i >= 0) msgListeners.splice(i, 1); },
+          hasListener: function (f) { return msgListeners.indexOf(f) >= 0; },
+        },
+        onDisconnect: {
+          addListener: function (f) { if (typeof f === "function") discListeners.push(f); },
+          removeListener: function (f) { var i = discListeners.indexOf(f); if (i >= 0) discListeners.splice(i, 1); },
+          hasListener: function (f) { return discListeners.indexOf(f) >= 0; },
+        },
+      };
     }
     try { rt.connect = wrapped; rt.__c2sConnect = true; } catch (e) {
       try { Object.defineProperty(rt, "connect", { value: wrapped, writable: true, configurable: true }); rt.__c2sConnect = true; } catch (e2) {}
@@ -626,6 +713,45 @@ var __C2S_DEBUG__ = false;
         }
       }
     } catch (e) {}
+  }
+
+  // Safari's popup `sender.url` carries a `?tabId=<n>` query that getURL(path) never has.
+  // LIVE-PROVEN (Dark Reader on Safari 18): the SAME popup sends some messages as the bare
+  //   safari-web-extension://<uuid>/ui/popup/index.html
+  // and others (e.g. subscribe-to-changes) as
+  //   safari-web-extension://<uuid>/ui/popup/index.html?tabId=188
+  // Bundles allow-list their own pages by EXACT-MATCHING sender.url against getURL(path):
+  //   allowedSenderURL = [getURL("/ui/popup/index.html"), …];
+  //   if (allowedSenderURL.includes(sender.url)) handle;      // Dark Reader, verbatim
+  // getURL(path) has no query, so the `?tabId` message fails the exact `includes()` → that
+  // popup RPC (GET_DATA, CHANGE_SETTINGS, SET_THEME…) is dropped with no sendResponse → the
+  // popup's `await getData()` never resolves → the UI never renders and every button is
+  // dead. (The regex-`.test()` idiom that rewriteRuntimeIdUrlMatchers targets survives the
+  // query as a substring; exact `===` / `includes()` does not, so it needs fixing here at
+  // runtime.) Normalizing the query and fragment OFF is a no-op for an already-bare URL, so
+  // it's safe on every browser and every message.
+  function senderWithFixedUrl(sender, canon) {
+    if (!sender || !canon) return sender;
+    var url;
+    try { url = sender.url; } catch (e) { return sender; }
+    if (typeof url !== "string") return sender;
+    // Cut at the first "?" or "#". Nothing to strip → return the sender untouched.
+    var cut = url.length;
+    var q = url.indexOf("?"); if (q >= 0) cut = q;
+    var h = url.indexOf("#"); if (h >= 0 && h < cut) cut = h;
+    if (cut === url.length) return sender;
+    var bare = url.slice(0, cut);
+    // Only strip our OWN extension pages — never a content-script's http(s) sender.
+    // canon (getURL("") sans trailing slash) is lowercased by patchGetURL; sender.url's
+    // host keeps Safari's real case, so compare case-insensitively.
+    if (bare.toLowerCase().indexOf(canon.toLowerCase()) !== 0) return sender;
+    // Safari's sender is a frozen exotic getter (in-place url rewrite doesn't stick, same
+    // as sender.origin — proven live), so hand the listener a shallow clone: copy every own
+    // prop (tab, id, frameId, documentId, …) so consumers reading them still work.
+    var clone = {};
+    try { for (var k in sender) { try { clone[k] = sender[k]; } catch (e) {} } } catch (e) {}
+    clone.url = bare;
+    return clone;
   }
 
   // Replace obj[name] with `fn`, returning true only if the swap actually took.
@@ -683,13 +809,23 @@ var __C2S_DEBUG__ = false;
     };
     wrapEvent(rt.onConnect, function (fn) {
       return function (port) {
-        try { if (port) fixSenderOrigin(port.sender, canon); } catch (e) {}
+        try {
+          if (port) {
+            fixSenderOrigin(port.sender, canon);
+            // Swap in a query-stripped sender clone for port-based allow-lists (Grammarly
+            // et al. gate on port.sender.url). Port is usually extensible even when its
+            // .sender is frozen; if the field is read-only the assignment no-ops silently.
+            var fixedS = senderWithFixedUrl(port.sender, canon);
+            if (fixedS !== port.sender) { try { port.sender = fixedS; } catch (e) {} }
+          }
+        } catch (e) {}
         return fn.call(this, port);
       };
     });
     wrapEvent(rt.onMessage, function (fn) {
       return function (msg, sender, reply) {
         try { fixSenderOrigin(sender, canon); } catch (e) {}
+        try { sender = senderWithFixedUrl(sender, canon); } catch (e) {}
         return fn.call(this, msg, sender, reply);
       };
     });
@@ -1604,6 +1740,19 @@ var __C2S_DEBUG__ = false;
         // Chrome rejects a second concurrent offscreen document.
         if (__offscreenFrame) return done("Only a single offscreen document may be created.");
         if (typeof document === "undefined" || !document.body) return done(); // no DOM → no-op (SW context)
+        // A real offscreen document is TOP-LEVEL; the emulation is an iframe, so
+        // frame-aware hardening libs take their "I'm a child frame" path and
+        // delegate to window.top. LavaMoat Snow is the live case (MetaMask):
+        // `a!==top && (e=top.SNOW, a.SNOW(cb,a))` throws when the host page has
+        // no SNOW, which kills the offscreen runtime before LavaMoat's _LM_ is
+        // installed and every offscreen module dies. Satisfy the delegation
+        // contract with an inert host stub: no frame-protection callbacks are
+        // ever invoked (nothing to protect here), and the child continues its
+        // normal boot. Defined lazily so pages without emulated offscreen
+        // documents are untouched.
+        if (!("SNOW" in window)) {
+          try { Object.defineProperty(window, "SNOW", { value: function () {} }); } catch (e) {}
+        }
         try {
           var url = opts && opts.url ? opts.url : "";
           var abs = chrome.runtime && chrome.runtime.getURL ? chrome.runtime.getURL(url) : url;
@@ -2488,6 +2637,67 @@ var __C2S_DEBUG__ = false;
       },
     });
 
+    // Force a real download for a URL WebKit would otherwise NAVIGATE to. Safari
+    // ignores the <a download> attribute for blob:/data: URLs inside an extension
+    // page — the click navigates the page to the blob and the user lands on a blank
+    // safari-web-extension://…/<uuid> (live: "Chrome extension source viewer"
+    // Download/CRX buttons). Refetch the blob, re-wrap it as application/octet-stream
+    // (a non-renderable type WebKit commits to disk instead of displaying), and click
+    // a fresh same-gesture anchor at the new URL. Returns true if it kicked off the
+    // download path, false if it couldn't (caller keeps default behavior).
+    function forceBlobDownload(url, filename) {
+      if (typeof window === "undefined") return false;
+      if (!/^(blob:|data:)/i.test(url)) return false;
+      // WebKit ignores the <a download> attribute for blob:/data: URLs in an extension
+      // page (proven live: every anchor/iframe method navigates or no-ops). The ONE
+      // method that saves to disk is window.open() on an application/octet-stream URL —
+      // WebKit's top-level downloader takes over. The saved name is derived by WebKit
+      // (can't be set from JS for a blob URL; it lands as "Unknown"), which is the
+      // accepted trade-off: a working download beats a blank page.
+      var open = function (href) {
+        try { var w = window.open(href); return true; } catch (e) { return false; }
+      };
+      try {
+        // Refetch → octet-stream so WebKit downloads rather than renders. fetch of a
+        // same-origin blob:/data: URL is allowed and cheap (it's already in memory).
+        fetch(url).then(function (r) { return r.blob(); }).then(function (b) {
+          var dl = new Blob([b], { type: "application/octet-stream" });
+          var u2 = URL.createObjectURL(dl);
+          open(u2);
+          setTimeout(function () { try { URL.revokeObjectURL(u2); } catch (e) {} }, 60000);
+        }).catch(function () { open(url); }); // fetch failed → best-effort original
+        return true;
+      } catch (e) { return false; }
+    }
+
+    // Global capture-phase interceptor: ANY converted extension that downloads via a
+    // plain <a download href="blob:…"> (the common pattern — CRX Viewer, file
+    // exporters, "save as" buttons) is caught here, so the fix is generic and needs
+    // no per-extension knowledge. Only same-gesture blob:/data: anchor clicks are
+    // touched; everything else falls through untouched.
+    if (typeof document !== "undefined" && typeof document.addEventListener === "function" && !self.__c2sDlIntercept) {
+      try {
+        self.__c2sDlIntercept = true;
+        document.addEventListener("click", function (ev) {
+          try {
+            if (ev.defaultPrevented) return;
+            var node = ev.target;
+            // Walk up to the nearest anchor (the click may land on a child element).
+            while (node && node.nodeType === 1 && node.tagName !== "A") node = node.parentNode;
+            if (!node || node.tagName !== "A") return;
+            // Only anchors that DECLARE a download (download attr present, even if "").
+            if (!node.hasAttribute("download")) return;
+            var href = node.getAttribute("href") || node.href || "";
+            if (!/^(blob:|data:)/i.test(href)) return;
+            if (forceBlobDownload(href, node.getAttribute("download") || node.download)) {
+              ev.preventDefault();
+              ev.stopImmediatePropagation();
+            }
+          } catch (e) {}
+        }, true);
+      } catch (e) {}
+    }
+
     // chrome.downloads — no Safari API. Creative fallback: navigate a tab to the
     // URL so WebKit's downloader takes over (or click an <a download> when a DOM
     // exists). Enough for "save this file" flows; queries return empty.
@@ -2524,7 +2734,11 @@ var __C2S_DEBUG__ = false;
           var id = seq++;
           var fname = opts.filename || (function () { try { return decodeURIComponent(url.split("/").pop().split("?")[0]) || "download"; } catch (e) { return "download"; } })();
           try {
-            if (typeof document !== "undefined" && document.body) {
+            // blob:/data: → route through forceBlobDownload (WebKit navigates on a
+            // bare <a download> for these; octet-stream refetch makes it save).
+            if (/^(blob:|data:)/i.test(url) && forceBlobDownload(url, opts.filename)) {
+              // handled
+            } else if (typeof document !== "undefined" && document.body) {
               var a = document.createElement("a");
               a.href = url; if (opts.filename) a.download = opts.filename;
               document.body.appendChild(a); a.click(); a.remove();
@@ -3066,6 +3280,91 @@ var __C2S_DEBUG__ = false;
       onBeforeRedirect: event(), onCompleted: event(), onErrorOccurred: event(),
       onActionIgnored: event(),
     });
+    // Safari's NATIVE webRequest addListener THROWS on filter urls with schemes
+    // its match-pattern parser rejects — ws:///wss:// are valid in Chrome (websocket
+    // interception) and extensions pass them mixed into one urls array (MetaMask:
+    // ["http://*/*","https://*/*","ws://*/*","wss://*/*"]). The throw kills the
+    // caller's whole init chain. Sanitize the filter to the parseable subset; if
+    // nothing survives, register nothing — the listener could only ever have fired
+    // for traffic Safari cannot observe anyway.
+    // The native EVENT objects are frozen (addListener non-configurable), so an
+    // in-place addListener override can't take — replace each event wholesale on
+    // the (thawed, extensible) webRequest namespace with a facade prototyping the
+    // native and shadowing the listener methods. chrome === browser post-thaw, so
+    // one pass covers both namespaces.
+    (function (wr) {
+      if (!wr) return;
+      var VALID_URL_PATTERN = /^(\*|https?|file|ftp):\/\//;
+      // Plain assignment cannot shadow the frozen prototype's non-writable
+      // addListener (strict-mode TypeError that would abort the whole shim tail);
+      // defineProperty is exempt from that restriction.
+      function def(obj, k, v) {
+        Object.defineProperty(obj, k, { value: v, writable: true, configurable: true });
+      }
+      function sanitizedEvent(native) {
+        if (!native || typeof native.addListener !== "function" || native.__c2sUrlSanitized) return null;
+        var facade;
+        try {
+          facade = Object.create(native);
+          def(facade, "__c2sUrlSanitized", true);
+          def(facade, "addListener", function () {
+            var args = [].slice.call(arguments);
+            var f = args[1];
+            if (f && Array.isArray(f.urls)) {
+              var kept = f.urls.filter(function (u) {
+                return u === "<all_urls>" || VALID_URL_PATTERN.test(String(u));
+              });
+              if (kept.length === 0) return undefined; // only unwatchable schemes → inert
+              if (kept.length !== f.urls.length) args[1] = Object.assign({}, f, { urls: kept });
+            }
+            return native.addListener.apply(native, args);
+          });
+          def(facade, "removeListener", function (fn) {
+            return typeof native.removeListener === "function" ? native.removeListener.call(native, fn) : undefined;
+          });
+          def(facade, "hasListener", function (fn) {
+            return typeof native.hasListener === "function" ? native.hasListener.call(native, fn) : false;
+          });
+        } catch (e) { return null; }
+        return facade;
+      }
+      var evNames = ["onBeforeRequest", "onBeforeSendHeaders", "onSendHeaders",
+        "onHeadersReceived", "onAuthRequired", "onResponseStarted",
+        "onBeforeRedirect", "onCompleted", "onErrorOccurred"];
+      // The native webRequest object is extensible but its event PROPERTIES are
+      // locked (non-writable, non-configurable), so installing a facade per event
+      // silently fails. Shadow at the level we DO own: build a namespace facade
+      // prototyping the native and republish it on the thawed chrome/browser roots.
+      var wrFacade = null;
+      for (var i = 0; i < evNames.length; i++) {
+        try {
+          var facade = sanitizedEvent(wr[evNames[i]]);
+          if (!facade) continue;
+          if (!wrFacade) wrFacade = Object.create(wr);
+          def(wrFacade, evNames[i], facade);
+        } catch (e) {}
+      }
+      if (wrFacade) {
+        var target = chrome;
+        installOverride(target, "webRequest", wrFacade);
+        if (target.webRequest !== wrFacade) {
+          // The native root silently ignores BOTH assignment and defineProperty
+          // for this slot (proven live: descriptor claims configurable, define
+          // "succeeds", read returns the old value — a WebKit exotic). Same move
+          // as the frozen-root thaw: shadow on a new root prototyping the native
+          // and republish the GLOBAL BINDINGS, which are always reassignable.
+          try {
+            var newRoot = Object.create(target);
+            Object.defineProperty(newRoot, "webRequest", { value: wrFacade, writable: true, configurable: true });
+            var sameRoots = (typeof browser !== "undefined") && browser === target;
+            __publishGlobal("chrome", newRoot);
+            if (sameRoots) __publishGlobal("browser", newRoot);
+          } catch (e) {}
+        } else if (typeof browser !== "undefined" && browser !== chrome) {
+          installOverride(browser, "webRequest", wrFacade);
+        }
+      }
+    })(chrome.webRequest);
 
     // chrome.declarativeContent — bundles construct matchers at module-eval
     // (new chrome.declarativeContent.PageStateMatcher(...)); rules never fire.
