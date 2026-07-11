@@ -168,7 +168,12 @@ export function buildReportMarkdown(meta: ReportMeta, issues: Issue[]): string {
   // Blocking = unresolved errors (auto-fixed ones don't block); same gate the
   // converter and --analyze use, so the verdict here agrees with the exit code.
   const blocking = countBlocking(issues, meta.strict);
-  const status = blocking === 0 ? "✅ Convertible — no blocking issues" : `⛔ ${blocking} blocking error(s) — use --force to convert anyway`;
+  // Mirror the terminal verdict's wording: under --strict the blocking count
+  // includes promoted warnings, so calling them all "error(s)" contradicts the
+  // per-severity counts a few lines below.
+  const status = blocking === 0
+    ? "✅ Convertible — no blocking issues"
+    : `⛔ ${blocking} blocking issue(s)${meta.strict ? " (--strict: warnings count as blocking)" : ""} — use --force to convert anyway`;
 
   const lines: string[] = [
     `# Conversion report — ${meta.name}`,

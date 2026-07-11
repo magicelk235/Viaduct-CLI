@@ -219,6 +219,10 @@ export function matchPatternError(pattern: string): string | null {
  */
 const COMMAND_MODIFIERS = new Set(["Ctrl", "Command", "Alt", "Option", "MacCtrl", "Shift"]);
 
+// suggested_key platforms Safari can actually read. Chords declared only for
+// chromeos/windows/linux are dead keys on Safari — warning about them is noise.
+const SAFARI_COMMAND_PLATFORMS = new Set(["default", "mac", "ios"]);
+
 export function analyzeCommands(commands: Record<string, unknown>): Issue[] {
   const issues: Issue[] = [];
   for (const [name, def] of Object.entries(commands)) {
@@ -228,7 +232,10 @@ export function analyzeCommands(commands: Record<string, unknown>): Issue[] {
     const chords =
       typeof suggested === "string"
         ? [suggested]
-        : Object.values(suggested as Record<string, unknown>).filter((v): v is string => typeof v === "string");
+        : Object.entries(suggested as Record<string, unknown>)
+            .filter(([platform]) => SAFARI_COMMAND_PLATFORMS.has(platform))
+            .map(([, v]) => v)
+            .filter((v): v is string => typeof v === "string");
     for (const chord of chords) {
       const parts = chord.split("+").map((p) => p.trim());
       const key = parts.pop();
@@ -731,13 +738,26 @@ export function collectReferencedPaths(m: Manifest): Set<string> {
  * undefined, and returns the same shape.
  */
 export function addSelfToConnectSrc<T extends string | Record<string, string> | undefined>(csp: T): T {
-  const fixOne = (policy: string): string =>
-    policy.replace(/(^|;)\s*connect-src\s+([^;]*)/i, (full, sep: string, sources: string) => {
-      const tokens = sources.trim().split(/\s+/).filter(Boolean);
-      // 'none' means "block everything" — don't loosen it; 'self' already present → no-op.
-      if (tokens.includes("'none'") || tokens.includes("'self'")) return full;
-      return `${sep} connect-src 'self' ${tokens.join(" ")}`;
-    });
+  const fixOne = (policy: string): string => {
+    if (/(?:^|;)\s*connect-src(?:\s|;|$)/i.test(policy)) {
+      return policy.replace(/(^|;)\s*connect-src\s+([^;]*)/i, (full, sep: string, sources: string) => {
+        const tokens = sources.trim().split(/\s+/).filter(Boolean);
+        // 'none' means "block everything" — don't loosen it; 'self' already present → no-op.
+        if (tokens.includes("'none'") || tokens.includes("'self'")) return full;
+        return `${sep} connect-src 'self' ${tokens.join(" ")}`;
+      });
+    }
+    // No connect-src: fetches fall back to default-src. Chrome still implies
+    // same-origin there; Safari doesn't — a default-src without 'self' (e.g.
+    // "default-src 'none'") blocks the extension's own bundled fetches too.
+    // Synthesize a connect-src that keeps the author's default scope + 'self'.
+    const dm = /(?:^|;)\s*default-src\s+([^;]*)/i.exec(policy);
+    if (!dm) return policy; // no default-src either → browser default covers 'self'
+    const tokens = dm[1].trim().split(/\s+/).filter(Boolean);
+    if (tokens.includes("'self'")) return policy;
+    const scope = tokens.filter((t) => t !== "'none'");
+    return `${policy.replace(/;?\s*$/, "")}; connect-src 'self'${scope.length ? " " + scope.join(" ") : ""}`;
+  };
   if (csp == null) return csp;
   if (typeof csp === "string") return fixOne(csp) as T;
   const out: Record<string, string> = {};
@@ -774,16 +794,21 @@ export function transformManifest(
 
   const removeSet = new Set(permissionsToRemove);
   if (Array.isArray(out.permissions)) out.permissions = out.permissions.filter((p) => !removeSet.has(p));
-  // Safari rejects the declarativeNetRequestWithHostAccess token, but either token
-  // grants the DNR API. If we stripped the variant and no plain declarativeNetRequest
-  // remains, add it so a DNR-only extension keeps its rulesets.
-  if (removeSet.has("declarativeNetRequestWithHostAccess") && Array.isArray(out.permissions) && !out.permissions.includes("declarativeNetRequest")) {
-    out.permissions.push("declarativeNetRequest");
-  }
   if (Array.isArray(out.optional_permissions)) {
     out.optional_permissions = out.optional_permissions.filter((p) => !removeSet.has(p));
-    if (out.optional_permissions.length === 0) delete out.optional_permissions;
   }
+  // Safari rejects the declarativeNetRequestWithHostAccess token, but either token
+  // grants the DNR API. Re-add plain declarativeNetRequest to whichever list the
+  // variant was declared in (a variant declared ONLY in optional_permissions must
+  // not silently lose the DNR capability), unless it's already present.
+  if (removeSet.has("declarativeNetRequestWithHostAccess")) {
+    const inRequired = Array.isArray(m.permissions) && m.permissions.includes("declarativeNetRequestWithHostAccess");
+    const key = inRequired ? "permissions" : "optional_permissions";
+    if (!Array.isArray(out[key])) out[key] = [];
+    const list = out[key] as string[];
+    if (!list.includes("declarativeNetRequest")) list.push("declarativeNetRequest");
+  }
+  if (Array.isArray(out.optional_permissions) && out.optional_permissions.length === 0) delete out.optional_permissions;
 
   const mv = out.manifest_version ?? 2;
   // Guard the type, not just truthiness: a hand-edited manifest can set background to
@@ -876,6 +901,10 @@ export function transformManifest(
   const wrongKey = mv === 3 ? "browser_action" : "action";
   if (out[wrongKey] && !out[actionKey]) {
     out[actionKey] = out[wrongKey] as Manifest["action"];
+    delete out[wrongKey];
+  } else if (out[wrongKey]) {
+    // Both keys present (Chrome just ignores the one invalid for its MV). Keep
+    // only the valid key: Safari REJECTS an MV2 manifest carrying `action`.
     delete out[wrongKey];
   }
   const action = (out[actionKey] as Manifest["action"]) ?? {};

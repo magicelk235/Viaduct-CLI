@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { resolve, relative, isAbsolute } from "node:path";
 import type { Manifest } from "../types.js";
+import { parseJsonc } from "./manifest.js";
 
 // res.path comes from the extension's manifest.json — untrusted. A path like
 // "../../etc/x" would make join() resolve outside stageDir, and the modifyHeaders
@@ -67,7 +68,10 @@ export function applyDnr(stageDir: string, manifest: Manifest): string[] {
     }
     let rules: unknown;
     try {
-      rules = JSON.parse(readFileSync(file, "utf-8"));
+      // Same lenient parse as the manifest: Chrome tolerates BOM/comments/trailing
+      // commas in rule files, and a parse failure here would SKIP the modifyHeaders
+      // crash-strip below while Safari still loads the raw file.
+      rules = parseJsonc(readFileSync(file, "utf-8"));
     } catch {
       notes.push(`DNR ruleset "${id}" (${res.path}) is not valid JSON; Safari will fail to load it.`);
       continue;
@@ -104,11 +108,18 @@ export function applyDnr(stageDir: string, manifest: Manifest): string[] {
   }
 
   if (needsAnthropicCorsBypass(manifest)) {
+    const allPerms = [
+      ...(Array.isArray(manifest.permissions) ? manifest.permissions : []),
+      ...(Array.isArray(manifest.optional_permissions) ? manifest.optional_permissions : []),
+    ];
+    const nmNote = allPerms.includes("nativeMessaging")
+      ? "Requires the nativeMessaging permission (present here)."
+      : "Requires the nativeMessaging permission (NOT declared here — add it or the retry cannot reach the native host).";
     notes.push(
       "api.anthropic.com calls hit an org CORS gate that cannot be bypassed in-browser " +
         "(no DNR modifyHeaders — it crashes Safari). The shim now retries blocked backend " +
         "requests through the native host (SafariWebExtensionHandler), which sets the Chrome " +
-        "Origin server-side. Requires the nativeMessaging permission (present here)."
+        `Origin server-side. ${nmNote}`
     );
   }
   return notes;

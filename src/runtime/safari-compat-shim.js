@@ -250,7 +250,7 @@ var __C2S_DEBUG__ = false;
           var start = Date.now();
           return setTimeout(function () {
             try { cb({ didTimeout: false, timeRemaining: function () { return Math.max(0, 50 - (Date.now() - start)); } }); } catch (e) {}
-          }, (opts && opts.timeout) ? Math.min(opts.timeout, 1) : 1);
+          }, 1);
         };
         g.cancelIdleCallback = function (id) { clearTimeout(id); };
       } catch (e) {}
@@ -504,7 +504,7 @@ var __C2S_DEBUG__ = false;
   function wrapConnect(rt) {
     if (!rt || typeof rt.connect !== "function" || rt.__c2sConnect) return;
     var nativeConnect = rt.connect; // already bound to the real runtime by mutableNamespace
-    var nativeSend = (typeof rt.sendMessage === "function") ? rt.sendMessage : null;
+    var nativeSend = (typeof rt.sendMessage === "function") ? rt.sendMessage.bind(rt) : null;
     function makeProxyPort(connectArgs) {
       var real = null;            // the real Port once connect() succeeds
       var queued = [];            // postMessage payloads buffered pre-connect
@@ -655,30 +655,44 @@ var __C2S_DEBUG__ = false;
     if (!rt || rt.__c2sOnConnect) return;
     var canon = canonicalOrigin(rt);
     if (!canon) return; // nothing to canonicalize against → skip (don't wrap for nothing)
-    var oc = rt.onConnect;
-    if (oc && typeof oc.addListener === "function" && !oc.__c2sWrapped) {
-      var nativeAdd = oc.addListener.bind(oc);
-      var ocTook = installOverride(oc, "addListener", function (fn) {
+    // Each event keeps an fn->wrapper map: the native event holds the WRAPPER, so
+    // removeListener/hasListener must translate the caller's original reference —
+    // a bare addListener-only wrap made every listener unremovable.
+    var wrapEvent = function (ev, makeWrapper) {
+      if (!ev || typeof ev.addListener !== "function" || ev.__c2sWrapped) return;
+      var nativeAdd = ev.addListener.bind(ev);
+      var nativeRemove = typeof ev.removeListener === "function" ? ev.removeListener.bind(ev) : null;
+      var nativeHas = typeof ev.hasListener === "function" ? ev.hasListener.bind(ev) : null;
+      var pairs = [];
+      var wrapped = function (fn) { for (var i = 0; i < pairs.length; i++) if (pairs[i][0] === fn) return pairs[i][1]; return null; };
+      var took = installOverride(ev, "addListener", function (fn) {
         if (typeof fn !== "function") return nativeAdd(fn);
-        return nativeAdd(function (port) {
-          try { if (port) fixSenderOrigin(port.sender, canon); } catch (e) {}
-          return fn.call(this, port);
-        });
+        var w = wrapped(fn);
+        if (!w) { w = makeWrapper(fn); pairs.push([fn, w]); }
+        return nativeAdd(w);
       });
-      if (ocTook) { try { oc.__c2sWrapped = true; } catch (e) {} }
-    }
-    var om = rt.onMessage;
-    if (om && typeof om.addListener === "function" && !om.__c2sWrapped) {
-      var nativeAddM = om.addListener.bind(om);
-      var omTook = installOverride(om, "addListener", function (fn) {
-        if (typeof fn !== "function") return nativeAddM(fn);
-        return nativeAddM(function (msg, sender, reply) {
-          try { fixSenderOrigin(sender, canon); } catch (e) {}
-          return fn.call(this, msg, sender, reply);
-        });
+      if (nativeRemove) installOverride(ev, "removeListener", function (fn) {
+        var w = wrapped(fn);
+        if (w) { for (var i = 0; i < pairs.length; i++) if (pairs[i][0] === fn) { pairs.splice(i, 1); break; } return nativeRemove(w); }
+        return nativeRemove(fn);
       });
-      if (omTook) { try { om.__c2sWrapped = true; } catch (e) {} }
-    }
+      if (nativeHas) installOverride(ev, "hasListener", function (fn) {
+        return nativeHas(wrapped(fn) || fn);
+      });
+      if (took) { try { ev.__c2sWrapped = true; } catch (e) {} }
+    };
+    wrapEvent(rt.onConnect, function (fn) {
+      return function (port) {
+        try { if (port) fixSenderOrigin(port.sender, canon); } catch (e) {}
+        return fn.call(this, port);
+      };
+    });
+    wrapEvent(rt.onMessage, function (fn) {
+      return function (msg, sender, reply) {
+        try { fixSenderOrigin(sender, canon); } catch (e) {}
+        return fn.call(this, msg, sender, reply);
+      };
+    });
     try { rt.__c2sOnConnect = true; } catch (e) {}
   }
   if (hasChrome) wrapOnConnect(mutableNamespace(chrome, "runtime"));
@@ -786,7 +800,19 @@ var __C2S_DEBUG__ = false;
         var a = [].slice.call(arguments);
         var cb = typeof a[a.length - 1] === "function" ? a.pop() : null;
         var p = fn.apply(local, a);
-        if (cb) { Promise.resolve(p).then(function (r) { cb(r); }, function () { cb(); }); return; }
+        if (cb) {
+          Promise.resolve(p).then(
+            function (r) { setLastErr(null); cb(r); },
+            function (err) {
+              // Chrome-style: lastError set for the callback's duration. A bare
+              // cb() reads as "success, no data" and callers may overwrite good
+              // data with defaults.
+              setLastErr({ message: (err && err.message) || String(err) });
+              try { cb(); } catch (e) {}
+              setLastErr(null);
+            });
+          return;
+        }
         return p;
       };
     };
@@ -1011,7 +1037,13 @@ var __C2S_DEBUG__ = false;
     if (typeof n.clear !== "function") n.clear = function (id, cb) { if (cb) { cb(true); return; } return Promise.resolve(true); };
     if (typeof n.update !== "function") n.update = function (id, opts, cb) { if (cb) { cb(true); return; } return Promise.resolve(true); };
     if (typeof n.getAll !== "function") n.getAll = function (cb) { if (cb) { cb({}); return; } return Promise.resolve({}); };
-    if (typeof n.getPermissionLevel !== "function") n.getPermissionLevel = function (cb) { if (cb) { cb("granted"); return; } return Promise.resolve("granted"); };
+    if (typeof n.getPermissionLevel !== "function") n.getPermissionLevel = function (cb) {
+      // Mirror the web Notification permission: a user who denied notifications
+      // must not read as "granted" (callers gate their notify UI on this).
+      var lvl = (typeof Notification !== "undefined" && Notification.permission === "denied") ? "denied" : "granted";
+      if (cb) { cb(lvl); return; }
+      return Promise.resolve(lvl);
+    };
     if (!n.onClicked) n.onClicked = event();
     if (!n.onClosed) n.onClosed = event();
     if (!n.onButtonClicked) n.onButtonClicked = event();
@@ -1100,7 +1132,7 @@ var __C2S_DEBUG__ = false;
 
       // chrome.tabs.group / ungroup are the create/remove side (absent in Safari).
       if (chrome.tabs && typeof chrome.tabs.group !== "function") {
-        chrome.tabs.group = function (opts) {
+        chrome.tabs.group = function (opts, cb) {
           opts = opts || {};
           var ids = opts.tabIds == null ? [] : (Array.isArray(opts.tabIds) ? opts.tabIds.slice() : [opts.tabIds]);
           var gid = opts.groupId;
@@ -1114,9 +1146,10 @@ var __C2S_DEBUG__ = false;
           // Best-effort: pull grouped tabs adjacent. Safari may reject; ignore.
           try { if (ids.length && chrome.tabs.move) chrome.tabs.move(ids, { index: -1 }, function () { void chrome.runtime.lastError; }); } catch (e) {}
           if (created) evCreated.__emit(Object.assign({}, c2sGroups[gid]));
+          if (typeof cb === "function") { try { cb(gid); } catch (e) {} return; }
           return Promise.resolve(gid);
         };
-        chrome.tabs.ungroup = function (tabIds) {
+        chrome.tabs.ungroup = function (tabIds, cb) {
           var ids = Array.isArray(tabIds) ? tabIds : [tabIds];
           var touched = Object.create(null);
           for (var i = 0; i < ids.length; i++) {
@@ -1126,6 +1159,7 @@ var __C2S_DEBUG__ = false;
           for (var gid in touched) {
             if (tabsOf(+gid).length === 0) { var gone = c2sGroups[gid]; delete c2sGroups[gid]; if (gone) evRemoved.__emit(Object.assign({}, gone)); }
           }
+          if (typeof cb === "function") { try { cb(); } catch (e) {} return; }
           return Promise.resolve();
         };
       }
@@ -1204,10 +1238,14 @@ var __C2S_DEBUG__ = false;
             var idxs = info && info.tabs != null ? (Array.isArray(info.tabs) ? info.tabs : [info.tabs]) : null;
             try {
               if (idxs && idxs.length && typeof chrome.tabs.query === "function") {
-                return chrome.tabs.query({ windowId: winId }, function (ts) {
-                  var first = (ts || []).filter(function (t) { return idxs.indexOf(t.index) >= 0; })[0];
-                  if (first && typeof chrome.tabs.update === "function") { try { chrome.tabs.update(first.id, { active: true }); } catch (e) {} }
-                  zoomDual({ id: winId, tabs: idxs }, cb);
+                // tabs.query(cb) returns undefined — wrap so the promise path of
+                // highlight() yields a real Promise, not undefined.
+                return new Promise(function (res) {
+                  chrome.tabs.query({ windowId: winId }, function (ts) {
+                    var first = (ts || []).filter(function (t) { return idxs.indexOf(t.index) >= 0; })[0];
+                    if (first && typeof chrome.tabs.update === "function") { try { chrome.tabs.update(first.id, { active: true }); } catch (e) {} }
+                    res(zoomDual({ id: winId, tabs: idxs }, cb));
+                  });
                 });
               }
             } catch (e) {}
@@ -1554,6 +1592,7 @@ var __C2S_DEBUG__ = false;
   if (hasChrome && !chrome.offscreen) {
     var __offscreenFrame = null;
     var __offscreenUrl = "";
+    var __offscreenAbsUrl = "";
     chrome.offscreen = {
       Reason: { AUDIO_PLAYBACK: "AUDIO_PLAYBACK", BLOBS: "BLOBS", CLIPBOARD: "CLIPBOARD", DOM_PARSER: "DOM_PARSER", DOM_SCRAPING: "DOM_SCRAPING", IFRAME_SCRIPTING: "IFRAME_SCRIPTING", TESTING: "TESTING", USER_MEDIA: "USER_MEDIA", WORKERS: "WORKERS", DISPLAY_MEDIA: "DISPLAY_MEDIA", GEOLOCATION: "GEOLOCATION", LOCAL_STORAGE: "LOCAL_STORAGE", BATTERY_STATUS: "BATTERY_STATUS", MATCH_MEDIA: "MATCH_MEDIA", WEB_RTC: "WEB_RTC" },
       createDocument: function (opts, cb) {
@@ -1572,15 +1611,26 @@ var __C2S_DEBUG__ = false;
           f.src = abs;
           f.setAttribute("aria-hidden", "true");
           f.style.cssText = "position:absolute;width:0;height:0;border:0;visibility:hidden;left:-9999px;";
-          document.body.appendChild(f);
           __offscreenFrame = f;
           __offscreenUrl = url;
+          __offscreenAbsUrl = abs;
+          // Chrome resolves createDocument only once the offscreen document has
+          // loaded (its message listeners are registered). Resolving at append
+          // time races the SW's first message past an unready iframe. Wait for
+          // load, with a fallback timer so a broken URL can't hang the caller.
+          return new Promise(function (res) {
+            var settled = false;
+            var fin = function () { if (!settled) { settled = true; res(done()); } };
+            try { f.addEventListener("load", fin); f.addEventListener("error", fin); } catch (e) {}
+            setTimeout(fin, 2000);
+            document.body.appendChild(f);
+          });
         } catch (e) { return done("Failed to create offscreen document."); }
         return done();
       },
       closeDocument: function (cb) {
         try { if (__offscreenFrame && __offscreenFrame.parentNode) __offscreenFrame.parentNode.removeChild(__offscreenFrame); } catch (e) {}
-        __offscreenFrame = null; __offscreenUrl = "";
+        __offscreenFrame = null; __offscreenUrl = ""; __offscreenAbsUrl = "";
         if (typeof cb === "function") { try { cb(); } catch (e) {} return undefined; }
         return Promise.resolve();
       },
@@ -1588,6 +1638,150 @@ var __C2S_DEBUG__ = false;
     };
     // Expose state for runtime.getContexts (defined later in the namespace-backfill block).
     try { chrome.runtime && (chrome.runtime.__c2sOffscreen = function () { return __offscreenFrame ? __offscreenUrl : null; }); } catch (e) {}
+
+    // MV3 SW code probes for its offscreen document via self.clients.matchAll()
+    // (ServiceWorkerClients — Chrome's documented hasDocument pattern, used by
+    // Google Translate among others). The converted background PAGE has no
+    // `clients`, so the probe throws and the caller's async chain dies before it
+    // ever reaches offscreen.createDocument. Back-fill a minimal clients list
+    // that reports the emulated offscreen iframe.
+    if (typeof self !== "undefined" && !self.clients) {
+      try {
+        self.clients = {
+          // ponytail: ignores matchAll(options) filters — extensions only scan urls
+          matchAll: function () {
+            var out = [];
+            if (__offscreenFrame) out.push({
+              id: "c2s-offscreen", type: "window", url: __offscreenAbsUrl,
+              frameType: "nested", focused: false, visibilityState: "hidden",
+              focus: function () { return Promise.resolve(this); },
+              postMessage: function () {},
+            });
+            return Promise.resolve(out);
+          },
+          get: function () { return Promise.resolve(undefined); },
+          claim: function () { return Promise.resolve(); },
+          openWindow: function () { return Promise.resolve(null); },
+        };
+      } catch (e) {}
+    }
+
+    // Safari never delivers runtime.sendMessage to frames of the SENDING page
+    // (Chrome delivers to every other frame). The emulated offscreen doc is an
+    // iframe inside the background page, so the background's own relays — e.g.
+    // Google Translate's {action:"playAudio", target:"offscreen"} — vanish.
+    // Receiver side (runs in every extension page, incl. the offscreen iframe):
+    // record onMessage listeners so a same-page sender can invoke them directly.
+    var __localMsgFns = [];
+    try {
+      var __omEv = chrome.runtime && chrome.runtime.onMessage;
+      if (__omEv && typeof __omEv.addListener === "function") {
+        var __omAdd = __omEv.addListener.bind(__omEv);
+        var __omRemove = typeof __omEv.removeListener === "function" ? __omEv.removeListener.bind(__omEv) : null;
+        installOverride(__omEv, "addListener", function (fn) {
+          if (typeof fn === "function") __localMsgFns.push(fn);
+          return __omAdd(fn);
+        });
+        if (__omRemove) installOverride(__omEv, "removeListener", function (fn) {
+          var i = __localMsgFns.indexOf(fn);
+          if (i >= 0) __localMsgFns.splice(i, 1);
+          return __omRemove(fn);
+        });
+        try {
+          // Honor the full onMessage contract, not just delivery: a listener may
+          // answer via sendResponse (sync or after `return true`) or by returning
+          // a Promise (the webextension-polyfill wrapper does this). Tampermonkey's
+          // storage bus long-polls its offscreen document — swallowing responses
+          // here starves it and blanks every page that reads storage (popup/options).
+          // Returns true when some listener responded or will respond.
+          window.__c2sDeliverLocalMsg = function (msg, sender, onResponse) {
+            var responded = false;
+            var respond = function (resp) {
+              if (responded) return;
+              responded = true;
+              if (typeof onResponse === "function") { try { onResponse(resp); } catch (e) {} }
+            };
+            var willRespond = false;
+            for (var i = 0; i < __localMsgFns.length; i++) {
+              var ret;
+              try { ret = __localMsgFns[i](msg, sender || {}, respond); } catch (e) { continue; }
+              if (ret === true) willRespond = true;
+              else if (ret && typeof ret.then === "function") {
+                willRespond = true;
+                ret.then(respond, function () {});
+              }
+            }
+            return responded || willRespond;
+          };
+        } catch (e) {}
+      }
+    } catch (e) {}
+    // Sender side: hand the message to the emulated offscreen iframe's listeners
+    // (only the page hosting the iframe has one) and route the FIRST response —
+    // theirs or a real cross-page one — back to the caller's callback/promise.
+    // When an iframe listener answers, the native broadcast still goes out for
+    // any other-page listeners but its (listener-less, undefined) response is
+    // ignored so it can't clobber the iframe's answer.
+    // ponytail: no dedup guard — Safari's same-page exclusion is what makes this
+    // safe; add a seen-marker if a Safari release starts delivering to own frames.
+    try {
+      if (chrome.runtime && typeof chrome.runtime.sendMessage === "function") {
+        var __rtSend = chrome.runtime.sendMessage.bind(chrome.runtime);
+        installOverride(chrome.runtime, "sendMessage", function () {
+          var args = Array.prototype.slice.call(arguments);
+          var f = __offscreenFrame;
+          var w = f && f.contentWindow;
+          var deliver = (w && typeof w.__c2sDeliverLocalMsg === "function") ? w.__c2sDeliverLocalMsg : null;
+          if (!deliver) return __rtSend.apply(null, args);
+
+          // sendMessage(msg) | sendMessage(msg, opts) | sendMessage(extId, msg, opts) — any form ± trailing callback
+          var cb = (args.length && typeof args[args.length - 1] === "function") ? args.pop() : null;
+          var msg = (typeof args[0] === "string" && args.length > 1) ? args[1] : args[0];
+          var sender = { id: chrome.runtime.id, url: (typeof location !== "undefined" ? location.href : "") };
+
+          // First response wins. A sync sendResponse lands before the caller's
+          // callback/promise is wired below, so buffer until `sink` is bound.
+          var settled = false, buffered = false, buf;
+          var sink = function (resp) { buffered = true; buf = resp; };
+          var settle = function (resp) {
+            if (settled) return;
+            settled = true;
+            sink(resp);
+          };
+
+          var localWillRespond = false;
+          try { localWillRespond = deliver(msg, sender, settle); } catch (e) {}
+
+          if (!localWillRespond) {
+            // No iframe responder → untouched native semantics.
+            if (cb) args.push(cb);
+            return __rtSend.apply(null, args);
+          }
+
+          try {
+            var p = __rtSend.apply(null, args);
+            if (p && typeof p.catch === "function") p.catch(function () {});
+          } catch (e) {}
+
+          var flush = function () {
+            if (!buffered) return;
+            buffered = false;
+            var resp = buf;
+            // Async like the real API — never invoke the callback re-entrantly.
+            setTimeout(function () { sink(resp); }, 0);
+          };
+          if (cb) {
+            sink = function (resp) { setLastErr(null); try { cb(resp); } catch (e) {} };
+            flush();
+            return undefined;
+          }
+          return new Promise(function (resolve) {
+            sink = resolve;
+            flush();
+          });
+        });
+      }
+    } catch (e) {}
   }
 
   // Namespaces with NO Safari equivalent that Chrome extensions still reference at
@@ -1599,11 +1793,22 @@ var __C2S_DEBUG__ = false;
   // chrome.* namespace backfills. A throw in any one must not skip the rest, and
   // must never escape the IIFE to abort the host script.
   if (hasChrome) try {
+    // Both honor Chrome's dual contract: a trailing callback is invoked (with
+    // lastError set on the reject side) instead of ignored — a promise-only stub
+    // leaves callback-form callers waiting forever.
     var rejectUnsupported = function (name) {
-      return function () { return Promise.reject(new Error(name + " is unsupported in Safari.")); };
+      return function () {
+        var cb = arguments.length && typeof arguments[arguments.length - 1] === "function" ? arguments[arguments.length - 1] : null;
+        if (cb) { setLastErr({ message: name + " is unsupported in Safari." }); try { cb(); } catch (e) {} setLastErr(null); return; }
+        return Promise.reject(new Error(name + " is unsupported in Safari."));
+      };
     };
     var resolveEmpty = function (val) {
-      return function () { return Promise.resolve(val); };
+      return function () {
+        var cb = arguments.length && typeof arguments[arguments.length - 1] === "function" ? arguments[arguments.length - 1] : null;
+        if (cb) { setLastErr(null); try { cb(val); } catch (e) {} return; }
+        return Promise.resolve(val);
+      };
     };
     // Fill members the host omitted WITHOUT clobbering ones it provides. Safari may
     // expose a PARTIAL namespace (e.g. chrome.system with only .cpu), so a blanket
@@ -1825,7 +2030,7 @@ var __C2S_DEBUG__ = false;
           return run(function () {
             if (!entry || !entry.url) throw new Error("A URL is required.");
             if (entries[entry.url]) throw new Error("Duplicate URL.");
-            var e = norm(entry); entries[entry.url] = e; persist(); added._emit(e); return undefined;
+            var e = norm(entry); entries[entry.url] = e; persist(); added._emit(Object.assign({}, e)); return undefined;
           }, cb);
         },
         removeEntry: function (info, cb) {
@@ -1839,7 +2044,7 @@ var __C2S_DEBUG__ = false;
             var url = info && info.url; var e = url && entries[url]; if (!e) throw new Error("URL not found.");
             if (info.title != null) e.title = info.title;
             if (info.hasBeenRead != null) e.hasBeenRead = !!info.hasBeenRead;
-            e.lastUpdateTime = Date.now(); persist(); updated._emit(e); return e;
+            e.lastUpdateTime = Date.now(); persist(); updated._emit(Object.assign({}, e)); return undefined;
           }, cb);
         },
         query: function (info, cb) {
@@ -1851,7 +2056,7 @@ var __C2S_DEBUG__ = false;
               if (info && info.url != null && e.url !== info.url) continue;
               if (info && info.title != null && e.title !== info.title) continue;
               if (info && info.hasBeenRead != null && e.hasBeenRead !== !!info.hasBeenRead) continue;
-              out.push(e);
+              out.push(Object.assign({}, e)); // copy — a live ref lets callers corrupt the store
             }
             return out;
           }, cb);
@@ -1928,10 +2133,24 @@ var __C2S_DEBUG__ = false;
     if (chrome.action) {
       if (!chrome.browserAction) chrome.browserAction = chrome.action;
       if (!chrome.pageAction) {
-        chrome.pageAction = Object.assign(Object.create(chrome.action), {
+        // Copy + bind, not Object.create: a Safari native reached through the
+        // prototype chain gets pageAction as `this` and throws illegal-invocation.
+        var __pa = {
           show: function (tabId, cb) { return dual(undefined, cb); },
           hide: function (tabId, cb) { return dual(undefined, cb); },
-        });
+        };
+        var __paCopy = function (k) {
+          if (k in __pa) return;
+          try {
+            var v = chrome.action[k];
+            __pa[k] = typeof v === "function" ? v.bind(chrome.action) : v;
+          } catch (e) {}
+        };
+        try { for (var __pk in chrome.action) __paCopy(__pk); } catch (e) {}
+        // Host namespaces may not enumerate; cover the standard surface explicitly.
+        var __paKeys = ["setTitle", "getTitle", "setIcon", "setPopup", "getPopup", "setBadgeText", "getBadgeText", "setBadgeBackgroundColor", "getBadgeBackgroundColor", "setBadgeTextColor", "getBadgeTextColor", "enable", "disable", "isEnabled", "getUserSettings", "openPopup", "onClicked"];
+        for (var __pi = 0; __pi < __paKeys.length; __pi++) { if (__paKeys[__pi] in chrome.action) __paCopy(__paKeys[__pi]); }
+        chrome.pageAction = __pa;
       }
     }
 
@@ -1987,9 +2206,9 @@ var __C2S_DEBUG__ = false;
           armAlarm(alarmReg[name] = { name: name, when: when, period: period });
           return dual(undefined, cb);
         },
-        get: function (name, cb) { var a = alarmReg[name || ""]; return dual(a ? alarmInfo(a) : undefined, cb); },
+        get: function (name, cb) { if (typeof name === "function") { cb = name; name = ""; } var a = alarmReg[name || ""]; return dual(a ? alarmInfo(a) : undefined, cb); },
         getAll: function (cb) { var out = []; for (var k in alarmReg) out.push(alarmInfo(alarmReg[k])); return dual(out, cb); },
-        clear: function (name, cb) { var a = alarmReg[name || ""]; if (a) { clearTimeout(a.t); delete alarmReg[name || ""]; } return dual(!!a, cb); },
+        clear: function (name, cb) { if (typeof name === "function") { cb = name; name = ""; } var a = alarmReg[name || ""]; if (a) { clearTimeout(a.t); delete alarmReg[name || ""]; } return dual(!!a, cb); },
         clearAll: function (cb) { var any = false; for (var k in alarmReg) { clearTimeout(alarmReg[k].t); delete alarmReg[k]; any = true; } return dual(any, cb); },
         onAlarm: {
           addListener: function (fn) { if (typeof fn === "function") alarmList.push(fn); },
@@ -2041,6 +2260,9 @@ var __C2S_DEBUG__ = false;
         var __wrapMenuCreate = function (props, cb) {
           if (props && typeof props === "object") {
             try {
+              // Sanitize a shallow COPY — callers reuse/inspect their properties
+              // object, and Chrome's create() never mutates it.
+              var __copy = {}; for (var __ck in props) __copy[__ck] = props[__ck]; props = __copy;
               if ("targetUrlPatterns" in props) props.targetUrlPatterns = __sanitizePatterns(props.targetUrlPatterns);
               if ("documentUrlPatterns" in props) props.documentUrlPatterns = __sanitizePatterns(props.documentUrlPatterns);
               if (props.targetUrlPatterns === undefined) delete props.targetUrlPatterns;
@@ -2126,7 +2348,9 @@ var __C2S_DEBUG__ = false;
           var changes = {};
           for (var k in items) {
             var nv = sessClone(items[k]);
-            if (!sameJson(sessMem[k], nv)) changes[k] = { oldValue: sessClone(sessMem[k]), newValue: sessClone(nv) };
+            // Chrome omits oldValue entirely for a newly-created key; an explicit
+            // `oldValue: undefined` trips `'oldValue' in change` checks.
+            if (!sameJson(sessMem[k], nv)) { var __ch = { newValue: sessClone(nv) }; if (k in sessMem) __ch.oldValue = sessClone(sessMem[k]); changes[k] = __ch; }
             sessMem[k] = nv;
           }
           sessEmit(changes);
@@ -2219,12 +2443,18 @@ var __C2S_DEBUG__ = false;
     // degrades to visibility-only / always-active. ("locked" has no web signal.)
     chrome.idle = chrome.idle || {};
     var __idleHasDoc = typeof document !== "undefined" && !!document.addEventListener;
+    // The converted background page is a permanently-hidden document with no
+    // input events — both signals below would misreport it as forever-"idle"
+    // (auto-lock extensions then lock constantly). Machine idle is unknowable
+    // there, so report "active", matching Chrome's answer for an active user.
+    var __idleBgPage = typeof location !== "undefined" && /(^|\/)background\.html$/.test((location && location.pathname) || "");
     var __idleInterval = 60; // seconds; Chrome's minimum is 15, default detection 60
     var __idleLastActivity = Date.now();
     var __idleCur = "active";
     var __idleListeners = [];
     // queryState honors its own threshold arg; the live edge tracker uses __idleInterval.
     var __idleStateFor = function (thresholdSec) {
+      if (__idleBgPage) return "active";
       if (typeof document !== "undefined" && document.visibilityState === "hidden") return "idle";
       if (!__idleHasDoc) return "active"; // no input signal here
       var sec = (typeof thresholdSec === "number" && thresholdSec > 0) ? thresholdSec : __idleInterval;
@@ -2652,16 +2882,22 @@ var __C2S_DEBUG__ = false;
     // members so native create/update/get/remove keep working untouched. Where the
     // whole namespace is absent (iOS), the method stubs degrade to tabs/no-ops.
     chrome.windows = chrome.windows || {};
+    // Callers read `.id` straight off the result; null would throw. -2 is
+    // WINDOW_ID_CURRENT, which the negative-windowId tabs.query normalization
+    // above already handles.
+    var __c2sWindowStub = function (id) {
+      return { id: id, focused: true, incognito: false, alwaysOnTop: false, type: "normal", state: "normal" };
+    };
     fill(chrome.windows, {
       WINDOW_ID_NONE: -1, WINDOW_ID_CURRENT: -2,
       CreateType: { NORMAL: "normal", POPUP: "popup", PANEL: "panel" },
       WindowState: { NORMAL: "normal", MINIMIZED: "minimized", MAXIMIZED: "maximized", FULLSCREEN: "fullscreen", LOCKED_FULLSCREEN: "locked-fullscreen" },
       // Fallbacks only reached when Safari omits the method (iOS); on macOS the
       // native impl is present so fill() skips these. create→open a tab.
-      get: function (id, info, cb) { if (typeof info === "function") { cb = info; } return dual(null, cb); },
-      getCurrent: function (info, cb) { if (typeof info === "function") { cb = info; } return dual(null, cb); },
-      getLastFocused: function (info, cb) { if (typeof info === "function") { cb = info; } return dual(null, cb); },
-      getAll: function (info, cb) { if (typeof info === "function") { cb = info; } return dual([], cb); },
+      get: function (id, info, cb) { if (typeof info === "function") { cb = info; } return dual(__c2sWindowStub(typeof id === "number" ? id : -2), cb); },
+      getCurrent: function (info, cb) { if (typeof info === "function") { cb = info; } return dual(__c2sWindowStub(-2), cb); },
+      getLastFocused: function (info, cb) { if (typeof info === "function") { cb = info; } return dual(__c2sWindowStub(-2), cb); },
+      getAll: function (info, cb) { if (typeof info === "function") { cb = info; } return dual([__c2sWindowStub(-2)], cb); },
       create: function (opts, cb) {
         var url = opts && opts.url;
         try { if (url && chrome.tabs && chrome.tabs.create) chrome.tabs.create({ url: Array.isArray(url) ? url[0] : url }); } catch (e) {}
@@ -2767,12 +3003,36 @@ var __C2S_DEBUG__ = false;
         var origins = [].concat(mf.host_permissions || [], mf.optional_host_permissions || []);
         return { perms: perms, origins: origins };
       };
+      // Parse "scheme://host/path" of a match pattern; null when malformed.
+      var parsePattern = function (p) {
+        if (p === "<all_urls>") return { scheme: "*", host: "*", path: "/*" };
+        var m = /^(\*|https?|file|ftp):\/\/([^/]*)(\/.*)?$/.exec(p);
+        return m ? { scheme: m[1], host: m[2], path: m[3] || "/*" } : null;
+      };
+      var coversHost = function (dh, ah) {
+        if (dh === "*") return true;
+        if (dh.indexOf("*.") === 0) {
+          var suffix = dh.slice(2);
+          var a = ah.indexOf("*.") === 0 ? ah.slice(2) : ah;
+          return a === suffix || a.slice(-(suffix.length + 1)) === "." + suffix;
+        }
+        return dh === ah;
+      };
       var matchOrigin = function (declared, asked) {
-        // A declared host pattern grants an asked origin if it is the same or broader.
-        // Cheap check: <all_urls>/*://*/* grant anything; otherwise exact membership.
+        // A declared host pattern grants an asked origin if it is the same or
+        // BROADER — real wildcard subsumption ("*://*.example.com/*" covers
+        // "https://api.example.com/*"), not just exact string membership.
+        var a = parsePattern(asked);
         for (var i = 0; i < declared.length; i++) {
           var d = declared[i];
-          if (d === asked || d === "<all_urls>" || d === "*://*/*") return true;
+          if (d === asked) return true;
+          var dp = parsePattern(d);
+          if (!dp || !a) continue;
+          var schemeOk = dp.scheme === "*" ? (a.scheme === "*" || a.scheme === "http" || a.scheme === "https") : dp.scheme === a.scheme;
+          if (!schemeOk) continue;
+          if (!coversHost(dp.host, a.host)) continue;
+          if (dp.path === "/*" || dp.path === a.path) return true;
+          if (dp.path.slice(-1) === "*" && a.path.indexOf(dp.path.slice(0, -1)) === 0) return true;
         }
         return false;
       };
@@ -3411,7 +3671,15 @@ var __C2S_DEBUG__ = false;
       var ck = (typeof chrome !== "undefined" && chrome.cookies) ? chrome.cookies
              : (api && api.cookies) ? api.cookies : null;
       var fallback = "";
-      try { if (typeof document !== "undefined" && document.cookie) fallback = document.cookie; } catch (e) {}
+      // document.cookie is the EMBEDDING PAGE's jar in a content script — only
+      // forward it when the proxied request targets that page's own host, never
+      // to a third-party backend.
+      try {
+        if (typeof document !== "undefined" && document.cookie &&
+            typeof location !== "undefined" && new URL(url, location.href).host === location.host) {
+          fallback = document.cookie;
+        }
+      } catch (e) {}
       if (!ck || typeof ck.getAll !== "function") return Promise.resolve(fallback);
       return new Promise(function (resolve) {
         var done = false;

@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, existsSync, realpathSync, statSync } from "n
 import { join, relative } from "node:path";
 import type { Issue, Manifest, Platforms } from "../types.js";
 import { UNSUPPORTED_APIS, parseJsonc, resolveI18nStringStrict } from "../manifest/manifest.js";
+import { matchBalancedParen } from "../runtime/shim.js";
 
 /**
  * Recursive file finder. Dirent-based so each entry costs no extra stat (only
@@ -121,7 +122,7 @@ const BACKGROUND_FILE_RE = /(background|service[-_]?worker)/i;
 // tabs.connect — the tab/frame-targeting side — hits the bug.
 const CONNECT_RE = /tabs\.connect\s*\(/;
 
-function scanJsContent(content: string, rel: string, issues: Issue[]): void {
+function scanJsContent(content: string, rel: string, issues: Issue[], isServiceWorker: boolean): void {
   const lineAt = makeLineResolver(content);
 
   const hits: Array<{ name: string; at: number; info: (typeof API_PATTERNS)[number]["info"] }> = [];
@@ -215,13 +216,22 @@ function scanJsContent(content: string, rel: string, issues: Issue[]): void {
   // (e.g. "a.js", 'b.js'). Anything else — a variable, a concat (base + "a.js"),
   // a getURL("x") call — can't be statically hoisted and silently loses its
   // imported code, so it must warn, not reassure.
+  // Only the manifest-declared service worker is converted (importScripts hoisted
+  // and neutralized). importScripts in any OTHER file — a genuine web worker —
+  // keeps working in Safari untouched, so flagging it would be a false alarm.
+  // Args are extracted with the same balanced-paren scan the converter uses
+  // (matchBalancedParen); a [^)]* regex truncates at the first ")" inside an
+  // argument (webpack's `importScripts(o.p+o.u(t))`) and misclassifies.
   const STATIC_LITERAL_LIST = /^\s*(?:(["'])[^"']*\1\s*,\s*)*(["'])[^"']*\2\s*$/;
-  const IS_CALL_RE = /\bimportScripts\s*\(([^)]*)\)/g;
+  const IS_OPEN_RE = /\bimportScripts\s*\(/g;
   let isFirstAt = -1;
   let isDynamicAt = -1;
-  for (let m; (m = IS_CALL_RE.exec(content)); ) {
+  if (isServiceWorker) for (let m; (m = IS_OPEN_RE.exec(content)); ) {
     if (isFirstAt === -1) isFirstAt = m.index;
-    const argList = m[1] ?? "";
+    const end = matchBalancedParen(content, m.index + m[0].length - 1);
+    if (end < 0) break;
+    const argList = content.slice(m.index + m[0].length, end - 1);
+    IS_OPEN_RE.lastIndex = end;
     if (argList.trim() !== "" && !STATIC_LITERAL_LIST.test(argList)) {
       isDynamicAt = m.index;
       break;
@@ -296,8 +306,11 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
     }
     // Safari's extension toolbar/store pipeline only renders PNG icons; an .svg/.webp/.jpg
     // icon loads in Chrome but shows a blank glyph in Safari (and the App Store rejects it).
-    const dot = p.lastIndexOf(".");
-    const ext = dot >= 0 ? p.slice(dot).toLowerCase() : "";
+    // Sniff off the basename — a dot in a directory name ("assets.v2/icon48")
+    // must not read as a bogus file extension.
+    const base = p.slice(p.lastIndexOf("/") + 1);
+    const dot = base.lastIndexOf(".");
+    const ext = dot >= 0 ? base.slice(dot).toLowerCase() : "";
     if (ext && ext !== ".png") {
       issues.push({
         severity: "warning",
@@ -413,6 +426,12 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
     }
   }
 
+  // Manifest-relative SW path, used to gate the importScripts checks to the one
+  // file the converter actually rewrites.
+  const swRel = typeof manifest.background?.service_worker === "string"
+    ? manifest.background.service_worker.replace(/^\.?\//, "")
+    : undefined;
+
   let faviconNoted = false;
   let extUrlNoted = false;
   let chromeSettingsNoted = false;
@@ -484,7 +503,7 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
       }
     }
 
-    if (isJs) scanJsContent(content, rel, issues);
+    if (isJs) scanJsContent(content, rel, issues, rel.split("\\").join("/") === swRel);
   }
 
   if (platforms === "ios" || platforms === "all") {

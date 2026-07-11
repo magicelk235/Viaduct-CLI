@@ -46,9 +46,10 @@ function applyConfig(
   values: Record<string, unknown>,
   explicitPath: string | undefined,
   argv: string[]
-): string | null {
+): { path: string | null; applied: Set<string> } {
+  const applied = new Set<string>();
   const path = explicitPath ?? (existsSync("viaduct.config.json") ? "viaduct.config.json" : undefined);
-  if (!path) return null;
+  if (!path) return { path: null, applied };
   if (!existsSync(path)) {
     fail(`Config file not found: ${path}`);
     process.exit(2);
@@ -85,14 +86,15 @@ function applyConfig(
     if (
       argv.includes(`--${key}`) ||
       argv.some((a) => a.startsWith(`--${key}=`)) ||
-      // The short alias appears as the bare token `-o` OR Node's attached form
-      // `-ofoo` (a single argv token). Match both so an explicit `-ofoo` isn't
-      // silently overridden by a config value for the same key.
-      (short !== undefined && argv.some((a) => a === `-${short}` || a.startsWith(`-${short}`)))
+      // The short alias appears bare (`-o dir`), attached (`-odir`), or grouped
+      // behind boolean shorts (`-qo dir`, `-qvodir`) — parseArgs accepts all of
+      // these, so all must count as "the user typed it".
+      (short !== undefined && argv.some((a) => new RegExp(`^-(?!-)[A-Za-z]*${short}`).test(a)))
     ) continue;
     values[key] = val;
+    applied.add(key);
   }
-  return path;
+  return { path, applied };
 }
 
 function pkgVersion(): string {
@@ -359,7 +361,7 @@ async function main(): Promise<void> {
   // Overlay config before validation so config-supplied bundle-id/team/etc. are
   // validated like CLI ones. Meta flags (--version/--help/--doctor/--list/
   // --uninstall/--analyze) run below and ignore config; that's fine.
-  const configPath = applyConfig(values as Record<string, unknown>, values.config, process.argv.slice(2));
+  const { path: configPath, applied: configApplied } = applyConfig(values as Record<string, unknown>, values.config, process.argv.slice(2));
   if (configPath) info(`Using config ${configPath}`);
 
   if (values.version) {
@@ -447,6 +449,15 @@ async function main(): Promise<void> {
 
   // Single-file outputs can't hold multiple extensions, so forbid them in batch.
   if (inputs.length > 1) {
+    // Config-file values are shared defaults; the per-extension ones can't apply
+    // to a batch. Drop them with a note — only a flag the user actually typed
+    // should hard-fail the run.
+    for (const key of ["output", "app-name", "bundle-id"] as const) {
+      if (configApplied.has(key) && values[key] !== undefined) {
+        warn(`Config "${key}" ignored for batch runs (it applies to a single extension).`);
+        (values as Record<string, unknown>)[key] = undefined;
+      }
+    }
     if (values.output !== undefined) {
       fail("--output names a single directory; omit it for batch (each extension gets its default ./<App>_Safari).");
       process.exit(2);
@@ -492,6 +503,13 @@ async function main(): Promise<void> {
   const liveScratch = new Set<string>();
   // One dir failing to remove (EPERM/EBUSY) must not abort cleanup of the rest.
   process.on("exit", () => { for (const d of liveScratch) { try { rmSync(d, { recursive: true, force: true }); } catch {} } });
+  // Signal death skips 'exit' handlers entirely (Ctrl-C mid-download leaked the
+  // scratch dir). Route signals through process.exit so the cleanup above runs;
+  // deferred one tick so convert()'s own SIGINT cleanup (registered later, exits
+  // itself) still runs first when a conversion is in flight.
+  const onSignal = () => { setImmediate(() => process.exit(130)); };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
   for (const input of inputs) {
     if (batch) console.error(`\n${color("bold", `── ${basename(input)} ──`)}`);
 
@@ -619,7 +637,9 @@ async function main(): Promise<void> {
     if (anyFailed) fail(`Batch finished with failures (${n} input(s)). See messages above.`);
     else ok(color("bold", `Batch complete: ${n} extension(s).`));
   }
-  process.exit(anyFailed ? 1 : 0);
+  // process.exit() truncates pending async stdout writes (a piped --analyze
+  // --json payload is exactly that); set the code and let the process drain.
+  process.exitCode = anyFailed ? 1 : 0;
 }
 
 main().catch((e) => {
