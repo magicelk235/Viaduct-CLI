@@ -52,8 +52,14 @@ export function verifyInSafari(bundleId: string): VerifyResult {
   // Nudge Safari to scan extensions; harmless if already open.
   run("/usr/bin/open", ["-a", "Safari"]);
 
-  const status = pluginkitStatus();
-  const registered = bundleRegistered(status, bundleId);
+  // Registration lands asynchronously after Safari launches; one immediate query
+  // races it and flips the --verify exit code spuriously. Poll for up to ~10s.
+  let registered = false;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    if (attempt > 0) run("/bin/sleep", ["1"]);
+    registered = bundleRegistered(pluginkitStatus(), bundleId);
+    if (registered) break;
+  }
   // State comes from the compact flag column, not the verbose block.
   const enabled = parseEnabled(pluginkitCompactStatus(), bundleId);
 

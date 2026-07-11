@@ -23,7 +23,10 @@ const EXCLUDE_SUFFIX = [".map", ".ts", ".tsx", ".md", ".log"];
 // Doc/config files: bare name or name + extension only (e.g. "LICENSE",
 // "LICENSE.txt"), never a prefix match — that would drop legit runtime files
 // like "LICENSE_KEY.js" or "READMExporter.js".
-const EXCLUDE_DOC_RE = /^(README|CHANGELOG|LICENSE)(\.[^.]+)?$/i;
+// Only doc-typed variants (or the bare name). A runtime file that merely shares
+// the name — changelog.html, license.js, Changelog.json — must ship, or it 404s
+// at runtime (only manifest-referenced paths are otherwise protected).
+const EXCLUDE_DOC_RE = /^(README|CHANGELOG|LICENSE)(\.(txt|md|markdown|rst|adoc))?$/i;
 const EXCLUDE_DOTFILE = [".eslint", ".prettier"];
 
 function shouldExclude(name: string): boolean {
@@ -193,8 +196,11 @@ export function stripDanglingSourcemaps(stageDir: string): number {
 // untouched). If a future enum ever has value !== name, switch back to a name→value map.
 const ENUM_MEMBERS = new Set(["ISOLATED", "MAIN"]);
 // e.g.  chrome.scripting.ExecutionWorld.ISOLATED  |  browser["scripting"].RegistrationWorld.MAIN
+// (?<![\w$.]) plus the optional global prefix: `self.chrome.scripting...` must be
+// consumed WHOLE (matching from `chrome` would leave `self."ISOLATED"` — a
+// SyntaxError), while `myObj.chrome.scripting...` must not match at all.
 const ENUM_RE =
-  /\b(?:chrome|browser)\s*(?:\.\s*scripting|\[\s*["']scripting["']\s*\])\s*\.\s*(ExecutionWorld|RegistrationWorld)\s*\.\s*([A-Z_]+)\b/g;
+  /(?<![\w$.])(?:(?:self|globalThis|window)\s*\.\s*)?(?:chrome|browser)\s*(?:\.\s*scripting|\[\s*["']scripting["']\s*\])\s*\.\s*(ExecutionWorld|RegistrationWorld)\s*\.\s*([A-Z_]+)\b/g;
 
 export function inlineImmutableEnums(stageDir: string): number {
   let modified = 0;
@@ -215,6 +221,44 @@ export function inlineImmutableEnums(stageDir: string): number {
       writeFileSync(file, next, "utf-8");
       modified++;
     }
+  }
+  return modified;
+}
+
+// Chrome bundles bake the literal scheme of their own pages into compiled
+// platform tables and URL checks:
+//   INTERNAL_PAGE_PROTOCOLS: ["chrome-extension:"]        (Tampermonkey)
+//   sender.url.startsWith("chrome-extension://")           (common idiom)
+// On Safari every extension page is safari-web-extension://…, so each of these
+// checks is false at runtime. The damage is silent and structural: message
+// dispatchers that gate privileged methods on "is the sender one of my own
+// pages?" refuse every popup/options RPC, and the page waiting on the reply
+// renders nothing (Tampermonkey's action popup: loadTree refused → blank).
+// A chrome-extension:// URL can never legitimately occur inside Safari, so the
+// literal is dead code unless rewritten. Swap the scheme token to Safari's in
+// the staged sources; host/path parts of any such URL are left untouched.
+// Must run BEFORE the shim/polyfill are written — those templates carry
+// chrome-extension:// strings on purpose (origin spoofing) and must keep them.
+//
+// ponytail: token substitution, not a JS parser. Matches the scheme token
+// wherever it appears (comments too — harmless). A dual-browser bundle that
+// compares against BOTH schemes ends up with two equal branches; the first
+// wins, same outcome either way.
+const CHROME_SCHEME_RE = /(?<![-\w])chrome-extension:/g;
+
+export function rewriteChromeSchemeLiterals(stageDir: string): number {
+  let modified = 0;
+  for (const file of walkScripts(stageDir)) {
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    if (!CHROME_SCHEME_RE.test(content)) continue;
+    CHROME_SCHEME_RE.lastIndex = 0;
+    writeFileSync(file, content.replace(CHROME_SCHEME_RE, "safari-web-extension:"), "utf-8");
+    modified++;
   }
   return modified;
 }
@@ -241,7 +285,7 @@ export function inlineImmutableEnums(stageDir: string): number {
 // `new RegExp(<chrome|browser>[.|["..."]]runtime.id + "<path>")`. A bundle that built the
 // pattern some other way (string concat into a var first) would need AST work — add then.
 const RUNTIME_ID_URL_RE =
-  /new\s+RegExp\s*\(\s*(?:chrome|browser|self|globalThis)?\s*(?:\.\s*chrome|\.\s*browser)?\s*\.\s*runtime\s*\.\s*id\s*\+\s*(["'])((?:\\.|(?!\1).)*)\1\s*\)/g;
+  /new\s+RegExp\s*\(\s*(?:chrome|browser|self|globalThis|window)?\s*(?:\.\s*chrome|\.\s*browser)?\s*\.\s*runtime\s*\.\s*id\s*\+\s*(["'])((?:\\.|(?!\1).)*)\1\s*\)/g;
 
 export function rewriteRuntimeIdUrlMatchers(stageDir: string): number {
   let modified = 0;

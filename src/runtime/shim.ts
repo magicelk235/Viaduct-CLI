@@ -259,6 +259,13 @@ export function convertServiceWorkerToBackgroundPage(dir: string, manifest: Mani
   // so the now-undefined global is never invoked. CSP-safe and generic.
   const importTags = hoistImportScripts(dir, sw);
 
+  // The OAuth bridge's onMessageExternal capture must install BEFORE any hoisted
+  // importScripts chunk runs — SW-loader bundles register their listeners inside
+  // those chunks, and the polyfill import injected into the SW module runs too
+  // late (modules are deferred). Load it as a classic script first; the polyfill
+  // is install-once, so the SW module's own import becomes a no-op.
+  const idPolyTag = existsSync(join(dir, "identity-polyfill.js")) ? `<script src="identity-polyfill.js"></script>\n` : "";
+
   // manifest.name may be an unresolved "__MSG_*__" i18n key (Honey: "__MSG_Honey_Title__")
   // — resolve it from _locales first so the title isn't a raw placeholder. Then escape:
   // the name can still contain <,>,& (e.g. "Save to Notion <Beta>"), so a stray "<" /
@@ -272,7 +279,7 @@ export function convertServiceWorkerToBackgroundPage(dir: string, manifest: Mani
   const html = `<!DOCTYPE html>
 <meta charset="utf-8">
 <title>${title} background</title>
-${polyTag}${shimTag}${importTags}<script type="module" src="${sw}"></script>
+${polyTag}${shimTag}${idPolyTag}${importTags}<script type="module" src="${sw}"></script>
 `;
   writeFileSync(join(dir, BACKGROUND_PAGE_FILENAME), html, "utf-8");
   // MV3 (Safari) rejects persistent background: "A manifest_version >= 3 must be non-persistent."

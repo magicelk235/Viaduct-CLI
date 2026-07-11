@@ -163,9 +163,12 @@ export const UNSUPPORTED_APIS: Record<
     fix: "Monitor history changes from a content script.",
   },
   "chrome.tts\\b": {
-    severity: "warning",
-    message: "chrome.tts (text-to-speech) is unsupported in Safari.",
-    fix: "Use the Web Speech API (speechSynthesis), or bridge to AVSpeechSynthesizer in the native host.",
+    // Keep in sync with SHIMMED_PERMISSIONS/UNSUPPORTED_PERMISSIONS.tts: the shim
+    // routes chrome.tts to the Web Speech API, so this is informational.
+    severity: "info",
+    message: "chrome.tts is routed to the Web Speech API (speechSynthesis) by the shim; speak/stop/pause keep working.",
+    fix: "No action needed for basic speech; voices map to the platform's speechSynthesis voices.",
+    shimmed: true,
   },
   "chrome.ttsEngine": {
     severity: "warning",
@@ -213,9 +216,12 @@ export const UNSUPPORTED_APIS: Record<
     fix: "Self-introspection works; if you rely on managing other extensions, move that to the native host app.",
   },
   "chrome.power": {
-    severity: "warning",
-    message: "chrome.power has no Safari equivalent.",
-    fix: "Use IOKit in the native host, or drop wake-lock behavior.",
+    // Keep in sync with SHIMMED_PERMISSIONS/UNSUPPORTED_PERMISSIONS.power: the
+    // shim backs requestKeepAwake with the Screen Wake Lock API.
+    severity: "info",
+    message: "chrome.power is backed by the Screen Wake Lock API (navigator.wakeLock) by the shim.",
+    fix: "No action needed; the 'system' (display-off) level has no web equivalent and behaves like 'display'.",
+    shimmed: true,
   },
   "chrome.system": {
     severity: "warning",

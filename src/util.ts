@@ -90,8 +90,10 @@ export function moveBundle(src: string, dest: string): boolean {
   if (existsSync(dest)) rmSync(dest, { recursive: true, force: true });
   try {
     renameSync(src, dest);
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "EXDEV") throw e;
+  } catch {
+    // Any rename failure (EXDEV, EPERM, ENOTEMPTY, ...) falls back to copy+delete.
+    // Rethrowing would bypass the callers' keep-the-built-app fallback and let
+    // their finally-cleanup delete the only copy of the built app.
     if (run("/usr/bin/ditto", [src, dest]).code !== 0) return false;
     rmSync(src, { recursive: true, force: true });
   }

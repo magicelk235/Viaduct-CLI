@@ -4,7 +4,10 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const MAX_BYTES = 100 * 1024 * 1024; // 100 MB
-const TIMEOUT_MS = 60_000;
+const TIMEOUT_MS = 60_000; // socket IDLE timeout: no data at all for this long
+// Whole-download wall clock. Distinct from (and much larger than) the idle
+// timeout: equal values made the 100 MB cap unreachable below ~1.7 MB/s.
+const TOTAL_TIMEOUT_MS = 5 * 60_000;
 const MAX_REDIRECTS = 5;
 
 // Chrome extension IDs are 32 chars from the alphabet a–p (base16-ish mojibake).
@@ -39,7 +42,7 @@ export function extractStoreId(url: string): string | undefined {
 // Google's CRX endpoint gates responses on prodversion; too stale a value risks it
 // declining newer extensions. Keep this within a major or two of current Chrome stable.
 // Override via VIADUCT_CRX_PRODVERSION when the default goes stale and the endpoint declines.
-const CRX_PRODVERSION = process.env.VIADUCT_CRX_PRODVERSION || "131.0";
+const CRX_PRODVERSION = process.env.VIADUCT_CRX_PRODVERSION || "138.0";
 
 /** Build the clients2 CRX download endpoint (302-redirects to the real CRX). */
 export function crxEndpoint(id: string): string {
@@ -143,8 +146,8 @@ function httpGet(url: string, redirectsLeft = MAX_REDIRECTS): Promise<HttpResult
     });
     // Total wall-clock deadline (idle timeout above can't bound a slow-drip response).
     deadline = setTimeout(() => {
-      req.destroy(new Error(`Timed out after ${TIMEOUT_MS}ms fetching ${url}`));
-    }, TIMEOUT_MS);
+      req.destroy(new Error(`Timed out after ${TOTAL_TIMEOUT_MS}ms fetching ${url}`));
+    }, TOTAL_TIMEOUT_MS);
     req.on("error", (e) => done(() => reject(e)));
   });
 }

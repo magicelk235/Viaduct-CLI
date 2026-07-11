@@ -7,6 +7,13 @@
               (typeof globalThis !== "undefined" && globalThis.__C2S_DEBUG) || false;
   var DBG = function () { if (DEBUG) try { console.log.apply(console, arguments); } catch (e) {} };
   var DBGW = function () { if (DEBUG) try { console.warn.apply(console, arguments); } catch (e) {} };
+  // Install-once: background.html loads this as a classic script (so the
+  // onMessageExternal capture beats hoisted importScripts chunks) AND the SW
+  // module imports it; the second evaluation must be a no-op or listeners
+  // double-dispatch.
+  var __g = typeof self !== "undefined" ? self : (typeof globalThis !== "undefined" ? globalThis : {});
+  if (__g.__c2sIdentityPolyfill) { return; }
+  __g.__c2sIdentityPolyfill = true;
   var api = typeof self !== "undefined" && self.chrome ? self.chrome
           : (typeof chrome !== "undefined" ? chrome : null);
   if (!api) { DBGW("[idpoly] no chrome api"); return; }
@@ -142,7 +149,13 @@
     });
 
     if (typeof callback === "function") {
-      p.then(function (u) { callback(u); }, function () { callback(undefined); });
+      p.then(function (u) { callback(u); }, function (err) {
+        // Chrome invokes the callback with undefined AND sets lastError for its
+        // duration; without it callers can't tell failure from empty success
+        // (getAuthToken below already follows this contract).
+        try { if (api.runtime) api.runtime.lastError = { message: (err && err.message) || "launchWebAuthFlow failed" }; } catch (e) {}
+        try { callback(undefined); } finally { try { if (api.runtime) delete api.runtime.lastError; } catch (e) {} }
+      });
       return;
     }
     return p;
@@ -214,7 +227,16 @@
     }
     var controlled = {
       addListener: capture,
-      removeListener: function (l) { var i = extListeners.indexOf(l); if (i >= 0) extListeners.splice(i, 1); },
+      removeListener: function (l) {
+        var i = extListeners.indexOf(l); if (i >= 0) extListeners.splice(i, 1);
+        // capture() also forwarded the listener to the native event; detach it
+        // there too or genuine external messages keep firing a "removed" listener.
+        var f = forwarded.indexOf(l);
+        if (f >= 0) {
+          forwarded.splice(f, 1);
+          try { if (nativeExt && typeof nativeExt.removeListener === "function") nativeExt.removeListener(l); } catch (e) {}
+        }
+      },
       hasListener: function (l) { return extListeners.indexOf(l) >= 0; }
     };
     // (1) Replace the event object so `rt.onMessageExternal.addListener` hits us.
@@ -263,9 +285,18 @@
           resp({ success: false, error: "bridge: no external listener captured" });
           return;
         }
+        // Chrome's channel contract: a listener keeps the channel open only by
+        // returning true (or a Promise). If none does, close it now — otherwise a
+        // fire-and-forget message leaves the page waiting out its 30s timeout.
+        var willRespond = false;
         for (var i = 0; i < extListeners.length; i++) {
-          try { extListeners[i](msg.payload, fixed, resp); } catch (e) { console.error("[idpoly] extListener err", e); }
+          try {
+            var ret = extListeners[i](msg.payload, fixed, resp);
+            if (ret === true) willRespond = true;
+            else if (ret && typeof ret.then === "function") { willRespond = true; ret.then(resp, function () { resp(undefined); }); }
+          } catch (e) { console.error("[idpoly] extListener err", e); }
         }
+        if (!willRespond && !settled) resp(undefined);
       });
     });
   }

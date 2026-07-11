@@ -68,7 +68,11 @@ interface WarEntry {
  */
 export function applyOAuthBridge(stageDir: string, manifest: Manifest, chromeId?: string): string[] {
   const notes: string[] = [];
-  const sw = manifest.background?.service_worker;
+  // A leading-slash service_worker path ("/sw.js") is root-relative in Chrome;
+  // normalize it to manifest-relative or the relative() math in
+  // injectPolyfillImport emits a cwd-derived garbage import that kills the SW.
+  const rawSw = manifest.background?.service_worker;
+  const sw = typeof rawSw === "string" ? rawSw.replace(/^\/+/, "") : rawSw;
   if (!sw) return notes; // only MV3 service-worker extensions have this handshake
 
   // 1. Emit the identity polyfill — it shims chrome.identity in the SW and is
@@ -92,9 +96,8 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest, chromeId?
   // or the polyfill's onBeforeNavigate wiring throws (webNavigation is undefined).
   const usesIdentity = Array.isArray(manifest.permissions) &&
     manifest.permissions.some((p) => typeof p === "string" && (p === "identity" || p.startsWith("identity.")));
-  if (usesIdentity) {
-    if (!Array.isArray(manifest.permissions)) manifest.permissions = [];
-    if (!manifest.permissions.includes("webNavigation")) manifest.permissions.push("webNavigation");
+  if (usesIdentity && Array.isArray(manifest.permissions) && !manifest.permissions.includes("webNavigation")) {
+    manifest.permissions.push("webNavigation");
   }
 
   // 2. The SW (or its loader) must run the polyfill FIRST so the bridge receiver

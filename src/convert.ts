@@ -1,11 +1,11 @@
-import { mkdtempSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve, basename } from "node:path";
+import { join, resolve, basename, sep } from "node:path";
 import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
 import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
-import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers } from "./input/stage.js";
+import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteChromeSchemeLiterals } from "./input/stage.js";
 import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, deriveProxyHosts } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
@@ -79,6 +79,25 @@ export function convert(opts: ConvertOptions): ConvertResult {
     result.resolvedBundleId = bundleId;
 
     const outputDir = resolve(opts.output ?? join(process.cwd(), `${appName}_Safari`));
+
+    // Refuse overlapping input/output BEFORE anything destructive. Re-converting a
+    // previous run's staged_extension with the same output dir would rmSync the
+    // input (stageExtension recreates stageDir fresh; --clean wipes outputDir);
+    // and `cd my-ext && viaduct .` puts stageDir inside the source, which cpSync
+    // rejects with a raw ERR_FS_CP_EINVAL. Fail with an actionable message instead.
+    const realOrSelf = (p: string) => { try { return realpathSync(p); } catch { return resolve(p); } };
+    const realExt = realOrSelf(extPath);
+    const realOut = realOrSelf(outputDir);
+    const isInside = (child: string, parent: string) => child === parent || child.startsWith(parent + sep);
+    if (isInside(realExt, realOut)) {
+      fail(`Input extension (${extPath}) lives inside the output directory (${outputDir}); converting would delete it. Pass -o <dir> outside the input.`);
+      return result;
+    }
+    if (isInside(realOut, realExt)) {
+      fail(`Output directory (${outputDir}) is inside the input extension; staging cannot copy a directory into itself. Pass -o <dir> outside the input.`);
+      return result;
+    }
+
     if (opts.clean && existsSync(outputDir)) {
       rmSync(outputDir, { recursive: true, force: true });
       ok(`Cleaned output dir → ${outputDir}`);
@@ -108,6 +127,15 @@ export function convert(opts: ConvertOptions): ConvertResult {
     // `runtime.id +` prefix here, making the matcher host-agnostic + query-tolerant.
     const rerouted = rewriteRuntimeIdUrlMatchers(stageDir);
     if (rerouted > 0) ok(`Rewrote runtime.id-based port matchers in ${rerouted} script(s)`);
+
+    // Compiled bundles hardcode "chrome-extension:" when classifying their own pages
+    // (sender.url prefix checks, internal-protocol tables). Safari pages are
+    // safari-web-extension://, so those checks all fail and background dispatchers
+    // refuse popup/options RPCs (Tampermonkey: blank action popup). Rewrite the
+    // scheme literal in the staged sources — before writeShim/writePolyfill below,
+    // whose templates carry chrome-extension:// on purpose.
+    const reschemed = rewriteChromeSchemeLiterals(stageDir);
+    if (reschemed > 0) ok(`Rewrote chrome-extension: scheme literals in ${reschemed} script(s)`);
 
     // Derived once and shared by the shim allowlist (below) and the Swift native
     // allowlist (later). transformManifest deep-clones its input, so the value is

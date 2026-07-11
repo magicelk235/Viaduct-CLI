@@ -24,6 +24,8 @@
   }
   var pending = Object.create(null);
   var seq = 0;
+  // Scoped like Chrome's runtime.lastError: set for a callback's duration only.
+  var lastErr;
 
   window.addEventListener("message", function (ev) {
     if (ev.source !== window) return;
@@ -62,7 +64,18 @@
       };
     });
     window.postMessage({ __claudeBridge: "page", reqId: reqId, msg: msg }, window.location.origin);
-    if (cb) { p.then(function (r) { cb(r); }, function () { cb(undefined); }); return; }
+    if (cb) {
+      p.then(
+        function (r) { lastErr = undefined; cb(r); },
+        function (e) {
+          // Callback form: surface the failure via lastError (Chrome's contract);
+          // a bare cb(undefined) is indistinguishable from an empty success.
+          lastErr = { message: (e && e.message) || "bridge error" };
+          try { cb(undefined); } finally { lastErr = undefined; }
+        }
+      );
+      return;
+    }
     return p;
   }
 
@@ -79,7 +92,7 @@
     onMessage: emptyEvent,
     onMessageExternal: emptyEvent,
     onConnect: emptyEvent,
-    get lastError() { return undefined; }
+    get lastError() { return lastErr; }
   };
 
   var ns = window.chrome || {};
