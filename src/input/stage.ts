@@ -126,7 +126,7 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
 
 const SOURCEMAP_RE = /^[ \t]*\/\/[#@] sourceMappingURL=(\S+)[ \t]*\r?$/gm;
 
-function walkScripts(dir: string, acc: string[] = []): string[] {
+export function walkScripts(dir: string, acc: string[] = []): string[] {
   let entries;
   try {
     entries = readdirSync(dir, { withFileTypes: true });

@@ -2650,24 +2650,39 @@ var __C2S_DEBUG__ = false;
       if (!/^(blob:|data:)/i.test(url)) return false;
       // WebKit ignores the <a download> attribute for blob:/data: URLs in an extension
       // page (proven live: every anchor/iframe method navigates or no-ops). The ONE
-      // method that saves to disk is window.open() on an application/octet-stream URL —
-      // WebKit's top-level downloader takes over. The saved name is derived by WebKit
-      // (can't be set from JS for a blob URL; it lands as "Unknown"), which is the
-      // accepted trade-off: a working download beats a blank page.
-      var open = function (href) {
-        try { var w = window.open(href); return true; } catch (e) { return false; }
-      };
+      // method that saves to disk is a TOP-LEVEL navigation to the URL — WebKit's
+      // downloader takes over for a non-renderable type. The saved name is derived by
+      // WebKit (can't be set from JS for a blob URL; lands as "Unknown"), the accepted
+      // trade-off: a working download beats a blank page.
+      //
+      // Observed live in Safari:
+      //  - window.open(blobUrl) IS the only thing that starts a download: WebKit's
+      //    top-level downloader takes over a non-renderable blob. It returns null in
+      //    a popover (reported as blocked) but STILL downloads — so ignore the return.
+      //  - chrome.tabs.create(blobUrl) NAVIGATES a real tab to the blob instead of
+      //    downloading (blank safari-web-extension://…/<uuid> page). Do NOT use it.
+      //  - The CRX "Download as zip" button (a popover) calls window.close() right
+      //    after the download call, so the open MUST be synchronous in the gesture —
+      //    an async fetch-then-open loses the race. Most export blobs are already a
+      //    non-renderable type (application/zip, octet-stream, the crx bytes), so the
+      //    original URL downloads directly; no refetch needed on the common path.
+      try { window.open(url); } catch (e) {}
+      // Belt-and-suspenders for a RENDERABLE blob type (would show inline instead of
+      // download): refetch → octet-stream and open that too. Async, so it only helps
+      // pages that stay open; the popover case is already handled by the sync open.
       try {
-        // Refetch → octet-stream so WebKit downloads rather than renders. fetch of a
-        // same-origin blob:/data: URL is allowed and cheap (it's already in memory).
-        fetch(url).then(function (r) { return r.blob(); }).then(function (b) {
-          var dl = new Blob([b], { type: "application/octet-stream" });
-          var u2 = URL.createObjectURL(dl);
-          open(u2);
+        fetch(url).then(function (r) {
+          var ct = (r.headers && r.headers.get && r.headers.get("content-type")) || "";
+          if (/octet-stream|zip|x-chrome/i.test(ct)) return null; // sync open sufficed
+          return r.blob();
+        }).then(function (b) {
+          if (!b) return;
+          var u2 = URL.createObjectURL(new Blob([b], { type: "application/octet-stream" }));
+          try { window.open(u2); } catch (e) {}
           setTimeout(function () { try { URL.revokeObjectURL(u2); } catch (e) {} }, 60000);
-        }).catch(function () { open(url); }); // fetch failed → best-effort original
-        return true;
-      } catch (e) { return false; }
+        }).catch(function () {});
+      } catch (e) {}
+      return true;
     }
 
     // Global capture-phase interceptor: ANY converted extension that downloads via a
@@ -2733,11 +2748,12 @@ var __C2S_DEBUG__ = false;
           var url = opts.url || "";
           var id = seq++;
           var fname = opts.filename || (function () { try { return decodeURIComponent(url.split("/").pop().split("?")[0]) || "download"; } catch (e) { return "download"; } })();
+          var wentViaBlob = false;
           try {
             // blob:/data: → route through forceBlobDownload (WebKit navigates on a
-            // bare <a download> for these; octet-stream refetch makes it save).
+            // bare <a download> for these; window.open makes it save).
             if (/^(blob:|data:)/i.test(url) && forceBlobDownload(url, opts.filename)) {
-              // handled
+              wentViaBlob = true;
             } else if (typeof document !== "undefined" && document.body) {
               var a = document.createElement("a");
               a.href = url; if (opts.filename) a.download = opts.filename;
@@ -2764,6 +2780,18 @@ var __C2S_DEBUG__ = false;
             dlChanged._emit({ id: id, state: { previous: "in_progress", current: "complete" } });
           };
           setTimeout(complete, 0); // macrotask: let the caller await the id and register onChanged first
+          // A blob download via window.open needs the page to STAY ALIVE until WebKit
+          // has committed the download. The common popover pattern —
+          // `downloads.download(..., () => window.close())` — closes the page in the
+          // callback and aborts the in-flight download (live: CRX "Download as zip").
+          // Delay the id callback so window.close() runs only after the download has
+          // started. ~350ms is enough for WebKit to take over the blob; the popover
+          // just stays open a beat longer. Non-blob downloads keep the fast path.
+          if (wentViaBlob && typeof cb === "function") {
+            setTimeout(function () { try { cb(id); } catch (e) {} }, 350);
+            // Return the id for promise callers; the cb-delay covers the close race.
+            return typeof Promise !== "undefined" ? new Promise(function (res) { setTimeout(function () { res(id); }, 350); }) : id;
+          }
           return dual(id, cb);
         },
         search: function (q, cb) {

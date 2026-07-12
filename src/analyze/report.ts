@@ -29,6 +29,13 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
   const removedOptPerms = permList(before, "optional_permissions").filter((p) => !permList(after, "optional_permissions").includes(p));
   if (removedOptPerms.length) out.push(`Removed optional permission(s): ${removedOptPerms.map((p) => `\`${p}\``).join(", ")}.`);
 
+  for (const key of ["host_permissions", "optional_host_permissions"] as const) {
+    const beforeHosts = Array.isArray(before[key]) ? (before[key] as unknown[]).filter((p): p is string => typeof p === "string") : [];
+    const afterHosts = new Set(Array.isArray(after[key]) ? (after[key] as string[]) : []);
+    const removed = beforeHosts.filter((p) => !afterHosts.has(p));
+    if (removed.length) out.push(`Removed invalid \`${key}\` pattern(s): ${removed.map((p) => `\`${p}\``).join(", ")}.`);
+  }
+
   if (before.background?.persistent !== false && after.background?.persistent === false)
     out.push("Background made non-persistent (MV2 → Safari).");
   if (before.background?.type === "module" && after.background?.type === undefined)

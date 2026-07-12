@@ -308,7 +308,11 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
 
   // Same "Safari silently drops a malformed pattern" failure mode as content-script
   // matches, but for host access: a bad host_permission grants NO host access in
-  // Safari with no error. Validate both required and optional host lists.
+  // Safari with no error. Unlike content-script matches this is auto-fixable:
+  // some patterns here are valid CHROME manifests (ws://\wss:// for webRequest
+  // websocket interception — MetaMask ships them) that Safari simply can't grant,
+  // so transformManifest drops the invalid entries and the valid rest keeps
+  // working. Removal is behavior-identical to what Safari would do anyway.
   for (const key of ["host_permissions", "optional_host_permissions"] as const) {
     const hosts = Array.isArray(m[key]) ? (m[key] as unknown[]) : [];
     for (const pat of hosts) {
@@ -316,11 +320,12 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
       const err = matchPatternError(pat);
       if (err) {
         issues.push({
-          severity: "error",
+          severity: "warning",
           category: "permission",
-          message: `Invalid match pattern "${pat}" in ${key}: ${err}.`,
+          message: `Invalid match pattern "${pat}" in ${key} will be removed: ${err}.`,
           file: "manifest.json",
-          fix: "Safari grants no host access for a malformed pattern; correct or remove it.",
+          fix: "Safari grants no host access for this pattern (Chrome-only schemes like ws:// cannot be granted); the converter drops it so the remaining patterns still apply.",
+          autoFixed: true,
         });
       }
     }
@@ -809,6 +814,16 @@ export function transformManifest(
     if (!list.includes("declarativeNetRequest")) list.push("declarativeNetRequest");
   }
   if (Array.isArray(out.optional_permissions) && out.optional_permissions.length === 0) delete out.optional_permissions;
+
+  // Drop host patterns Safari's match-pattern parser rejects (ws://*/* etc. — valid
+  // in Chrome for webRequest websockets, ungrantable in Safari). Keeping them risks
+  // Safari discarding host access; removal matches analyzeManifest's auto-fix note.
+  for (const key of ["host_permissions", "optional_host_permissions"] as const) {
+    if (!Array.isArray(out[key])) continue;
+    const kept = (out[key] as unknown[]).filter((p) => typeof p !== "string" || matchPatternError(p) === null);
+    if (kept.length === 0) delete out[key];
+    else out[key] = kept as string[];
+  }
 
   const mv = out.manifest_version ?? 2;
   // Guard the type, not just truthiness: a hand-edited manifest can set background to
