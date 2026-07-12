@@ -237,15 +237,26 @@ function scanJsContent(content: string, rel: string, issues: Issue[], isServiceW
       break;
     }
   }
+  // A dynamic call that is webpack's worker chunk loader is handled: the converter
+  // pre-registers the bundle's async chunks in background.html (matching the
+  // webpackChunk global), so r.e() finds them loaded and never calls importScripts.
+  // Only a NON-webpack dynamic call still means dead code in the converted page.
+  const WEBPACK_CHUNK_GLOBAL_RE = /(?:globalThis|self|window)\s*(?:\.\s*webpackChunk[$\w]*|\[\s*["']webpackChunk[^"'\\]*["']\s*\])\s*=(?!=)/;
   if (isFirstAt !== -1) {
-    issues.push(isDynamicAt !== -1 ? {
+    issues.push(isDynamicAt !== -1 ? (WEBPACK_CHUNK_GLOBAL_RE.test(content) ? {
+      severity: "info",
+      category: "background",
+      message: "Dynamic importScripts() is webpack's worker chunk loader; the bundle's async chunks are pre-registered in background.html so chunk loading keeps working.",
+      file: rel,
+      line: lineAt(isDynamicAt),
+    } : {
       severity: "warning",
       category: "background",
       message: "importScripts() with a dynamic (non-literal) argument can't be hoisted; the imported code won't run in the converted background page.",
       file: rel,
       line: lineAt(isDynamicAt),
       fix: 'Replace the dynamic importScripts(expr) with static ES imports (import "./a.js";) at the top of the worker.',
-    } : {
+    }) : {
       severity: "info",
       category: "background",
       message: "importScripts() targets are auto-hoisted into background.html as classic scripts; the calls are neutralized.",

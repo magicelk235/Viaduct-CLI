@@ -1,12 +1,14 @@
 import { writeFileSync, readFileSync, readdirSync, copyFileSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, relative } from "node:path";
 import type { Manifest } from "../types.js";
 import { TEMPLATE_DIR, RUNTIME_DIR } from "../paths.js";
 import { resolveI18nString } from "../manifest/manifest.js";
+import { walkScripts } from "../input/stage.js";
 
 export const SHIM_FILENAME = "safari-compat-shim.js";
 export const POLYFILL_FILENAME = "browser-polyfill.min.js";
 export const BACKGROUND_PAGE_FILENAME = "background.html";
+export const SW_LIFECYCLE_FILENAME = "viaduct-sw-lifecycle.js";
 
 /**
  * Copy the bundled webextension-polyfill into the staged extension so Chrome code
@@ -148,15 +150,62 @@ function walkHtmlFiles(dir: string, acc: string[] = []): string[] {
  * the polyfill defines `browser`, then the shim patches missing chrome / browser
  * namespaces, all before bundle module-eval.
  */
+const COLOR_SCHEME_MARKER = "c2s-color-scheme";
+
+/**
+ * Does the page (or the stylesheets it links from the same staged dir) handle dark
+ * mode itself? A page that declares `color-scheme` or has any `prefers-color-scheme`
+ * media query is theme-aware and must be left alone. Everything else is a
+ * light-only page: Chrome renders extension pages light regardless of the OS theme,
+ * but Safari honors the OS dark mode — so a light-only page gets a dark default text
+ * color over its explicit `background:white` islands and goes white-on-white (live:
+ * "Chrome extension source viewer" file list is invisible in Safari dark mode).
+ */
+function pageHandlesDarkMode(dir: string, htmlFile: string, html: string): boolean {
+  const declaresTheme = (css: string): boolean =>
+    /prefers-color-scheme/i.test(css) || /\bcolor-scheme\s*:/i.test(css);
+  if (declaresTheme(html)) return true;
+  // Also honor a <meta name="color-scheme"> the page already ships.
+  if (/<meta[^>]+name\s*=\s*["']color-scheme["']/i.test(html)) return true;
+  // Read every same-dir stylesheet the page links (skip absolute/remote hrefs).
+  const linkRe = /<link\b[^>]*\brel\s*=\s*["']?stylesheet["']?[^>]*>/gi;
+  const hrefRe = /\bhref\s*=\s*["']([^"']+)["']/i;
+  let m: RegExpExecArray | null;
+  while ((m = linkRe.exec(html)) !== null) {
+    const href = hrefRe.exec(m[0])?.[1];
+    if (!href || /^(https?:)?\/\//i.test(href) || href.startsWith("data:")) continue;
+    const cssPath = join(dirname(htmlFile), href.split("?")[0].split("#")[0]);
+    try {
+      if (declaresTheme(readFileSync(cssPath, "utf-8"))) return true;
+    } catch {
+      /* missing stylesheet → ignore */
+    }
+  }
+  return false;
+}
+
 export function injectShimIntoHtmlPages(dir: string, polyfillFile?: string): number {
   const shimTag = `<script src="/${SHIM_FILENAME}"></script>`;
   const polyTag = polyfillFile ? `<script src="/${polyfillFile}"></script>` : "";
   let count = 0;
   for (const file of walkHtmlFiles(dir)) {
     let html = readFileSync(file, "utf-8");
-    // Insert only the missing tag(s) so a partial prior injection (either tag)
+    // A light-only page needs Chrome's light rendering. `color-scheme:light` alone
+    // is not enough: Safari sets the scheme but leaves the canvas transparent and
+    // the DEFAULT text color light, so a page that never set its own body
+    // background/color (it relied on Chrome's white default) ends up white text on a
+    // transparent body over Safari's dark window — invisible, with transparent panes
+    // showing through as black (live: crxviewer source pane). Chrome's UA default for
+    // an extension page is white bg + black text; replicate it, but only as a FLOOR
+    // (no !important) so any explicit color the page's own CSS sets still wins.
+    // Theme-aware pages are detected and left untouched.
+    const csTag =
+      !html.includes(COLOR_SCHEME_MARKER) && !pageHandlesDarkMode(dir, file, html)
+        ? `<style id="${COLOR_SCHEME_MARKER}">:root{color-scheme:light;}html,body{background-color:#fff;color:#000;}</style>`
+        : "";
+    // Insert only the missing tag(s) so a partial prior injection (any tag)
     // never produces duplicates. Polyfill stays before the shim.
-    const missing = [polyTag, shimTag].filter((t) => t && !html.includes(t));
+    const missing = [polyTag, shimTag, csTag].filter((t) => t && !html.includes(t));
     if (missing.length === 0) continue;
     const toInsert = missing.join("\n    ");
     const at = headInsertIndex(html);
@@ -257,7 +306,31 @@ export function convertServiceWorkerToBackgroundPage(dir: string, manifest: Mani
   // files are self-contained IIFEs that just need to run in global scope first —
   // exactly what a prior <script> tag gives), then neutralize the calls in the SW
   // so the now-undefined global is never invoked. CSP-safe and generic.
-  const importTags = hoistImportScripts(dir, sw);
+  const hoist = hoistImportScripts(dir, sw);
+  const importTags = hoist.tags;
+
+  // A dynamic-arg importScripts (webpack worker builds: importScripts(r.p+r.u(id)))
+  // can't be hoisted — after neutralization the async chunks would simply never
+  // load and the bundle dies mid-boot (MetaMask). Pre-register the chunks instead:
+  // load every pure chunk-push file AFTER the SW module. Deferred classic scripts
+  // and module scripts share one in-order execution queue, so each chunk pushes
+  // through the runtime's wrapped webpackChunk.push and marks itself loaded before
+  // DOMContentLoaded — by the time the SW's install handler asks for a chunk, the
+  // runtime sees it registered and the neutralized importScripts is never reached.
+  const chunkFiles = hoist.dynamic ? collectWebpackChunks(dir, sw, hoist.hoisted) : [];
+  const chunkTags = chunkFiles.length
+    ? chunkFiles.map((rel) => `<script defer src="${rel}"></script>`).join("\n") + "\n"
+    : "";
+
+  // SW-lifecycle emulation (self.serviceWorker state machine + synthetic
+  // install/activate) — must be the FIRST script so the surface exists before
+  // anything evaluates. See src/templates/viaduct-sw-lifecycle.js for why.
+  let lifecycleTag = "";
+  const lifecycleTemplate = join(TEMPLATE_DIR, SW_LIFECYCLE_FILENAME);
+  if (existsSync(lifecycleTemplate)) {
+    copyFileSync(lifecycleTemplate, join(dir, SW_LIFECYCLE_FILENAME));
+    lifecycleTag = `<script src="${SW_LIFECYCLE_FILENAME}"></script>\n`;
+  }
 
   // The OAuth bridge's onMessageExternal capture must install BEFORE any hoisted
   // importScripts chunk runs — SW-loader bundles register their listeners inside
@@ -279,8 +352,8 @@ export function convertServiceWorkerToBackgroundPage(dir: string, manifest: Mani
   const html = `<!DOCTYPE html>
 <meta charset="utf-8">
 <title>${title} background</title>
-${polyTag}${shimTag}${idPolyTag}${importTags}<script type="module" src="${sw}"></script>
-`;
+${lifecycleTag}${polyTag}${shimTag}${idPolyTag}${importTags}<script type="module" src="${sw}"></script>
+${chunkTags}`;
   writeFileSync(join(dir, BACKGROUND_PAGE_FILENAME), html, "utf-8");
   // MV3 (Safari) rejects persistent background: "A manifest_version >= 3 must be non-persistent."
   manifest.background = { page: BACKGROUND_PAGE_FILENAME, persistent: false };
@@ -297,32 +370,50 @@ ${polyTag}${shimTag}${idPolyTag}${importTags}<script type="module" src="${sw}"><
  * Returns "" when there are no resolvable importScripts calls.
  */
 /**
- * Given the index of an opening "(" in `src`, return the index just PAST its
- * matching ")", honoring nested parens and skipping string literals (', ", `)
- * and // and / * * / comments so their parens/quotes don't throw off the count.
- * Returns -1 if no balanced close is found. Template-literal `${}` expressions
- * are tracked so a ")" inside an interpolation still counts.
+ * Lexing walk shared by matchBalancedParen and pushArrayElementCount so the two
+ * can never disagree about what is code. Invokes onCode(c, i) for every character
+ * outside string/template/comment/regex content. Template literals get full
+ * `${…}` handling: interpolations re-enter code mode, nested templates included —
+ * the old "skip to the next backtick" approach turned everything after an inner
+ * template into mislexed noise (MetaMask's 1MB chunk 6078 nests templates two
+ * deep and was wrongly rejected by the chunk collector because of it).
+ * Returns the index where onCode returned true, else -1 (end of input reached,
+ * or an unterminated construct).
  */
-export function matchBalancedParen(src: string, open: number): number {
-  let depth = 0;
-  // Last non-whitespace char seen, to disambiguate `/` as regex-start vs division.
-  let prev = "";
-  for (let i = open; i < src.length; i++) {
+function walkCode(src: string, start: number, onCode: (c: string, i: number) => boolean): number {
+  // Context stack: "T" = inside template-literal text; a number = inside a `${}`
+  // interpolation, holding its open-brace count so the matching "}" hands control
+  // back to the surrounding template text instead of being reported as code.
+  const stack: Array<"T" | number> = [];
+  for (let i = start; i < src.length; i++) {
     const c = src[i];
-    if (c === "(") depth++;
-    else if (c === ")") {
-      depth--;
-      if (depth === 0) return i + 1;
-    } else if (c === '"' || c === "'" || c === "`") {
+    const top = stack.length ? stack[stack.length - 1] : undefined;
+    if (top === "T") {
+      if (c === "\\") { i++; continue; }
+      if (c === "`") { stack.pop(); continue; }
+      if (c === "$" && src[i + 1] === "{") { stack.push(0); i++; continue; }
+      continue;
+    }
+    if (c === "`") { stack.push("T"); continue; }
+    if (typeof top === "number") {
+      if (c === "}") {
+        if (top === 0) { stack.pop(); continue; } // closes the ${ — resume template text
+        stack[stack.length - 1] = top - 1;
+      } else if (c === "{") {
+        stack[stack.length - 1] = top + 1;
+      }
+    }
+    if (c === '"' || c === "'") {
       // skip the string literal
-      const quote = c;
       i++;
       while (i < src.length) {
         if (src[i] === "\\") { i += 2; continue; }
-        if (src[i] === quote) break;
+        if (src[i] === c) break;
         i++;
       }
-    } else if (c === "/" && (src[i + 1] === "/" || src[i + 1] === "*")) {
+      continue;
+    }
+    if (c === "/" && (src[i + 1] === "/" || src[i + 1] === "*")) {
       // Always a comment: a regex literal's first body char can never be `/` or `*`
       // (RegularExpressionFirstChar excludes both — even /[/*]/ starts with `[`), so
       // `//` and `/*` are unconditionally comments regardless of expression position.
@@ -335,22 +426,68 @@ export function matchBalancedParen(src: string, open: number): number {
         if (close < 0) return -1;
         i = close + 1;
       }
-    } else if (c === "/" && startsRegex(prev)) {
+      continue;
+    }
+    if (c === "/" && startsRegexAt(src, i, start)) {
       // A regex literal whose body doesn't start with `/`/`*` (e.g. /\//, /a-z/).
       i = skipRegex(src, i);
       if (i < 0) return -1;
+      continue;
     }
-    if (c !== " " && c !== "\t" && c !== "\n" && c !== "\r") prev = c;
+    if (onCode(c, i)) return i;
   }
   return -1;
 }
 
-// Does a `/` at the current position begin a regex literal (vs division)? A regex
-// starts when the previous significant char is empty (start) or anything that can't
-// end a value — operators, openers, commas, etc. Conservative: when unsure, treats
-// `/` as division (the pre-existing behavior).
-function startsRegex(prev: string): boolean {
-  return prev === "" || "(,=:[!&|?{};+-*%^~<>".indexOf(prev) >= 0;
+/**
+ * Given the index of an opening "(" in `src`, return the index just PAST its
+ * matching ")", honoring nested parens and skipping string/template/comment/regex
+ * content (see walkCode). Returns -1 if no balanced close is found. A ")" inside
+ * a template interpolation still counts — interpolations are code.
+ */
+export function matchBalancedParen(src: string, open: number): number {
+  let depth = 0;
+  const at = walkCode(src, open, (c) => {
+    if (c === "(") depth++;
+    else if (c === ")") {
+      depth--;
+      if (depth === 0) return true;
+    }
+    return false;
+  });
+  return at < 0 ? -1 : at + 1;
+}
+
+// Keywords a regex literal can directly follow (`return/,/.test(x)` is how terser
+// emits it). An identifier ending just before the `/` that ISN'T one of these means
+// division (`n / 2`).
+const REGEX_PRECEDING_KEYWORDS = new Set([
+  "return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw",
+  "case", "do", "else", "yield", "await",
+]);
+
+// Does the `/` at src[slashIdx] begin a regex literal (vs division)? Looks back at
+// the previous significant char: operators/openers/commas can't end a value, so a
+// regex follows; an identifier char means division UNLESS the whole word is a
+// keyword like `return`. Conservative: when unsure, treats `/` as division.
+function startsRegexAt(src: string, slashIdx: number, floor: number): boolean {
+  let j = slashIdx - 1;
+  while (j >= floor && (src[j] === " " || src[j] === "\t" || src[j] === "\n" || src[j] === "\r")) j--;
+  if (j < floor) return true; // expression start
+  const c = src[j];
+  if ("(,=:[!&|?{};+-*%^~<>".indexOf(c) >= 0) return true;
+  if (/[A-Za-z0-9_$]/.test(c)) {
+    let k = j;
+    while (k >= floor && /[A-Za-z0-9_$]/.test(src[k])) k--;
+    // A word matching a keyword is only the keyword when it's NOT a member name:
+    // `o.return / 2` is division (property `return`), not `return /regex/`. Look
+    // past whitespace before the word — a `.` (dot or `?.`) means member access.
+    let d = k;
+    while (d >= floor && (src[d] === " " || src[d] === "\t" || src[d] === "\n" || src[d] === "\r")) d--;
+    if (src[d] === ".") return false;
+    return REGEX_PRECEDING_KEYWORDS.has(src.slice(k + 1, j + 1));
+  }
+  return false;
 }
 
 // Given index `start` at the opening `/` of a regex literal, return the index of its
@@ -369,31 +506,85 @@ function skipRegex(src: string, start: number): number {
   return -1;
 }
 
-function hoistImportScripts(dir: string, swPath: string): string {
-  const swFile = join(dir, swPath);
-  let src: string;
-  try {
-    src = readFileSync(swFile, "utf-8");
-  } catch {
-    return "";
-  }
-  if (!/\bimportScripts\s*\(/.test(src)) return "";
+interface HoistResult {
+  /** <script> tags for the resolved string-literal targets, "" when none. */
+  tags: string;
+  /** Root-relative paths of the hoisted files (so chunk collection can skip them). */
+  hoisted: Set<string>;
+  /** True when at least one call had a non-literal argument — those targets are
+   *  unknowable at staging time, so the caller pre-registers webpack chunks. */
+  dynamic: boolean;
+}
 
+function hoistImportScripts(dir: string, swPath: string): HoistResult {
+  const none: HoistResult = { tags: "", hoisted: new Set(), dynamic: false };
+  const swFile = join(dir, swPath);
+  if (!existsSync(swFile)) return none;
+
+  // Hoisted files can THEMSELVES call importScripts (a lib pulled in by the SW
+  // pulling in its own dep), so neutralize + hoist depth-first: a file's targets
+  // are tagged before the file, matching "the import has run by the time the
+  // importer's later code executes". Per spec, importScripts resolves every URL
+  // against the worker's own location — i.e. the SW's dir — not the importing
+  // file's dir, so one resolve base serves the whole tree. `seen` doubles as the
+  // cycle guard. Neutralizing EVERY call in every hoisted file also means no page
+  // ever needs a runtime importScripts stub — defining one would break the
+  // standard `typeof importScripts === "function"` worker-detection idiom
+  // (crxviewer's Prism glue clobbers its own page-loaded Prism when that check
+  // lies).
   const swDir = dirname(swPath); // e.g. "service-worker"
   const tags: string[] = [];
   const seen = new Set<string>();
+  let dynamic = false;
+
+  const hoistFile = (rootRel: string): void => {
+    const res = neutralizeImportScripts(dir, rootRel, swDir);
+    if (res.dynamic) dynamic = true;
+    for (const target of res.targets) {
+      if (seen.has(target)) continue;
+      seen.add(target);
+      hoistFile(target);
+      tags.push(`<script src="${target}"></script>`);
+    }
+  };
+  hoistFile(swPath);
+
+  return { tags: tags.length ? tags.join("\n") + "\n" : "", hoisted: seen, dynamic };
+}
+
+/**
+ * Replace every importScripts(...) call in ONE file with a void-0 no-op and
+ * return the resolvable string-literal targets (root-relative, existing on disk)
+ * plus whether any call had a runtime-computed argument.
+ */
+function neutralizeImportScripts(dir: string, rootRel: string, resolveDir: string): { targets: string[]; dynamic: boolean } {
+  const filePath = join(dir, rootRel);
+  let src: string;
+  try {
+    src = readFileSync(filePath, "utf-8");
+  } catch {
+    return { targets: [], dynamic: false };
+  }
+  if (!/\bimportScripts\s*\(/.test(src)) return { targets: [], dynamic: false };
+
+  const targets: string[] = [];
+  let dynamic = false;
   // Find each importScripts( ... ) call and its argument list. A regex with
   // [^)]* truncates at the FIRST ")", which is wrong when an argument itself
   // contains parens — e.g. webpack's `importScripts(o.p+o.u(t))`. That left the
   // outer ")" dangling after the no-op replacement and broke the bundle with a
   // SyntaxError. Scan for the balanced closing paren instead (string-literal and
   // comment aware), so the WHOLE call is replaced regardless of nesting.
-  // Also consume an optional `<receiver>.` prefix (self./globalThis./window./this.)
-  // so the whole member-call `self.importScripts(...)` — the idiomatic Workbox /
-  // TS-WebWorker form — is replaced as one span. Matching only `importScripts(`
-  // (\b sits between the "." and "i") would leave the receiver behind and emit the
-  // syntax error `self.void 0`, breaking the entire background module.
-  const callOpenRe = /(?:\b(?:self|globalThis|window|this)\s*\.\s*)?\bimportScripts\s*\(/g;
+  // Also consume an optional `<receiver>.` prefix so the whole member-call
+  // `self.importScripts(...)` — the idiomatic Workbox / TS-WebWorker form — is
+  // replaced as one span. Matching only `importScripts(` (\b sits between the "."
+  // and "i") would leave the receiver behind and emit the syntax error
+  // `self.void 0`, breaking the entire background module. The receiver isn't just
+  // the well-known globals: bundlers alias them (`var g=self; g.importScripts(…)`),
+  // so consume ANY member chain ending in `.importScripts(` — a leading identifier
+  // plus zero+ `.name` / `?.name` / `[...]` steps. A bare `importScripts(` (no
+  // receiver) still matches via the leading `\b`.
+  const callOpenRe = /(?:[A-Za-z_$][\w$]*(?:\s*(?:\?\.\s*[\w$]+|\.\s*[\w$]+|\[[^\]]*\]))*\s*(?:\?\.|\.)\s*)?\bimportScripts\s*\(/g;
   let neutralized = 0;
   let out = "";
   let last = 0;
@@ -403,16 +594,25 @@ function hoistImportScripts(dir: string, swPath: string): string {
     const end = matchBalancedParen(src, openParen); // index just past the ")"
     if (end < 0) continue; // unbalanced (shouldn't happen in valid JS) → leave as-is
     const argList = src.slice(openParen + 1, end - 1);
-    const argRe = /["']([^"']+)["']/g;
+    // Anything left after stripping STATIC literals and separators means an
+    // argument is computed at runtime (`o.p+o.u(t)`, a variable, an interpolated
+    // template) — the target can't be hoisted here. Strip "…"/'…' and only
+    // interpolation-free templates: a `${…}` template must NOT be stripped or its
+    // runtime value would masquerade as a static string and go undetected — the
+    // remaining `${…}` keeps the residue non-empty, correctly marking it dynamic.
+    const stripStatics = /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`$\\]|\$(?!\{))*`/g;
+    if (argList.replace(stripStatics, "").replace(/[\s,]/g, "") !== "") dynamic = true;
+    // Extract string OR interpolation-free template targets (`a.js`). A backtick
+    // with `${}` stays dynamic above, so only static templates reach here as
+    // hoistable literals (the `$(?!\{)` lets a literal `$` in a filename through).
+    const argRe = /"([^"]+)"|'([^']+)'|`((?:[^`$\\]|\$(?!\{))+)`/g;
     let m: RegExpExecArray | null;
     while ((m = argRe.exec(argList))) {
-      const rawPath = m[1];
-      // Resolve relative to the SW dir → a path from the extension root.
-      const fromRoot = join(swDir, rawPath).split("\\").join("/");
-      if (seen.has(fromRoot)) continue;
-      if (!existsSync(join(dir, fromRoot))) continue; // unresolved → skip the tag; no-op still applies
-      seen.add(fromRoot);
-      tags.push(`<script src="${fromRoot}"></script>`);
+      const literal = m[1] ?? m[2] ?? m[3]; // "…" | '…' | `…`
+      // Resolve relative to the worker's dir → a path from the extension root.
+      const fromRoot = join(resolveDir, literal).split("\\").join("/");
+      // Unresolved → skip the tag; the no-op replacement still applies.
+      if (existsSync(join(dir, fromRoot))) targets.push(fromRoot);
     }
     out += src.slice(last, mm.index) + "void 0 /* importScripts hoisted to background.html */";
     last = end;
@@ -420,10 +620,96 @@ function hoistImportScripts(dir: string, swPath: string): string {
     callOpenRe.lastIndex = end; // continue scanning after the full call
   }
   out += src.slice(last);
-  src = out;
 
   // Write whenever ANY call was neutralized — even an unresolved target must be
   // de-fanged (it would throw on the undefined global), not just hoisted ones.
-  if (neutralized > 0) writeFileSync(swFile, src, "utf-8");
-  return tags.length ? tags.join("\n") + "\n" : "";
+  if (neutralized > 0) writeFileSync(filePath, out, "utf-8");
+  return { targets, dynamic };
+}
+
+// A pure webpack async chunk is a single statement:
+//   (globalThis.webpackChunkNAME = globalThis.webpackChunkNAME || []).push([[ids], {modules}]);
+// optionally preceded by a license banner / "use strict" and followed only by a
+// sourcemap pragma. Anything else before/after is real top-level code — that's an
+// entry script, not a registration, and must not be loaded into the background page.
+const CHUNK_PREFIX_RE = /^(?:\uFEFF|\s|;|["']use strict["'];?|\/\/[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*$/;
+const CHUNK_SUFFIX_RE = /^(?:\s|;|\/\/[#@][^\n]*(?:\n|$)|\/\*[#@][\s\S]*?\*\/)*$/;
+
+/**
+ * Find every webpack async chunk belonging to the SW's bundle: the SW declares a
+ * `webpackChunk*` loading global, and each chunk file starts with a push into that
+ * SAME global (different bundles in the extension use different globals or none).
+ * Only 2-element pushes ([chunkIds, modules]) qualify — a 3rd element is webpack's
+ * runtime/startup callback, which the wrapped push EXECUTES, so loading such a
+ * file would boot a foreign entry point inside the background page. Registration
+ * pushes only define modules; nothing runs until the SW require()s them.
+ * Returns root-relative paths, sorted for a deterministic background.html.
+ */
+function collectWebpackChunks(dir: string, swPath: string, hoisted: Set<string>): string[] {
+  let swSrc: string;
+  try {
+    swSrc = readFileSync(join(dir, swPath), "utf-8");
+  } catch {
+    return [];
+  }
+  // The chunk-loading global, dot or bracket form: globalThis.webpackChunkfoo = ...
+  const gm = /(?:globalThis|self|window)\s*(?:\.\s*(webpackChunk[$\w]*)|\[\s*["'](webpackChunk[^"'\\]*)["']\s*\])\s*=(?!=)/.exec(swSrc);
+  const name = gm && (gm[1] || gm[2]);
+  if (!name) return [];
+  const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const ref = `(?:globalThis|self|window)\\s*(?:\\.\\s*${esc}|\\[\\s*["']${esc}["']\\s*\\])`;
+  const pushRe = new RegExp(`\\(\\s*${ref}\\s*=\\s*${ref}\\s*\\|\\|\\s*\\[\\s*\\]\\s*\\)\\s*\\.push\\s*\\(`);
+
+  const chunks: string[] = [];
+  for (const abs of walkScripts(dir)) {
+    const rel = relative(dir, abs).split("\\").join("/");
+    if (rel === swPath || hoisted.has(rel)) continue;
+    let src: string;
+    try {
+      src = readFileSync(abs, "utf-8");
+    } catch {
+      continue;
+    }
+    // Scan the whole file, not a fixed head window: a chunk push is a single
+    // top-level statement, but a third-party-license banner can run to many KB and
+    // shove it well past any fixed offset (LicenseWebpackPlugin headers routinely
+    // exceed 4KB), so a windowed search silently drops the chunk. The push must
+    // still be the FIRST real statement — CHUNK_PREFIX_RE below rejects a match
+    // with any real code before it, so a mid-file coincidental push never qualifies.
+    const m = pushRe.exec(src);
+    if (!m || !CHUNK_PREFIX_RE.test(src.slice(0, m.index))) continue;
+    const open = m.index + m[0].length - 1; // the push's "("
+    const end = matchBalancedParen(src, open);
+    if (end < 0) continue;
+    if (pushArrayElementCount(src.slice(open + 1, end - 1)) !== 2) continue;
+    if (!CHUNK_SUFFIX_RE.test(src.slice(end))) continue;
+    chunks.push(rel);
+  }
+  return chunks.sort();
+}
+
+/**
+ * Given the text between push( and ), verify it is a single array literal and
+ * count its top-level elements. Shares walkCode's lexing with matchBalancedParen,
+ * tracking all bracket kinds so a comma only counts at the array's own level.
+ * Returns -1 when the text isn't one bare array literal.
+ */
+export function pushArrayElementCount(s: string): number {
+  let start = 0;
+  while (start < s.length && /\s/.test(s[start])) start++;
+  if (s[start] !== "[") return -1;
+  let depth = 0;
+  let count = 1;
+  const at = walkCode(s, start, (c) => {
+    if (c === "[" || c === "(" || c === "{") depth++;
+    else if (c === "]" || c === ")" || c === "}") {
+      depth--;
+      if (depth === 0) return true; // closed the outer array
+    } else if (c === "," && depth === 1) count++;
+    return false;
+  });
+  if (at < 0) return -1;
+  // Only trailing whitespace may follow the outer array.
+  for (let j = at + 1; j < s.length; j++) if (!/\s/.test(s[j])) return -1;
+  return count;
 }
