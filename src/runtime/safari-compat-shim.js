@@ -2645,43 +2645,68 @@ var __C2S_DEBUG__ = false;
     // (a non-renderable type WebKit commits to disk instead of displaying), and click
     // a fresh same-gesture anchor at the new URL. Returns true if it kicked off the
     // download path, false if it couldn't (caller keeps default behavior).
+    // Derive a sensible download filename from an explicit hint or the URL tail.
+    function deriveDlName(hint, url) {
+      var n = hint;
+      if (!n) {
+        try { n = decodeURIComponent(String(url).split(/[?#]/)[0].split("/").pop() || ""); } catch (e) { n = ""; }
+      }
+      // blob:/data: tails are UUIDs, not names — don't use them.
+      if (!n || /^[0-9a-f-]{16,}$/i.test(n)) n = "download";
+      return n;
+    }
+
     function forceBlobDownload(url, filename) {
       if (typeof window === "undefined") return false;
       if (!/^(blob:|data:)/i.test(url)) return false;
       // WebKit ignores the <a download> attribute for blob:/data: URLs in an extension
-      // page (proven live: every anchor/iframe method navigates or no-ops). The ONE
-      // method that saves to disk is a TOP-LEVEL navigation to the URL — WebKit's
-      // downloader takes over for a non-renderable type. The saved name is derived by
-      // WebKit (can't be set from JS for a blob URL; lands as "Unknown"), the accepted
-      // trade-off: a working download beats a blank page.
+      // page (proven live: every anchor/iframe method navigates or no-ops). Two ways
+      // to actually save the bytes, chosen by whether we can preserve the filename:
       //
-      // Observed live in Safari:
-      //  - window.open(blobUrl) IS the only thing that starts a download: WebKit's
-      //    top-level downloader takes over a non-renderable blob. It returns null in
-      //    a popover (reported as blocked) but STILL downloads — so ignore the return.
-      //  - chrome.tabs.create(blobUrl) NAVIGATES a real tab to the blob instead of
-      //    downloading (blank safari-web-extension://…/<uuid> page). Do NOT use it.
-      //  - The CRX "Download as zip" button (a popover) calls window.close() right
-      //    after the download call, so the open MUST be synchronous in the gesture —
-      //    an async fetch-then-open loses the race. Most export blobs are already a
-      //    non-renderable type (application/zip, octet-stream, the crx bytes), so the
-      //    original URL downloads directly; no refetch needed on the common path.
-      try { window.open(url); } catch (e) {}
-      // Belt-and-suspenders for a RENDERABLE blob type (would show inline instead of
-      // download): refetch → octet-stream and open that too. Async, so it only helps
-      // pages that stay open; the popover case is already handled by the sync open.
+      //  A. navigator.share({files:[File]}) — the ONLY method that keeps the real
+      //     filename (WebKit derives blob-download names itself otherwise, always
+      //     "Unknown"). Opens the macOS share sheet with the named file; the user
+      //     picks "Save to Files"/AirDrop/etc. Gated on canShare (Safari desktop
+      //     supports file sharing). Async (needs the bytes), but the share sheet is
+      //     the whole UI so a popover staying open 350ms — see the chrome.downloads
+      //     callback delay — is enough for it to appear.
+      //  B. window.open(blobUrl) — WebKit's top-level downloader takes a
+      //     non-renderable blob straight to disk. Names it "Unknown", but needs no
+      //     bytes and fires synchronously in the gesture. The reliable fallback when
+      //     sharing is unavailable or the blob can't be fetched.
+      //
+      // NOT usable (proven live): <a download> (navigates), chrome.tabs.create
+      // (navigates to a blank blob page), ?filename= query (WebKitBlobResource error).
+      var name = deriveDlName(filename, url);
+      var canShareFiles = false;
       try {
-        fetch(url).then(function (r) {
-          var ct = (r.headers && r.headers.get && r.headers.get("content-type")) || "";
-          if (/octet-stream|zip|x-chrome/i.test(ct)) return null; // sync open sufficed
-          return r.blob();
-        }).then(function (b) {
-          if (!b) return;
-          var u2 = URL.createObjectURL(new Blob([b], { type: "application/octet-stream" }));
-          try { window.open(u2); } catch (e) {}
-          setTimeout(function () { try { URL.revokeObjectURL(u2); } catch (e) {} }, 60000);
-        }).catch(function () {});
+        canShareFiles = typeof navigator !== "undefined" &&
+          typeof navigator.share === "function" &&
+          typeof navigator.canShare === "function";
       } catch (e) {}
+
+      if (canShareFiles) {
+        // Try the name-preserving share path. If anything fails (fetch error, user
+        // dismisses, canShare rejects the file), fall back to window.open so the
+        // download still happens — just unnamed.
+        var shared = false;
+        try {
+          fetch(url).then(function (r) { return r.blob(); }).then(function (b) {
+            var file = new File([b], name, { type: b.type || "application/octet-stream" });
+            if (!navigator.canShare || !navigator.canShare({ files: [file] })) throw new Error("cannot share files");
+            shared = true;
+            return navigator.share({ files: [file] });
+          }).catch(function () {
+            // Sharing not possible or was declined AFTER we committed to it — only
+            // fall back when we never actually opened the sheet (avoids a double
+            // download when the user just cancels the share).
+            if (!shared) { try { window.open(url); } catch (e) {} }
+          });
+          return true;
+        } catch (e) { /* fall through to window.open */ }
+      }
+      // No file-sharing → reliable unnamed download.
+      try { window.open(url); } catch (e) {}
       return true;
     }
 
