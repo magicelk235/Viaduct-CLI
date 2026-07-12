@@ -2645,68 +2645,56 @@ var __C2S_DEBUG__ = false;
     // (a non-renderable type WebKit commits to disk instead of displaying), and click
     // a fresh same-gesture anchor at the new URL. Returns true if it kicked off the
     // download path, false if it couldn't (caller keeps default behavior).
-    // Derive a sensible download filename from an explicit hint or the URL tail.
-    function deriveDlName(hint, url) {
-      var n = hint;
-      if (!n) {
-        try { n = decodeURIComponent(String(url).split(/[?#]/)[0].split("/").pop() || ""); } catch (e) { n = ""; }
-      }
-      // blob:/data: tails are UUIDs, not names — don't use them.
-      if (!n || /^[0-9a-f-]{16,}$/i.test(n)) n = "download";
-      return n;
+    // Map a filename extension → a MIME type WebKit associates with it. WebKit names
+    // a window.open blob download "Unknown", but it appends an extension DERIVED FROM
+    // THE BLOB'S MIME TYPE (proven live: application/zip → .zip, octet-stream → no
+    // ext). So re-typing the blob to match the intended filename's extension is how
+    // we control the suffix. Covers the common export types; unknown extensions fall
+    // back to octet-stream (no suffix, same as today).
+    var C2S_EXT_MIME = {
+      zip: "application/zip", crx: "application/x-chrome-extension", xpi: "application/x-xpinstall",
+      json: "application/json", txt: "text/plain", csv: "text/csv", pdf: "application/pdf",
+      png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", svg: "image/svg+xml",
+      html: "text/html", htm: "text/html", js: "text/javascript", css: "text/css", xml: "application/xml",
+      md: "text/markdown", tar: "application/x-tar", gz: "application/gzip",
+    };
+    function c2sMimeForName(name) {
+      var m = /\.([a-z0-9]+)$/i.exec(String(name || ""));
+      var ext = m ? m[1].toLowerCase() : "";
+      return C2S_EXT_MIME[ext] || "";
     }
 
     function forceBlobDownload(url, filename) {
       if (typeof window === "undefined") return false;
       if (!/^(blob:|data:)/i.test(url)) return false;
       // WebKit ignores the <a download> attribute for blob:/data: URLs in an extension
-      // page (proven live: every anchor/iframe method navigates or no-ops). Two ways
-      // to actually save the bytes, chosen by whether we can preserve the filename:
+      // page (proven live: every anchor/iframe/tabs.create method navigates or no-ops).
+      // The ONE thing that saves the bytes straight to ~/Downloads is a top-level
+      // navigation to the URL — WebKit's downloader takes over a non-renderable blob.
+      // One-click, exactly like Chrome. WebKit derives the base name from the blob
+      // URL's UUID ("Unknown"; the base name can't be set from JS for a blob in an
+      // extension page — navigator.share can, but only via the multi-step share sheet,
+      // worse UX than a rename), and derives the EXTENSION from the blob's MIME type.
       //
-      //  A. navigator.share({files:[File]}) — the ONLY method that keeps the real
-      //     filename (WebKit derives blob-download names itself otherwise, always
-      //     "Unknown"). Opens the macOS share sheet with the named file; the user
-      //     picks "Save to Files"/AirDrop/etc. Gated on canShare (Safari desktop
-      //     supports file sharing). Async (needs the bytes), but the share sheet is
-      //     the whole UI so a popover staying open 350ms — see the chrome.downloads
-      //     callback delay — is enough for it to appear.
-      //  B. window.open(blobUrl) — WebKit's top-level downloader takes a
-      //     non-renderable blob straight to disk. Names it "Unknown", but needs no
-      //     bytes and fires synchronously in the gesture. The reliable fallback when
-      //     sharing is unavailable or the blob can't be fetched.
-      //
-      // NOT usable (proven live): <a download> (navigates), chrome.tabs.create
-      // (navigates to a blank blob page), ?filename= query (WebKitBlobResource error).
-      var name = deriveDlName(filename, url);
-      var canShareFiles = false;
-      try {
-        canShareFiles = typeof navigator !== "undefined" &&
-          typeof navigator.share === "function" &&
-          typeof navigator.canShare === "function";
-      } catch (e) {}
-
-      if (canShareFiles) {
-        // Try the name-preserving share path. If anything fails (fetch error, user
-        // dismisses, canShare rejects the file), fall back to window.open so the
-        // download still happens — just unnamed.
-        var shared = false;
-        try {
-          fetch(url).then(function (r) { return r.blob(); }).then(function (b) {
-            var file = new File([b], name, { type: b.type || "application/octet-stream" });
-            if (!navigator.canShare || !navigator.canShare({ files: [file] })) throw new Error("cannot share files");
-            shared = true;
-            return navigator.share({ files: [file] });
-          }).catch(function () {
-            // Sharing not possible or was declined AFTER we committed to it — only
-            // fall back when we never actually opened the sheet (avoids a double
-            // download when the user just cancels the share).
-            if (!shared) { try { window.open(url); } catch (e) {} }
-          });
-          return true;
-        } catch (e) { /* fall through to window.open */ }
+      // Two paths, never both (a double open = a double download):
+      //  - No usable filename extension → just open the original URL synchronously.
+      //  - Known extension → refetch, re-type the blob so WebKit appends the right
+      //    suffix, and open THAT. fetch→window.open still downloads (proven live) and
+      //    the popover's close is deferred ~350ms by the chrome.downloads wrapper, so
+      //    the async open lands in time. On any fetch error, fall back to the plain
+      //    open so a download still happens.
+      var wantMime = c2sMimeForName(filename);
+      if (!wantMime) {
+        try { window.open(url); } catch (e) {}
+        return true;
       }
-      // No file-sharing → reliable unnamed download.
-      try { window.open(url); } catch (e) {}
+      try {
+        fetch(url).then(function (r) { return r.blob(); }).then(function (b) {
+          var u2 = URL.createObjectURL(new Blob([b], { type: wantMime }));
+          try { window.open(u2); } catch (e) {}
+          setTimeout(function () { try { URL.revokeObjectURL(u2); } catch (e) {} }, 60000);
+        }).catch(function () { try { window.open(url); } catch (e) {} });
+      } catch (e) { try { window.open(url); } catch (e2) {} }
       return true;
     }
 
