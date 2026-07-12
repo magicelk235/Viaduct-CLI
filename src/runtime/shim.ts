@@ -258,9 +258,16 @@ export function injectPopupSizing(dir: string, popupFile: string, fullHeight = f
   // sliver. Give html/body an explicit large height so the app's % layout fills.
   // Use !important on height ONLY (the collapse is the bug); width still follows
   // the app. This is gated to side-panel pages, so normal popups are untouched.
+  // The min-* values are a FLOOR (no !important) to stop an empty-at-load popup
+  // collapsing to nothing — NOT a target size. Keep them small: a popup WITH content
+  // (e.g. CRX Viewer's two buttons, ~250px) sizes to its content and must not be
+  // inflated with empty space. Too-large floors (the old 320x160) padded compact
+  // popups; a modest width floor + fit-content height lets content-sized popups stay
+  // tight while still rescuing a genuinely empty body. `width:fit-content` makes the
+  // body shrink-wrap its content in Safari's over-wide popover so there's no slack.
   const sizeFloor = fullHeight
     ? `html,body{margin:0!important;height:600px!important;min-width:380px;}`
-    : `html,body{margin:0!important;}body{min-width:320px;min-height:160px;}`;
+    : `html,body{margin:0!important;}body{min-width:180px;width:-webkit-fit-content;width:fit-content;}`;
   // Anchor a flex `:root` to the start. uBlock makes `<html>` a flex container with
   // `justify-content:flex-end` (popup-fenix.css `:root.desktop`) and relies on Chrome
   // sizing the popover to the exact body width so flex-end never has slack to act on.

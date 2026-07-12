@@ -2265,6 +2265,29 @@ var __C2S_DEBUG__ = false;
       wrapActionSetter("setTitle");
       wrapActionSetter("setIcon");
 
+      // Neutralize action.disable() when the extension drives button visibility via
+      // declarativeContent ShowAction rules (flagged in the declarativeContent stub).
+      // Those rules never fire on Safari, so a global disable() would leave the button
+      // permanently greyed/unclickable (live: CRX Viewer disables the action and
+      // relies on onPageChanged rules to re-show it). Keeping it enabled matches
+      // Chrome's effective "visible on matching pages" far better than "always off";
+      // on non-matching pages the popup just shows its enter-a-URL form. The wrap is a
+      // no-op for extensions that don't use declarativeContent visibility control, so
+      // legitimate disables still work.
+      if (typeof chrome.action.disable === "function" && !chrome.action.__c2s_disable) {
+        var __nativeDisable = chrome.action.disable;
+        chrome.action.__c2s_disable = true;
+        chrome.action.disable = function (tabId, cb) {
+          if (self.__c2sDeclarativeShowAction) {
+            // Skip the global disable; keep the button clickable. Honor the callback.
+            var done = (typeof tabId === "function") ? tabId : cb;
+            if (typeof done === "function") { try { done(); } catch (e) {} return; }
+            return typeof Promise !== "undefined" ? Promise.resolve() : undefined;
+          }
+          return __nativeDisable.apply(chrome.action, arguments);
+        };
+      }
+
       // Chrome-only chrome.action methods Safari does not expose. UrbanVPN awaits
       // setBadgeTextColor inside its badge-update flow; an undefined method throws "is
       // not a function" and rejects the whole flow. Backfill inert dual stubs (Safari
@@ -3410,9 +3433,13 @@ var __C2S_DEBUG__ = false;
     // chrome.declarativeContent — bundles construct matchers at module-eval
     // (new chrome.declarativeContent.PageStateMatcher(...)); rules never fire.
     if (!chrome.declarativeContent) {
+      // Tag each action-constructor instance so addRules can recognize a
+      // ShowAction/ShowPageAction rule (below).
       var DCtor = function (o) { Object.assign(this, o || {}); };
+      var mkShow = function (tag) { var C = function (o) { Object.assign(this, o || {}); this.__c2sShow = tag; }; return C; };
+      var ShowActionCtor = mkShow("action");
       chrome.declarativeContent = {
-        PageStateMatcher: DCtor, ShowAction: DCtor, ShowPageAction: DCtor, SetIcon: DCtor,
+        PageStateMatcher: DCtor, ShowAction: ShowActionCtor, ShowPageAction: ShowActionCtor, SetIcon: DCtor,
         RequestContentScript: DCtor,
         // Rules never fire (no navigation watcher on Safari), but addRules MUST resolve
         // the added Rule[] with assigned ids so getRules round-trips — Chrome's contract.
@@ -3424,6 +3451,24 @@ var __C2S_DEBUG__ = false;
               var added = (r || []).map(function (rule) {
                 return Object.assign({}, rule, { id: rule.id || ("dc_" + (++nextId)) });
               });
+              // If any rule's actions include a ShowAction, the extension is using
+              // declarativeContent to CONTROL toolbar-button visibility (it disables
+              // the action globally and expects these rules to re-show it on matching
+              // pages — CRX Viewer does exactly this). Those rules NEVER fire on Safari
+              // (no page-change watcher), so the paired action.disable() would leave
+              // the button permanently greyed/unclickable. Flag it so the action's
+              // disable() is neutralized below, keeping the button clickable — the
+              // closest match to Chrome, where it shows on the matching pages.
+              try {
+                for (var i = 0; i < added.length; i++) {
+                  var acts = added[i] && added[i].actions;
+                  if (Array.isArray(acts) && acts.some(function (a) { return a && a.__c2sShow; })) {
+                    self.__c2sDeclarativeShowAction = true;
+                    if (chrome.action && typeof chrome.action.enable === "function") { try { chrome.action.enable(); } catch (e) {} }
+                    break;
+                  }
+                }
+              } catch (e) {}
               rules = rules.concat(added);
               return dual(added, cb);
             },
