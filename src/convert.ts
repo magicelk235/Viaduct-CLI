@@ -66,6 +66,18 @@ export function convert(opts: ConvertOptions): ConvertResult {
     const issues: Issue[] = [...manifestIssues, ...scanExtension(extPath, manifest, opts.platforms)];
     result.issues = issues;
 
+    // Safari gates every website match pattern behind a per-user grant defaulting
+    // to "Ask": until the user allows website access, content scripts never inject
+    // and cross-origin API fetches stay CORS-blocked — which reads as "the
+    // extension doesn't work" (live report: TWP translate). Flag it so the CLI's
+    // Done block spells out the grant step, not just "enable the extension".
+    const isMatchPattern = (p: unknown): boolean =>
+      typeof p === "string" && (p === "<all_urls>" || /^(\*|https?|wss?|ftp):\/\//.test(p));
+    result.needsWebsiteAccessGrant =
+      (manifest.permissions ?? []).some(isMatchPattern) ||
+      (manifest.host_permissions ?? []).some(isMatchPattern) ||
+      (manifest.content_scripts ?? []).some((cs) => (cs?.matches ?? []).length > 0);
+
     const blocking = countBlocking(issues, opts.strict);
     if (blocking > 0 && !opts.force) {
       printIssues(issues);

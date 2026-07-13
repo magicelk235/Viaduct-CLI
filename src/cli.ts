@@ -584,6 +584,12 @@ async function main(): Promise<void> {
       if (result.installedAppPath) {
         console.log(`  Installed: ${result.installedAppPath}`);
         console.log("  Safari → Settings → Extensions → enable the extension.");
+        if (result.needsWebsiteAccessGrant) {
+          console.log("  Then grant website access (Safari defaults to Ask — until allowed, content");
+          console.log("  scripts and external API calls silently do nothing): click the extension's");
+          console.log('  toolbar icon → "Always Allow on Every Website", or Settings → Extensions →');
+          console.log("  the extension → Edit Websites.");
+        }
         if (team) {
           console.log("  Team-signed: stays enabled across Safari quits (no unsigned toggle).");
           console.log("  Free personal team: re-run this command to re-sign before the ~7-day profile expires.");
@@ -594,6 +600,9 @@ async function main(): Promise<void> {
         console.log(`  App:    ${result.appPath}`);
         console.log(`  Install: re-run with --install, or  cp -R "${result.appPath}" ~/Applications/`);
         console.log("  Then: Safari → Settings → Extensions → enable.");
+        if (result.needsWebsiteAccessGrant) {
+          console.log('  And grant website access (toolbar icon → "Always Allow on Every Website") — Safari defaults to Ask.');
+        }
       } else if (result.xcodeProject) {
         console.log(`  Project: ${result.xcodeProject}`);
       } else if (result.stagedPath) {
