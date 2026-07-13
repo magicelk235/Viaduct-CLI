@@ -116,4 +116,11 @@ export interface ConvertResult {
    *  must treat the run as failed (non-zero exit) since the user's install didn't
    *  happen — and any --verify keyed on installedAppPath can't run. */
   installFailed?: boolean;
+  /** The manifest declares website match patterns (host_permissions / MV2
+   *  permissions / content_scripts matches). Safari gates these behind a per-user
+   *  grant that defaults to "Ask" — until the user allows website access, content
+   *  scripts never inject and cross-origin API fetches stay CORS-blocked, which
+   *  reads as "the extension doesn't work" (live: TWP translate). The CLI prints
+   *  the grant step when this is set. */
+  needsWebsiteAccessGrant?: boolean;
 }
