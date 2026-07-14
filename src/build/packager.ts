@@ -457,12 +457,15 @@ export function detectXcodeTeam(): string | null {
 }
 
 /**
- * Sanitize a raw extension name into an app name. Strips whitespace plus path/scheme
- * separators — the result becomes a directory name, an xcodebuild scheme, and part of
- * the bundle id. Falls back to "Extension" when nothing survives.
+ * Sanitize a raw extension name into an app name. The result becomes a directory
+ * name, an xcodebuild scheme, and part of the bundle id, and is passed verbatim to
+ * `xcrun ... --app-name`, which writes it into generated .xcodeproj XML. So we
+ * whitelist rather than blacklist: keep letters (any script), digits, and the two
+ * safe joiners `-` `_`; drop everything else. This closes XML/scheme/make-variable
+ * injection via `< > & " $ \` ( ) |` that a blacklist would leave through.
  */
 export function deriveAppName(rawName: string): string {
-  return rawName.replace(/[\s/\\:]+/g, "") || "Extension";
+  return rawName.replace(/[^\p{L}\p{N}_-]+/gu, "") || "Extension";
 }
 
 export function defaultBundleId(appName: string): string {
