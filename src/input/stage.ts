@@ -244,7 +244,17 @@ export function inlineImmutableEnums(stageDir: string): number {
 // wherever it appears (comments too — harmless). A dual-browser bundle that
 // compares against BOTH schemes ends up with two equal branches; the first
 // wins, same outcome either way.
-const CHROME_SCHEME_RE = /(?<![-\w])chrome-extension:/g;
+//
+// EXCEPT concrete-host URLs: "chrome-extension://<id>/…" (id literal or ${…}
+// interpolation) is never a local check the swap can fix — Safari's page host
+// is a per-install UUID, so the host part can't match regardless of scheme.
+// Such literals are server-bound tokens instead, above all OAuth redirect_uris
+// registered verbatim with the provider (Claude in Chrome:
+// chrome-extension://<id>/oauth_callback.html); rewriting one turns a working
+// login into "Redirect URI … is not supported by client". Keep them intact.
+// A wildcard host ("chrome-extension://*/…", match patterns) still rewrites —
+// there the scheme is the only thing that can mismatch.
+const CHROME_SCHEME_RE = /(?<![-\w])chrome-extension:(?!\/\/[\w$])/g;
 
 export function rewriteChromeSchemeLiterals(stageDir: string): number {
   let modified = 0;
