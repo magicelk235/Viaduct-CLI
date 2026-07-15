@@ -437,6 +437,39 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
     }
   }
 
+  // Content blockers whose core is blocking webRequest do not block in Safari:
+  // WebKit decides each network request before extension JS runs and ignores the
+  // blocking return value. Unlike the generic per-file "blocking webRequest"
+  // warning (scanJsContent), this is a class-level ERROR — for an ad/tracker
+  // blocker, blocking IS the product, so a bundle that installs but blocks nothing
+  // is a misleading failure. Gate narrowly so a password manager (webRequestBlocking
+  // on a few auth hosts, no web-wide blocking) does not trip it, and skip extensions
+  // that already ship declarativeNetRequest (the DNR path works in Safari).
+  const cbPerms = [
+    ...(Array.isArray(manifest.permissions) ? manifest.permissions : []),
+    ...(Array.isArray(manifest.optional_permissions) ? manifest.optional_permissions : []),
+  ];
+  const hasDnr = (manifest.declarative_net_request?.rule_resources?.length ?? 0) > 0;
+  if (cbPerms.includes("webRequestBlocking") && !hasDnr) {
+    // <all_urls> or an http(s)/any-scheme host wildcard = web-wide blocking intent.
+    const BROAD_HOST = /^(?:<all_urls>|\*:\/\/\*\/\*|https?:\/\/\*\/\*)$/;
+    const hostStrings = [
+      ...(Array.isArray(manifest.host_permissions) ? manifest.host_permissions : []),
+      ...cbPerms, // MV2 carries host patterns in permissions
+      ...arr(manifest.content_scripts).flatMap((cs: any) => arr(cs?.matches)),
+    ].filter((s): s is string => typeof s === "string");
+    if (hostStrings.some((h) => BROAD_HOST.test(h))) {
+      issues.push({
+        severity: "error",
+        category: "content-blocker",
+        message:
+          "This is a content blocker built on blocking webRequest — network blocking will NOT work in Safari (WebKit decides each request before extension JS runs and ignores the blocking return). The extension still installs and its cosmetic/element-hiding features still run.",
+        file: "manifest.json",
+        fix: "Blocking webRequest cannot block in Safari and no shim can change that. For real ad/tracker blocking, convert the extension's declarativeNetRequest build instead — e.g. uBlock Origin Lite (uBOL), which Safari honors.",
+      });
+    }
+  }
+
   // Manifest-relative SW path, used to gate the importScripts checks to the one
   // file the converter actually rewrites.
   const swRel = typeof manifest.background?.service_worker === "string"
