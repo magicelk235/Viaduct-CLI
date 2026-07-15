@@ -308,6 +308,15 @@ open "~/Applications/<AppName>.app"
 
 ## Limitations
 
+- **Ad/content blockers built on blocking `webRequest` (e.g. full uBlock
+  Origin) cannot block network requests in Safari.** WebKit decides each
+  request before extension JavaScript runs and ignores the blocking return
+  value — no shim can change this, because the decision happens below JS. The
+  extension still installs and its cosmetic/element-hiding features still run;
+  viaduct reports this class of extension with an `error`. For real ad/tracker
+  blocking on Safari, convert the extension's `declarativeNetRequest` build
+  instead — e.g. **uBlock Origin Lite** (uBOL). Safari honors DNR rulesets, so
+  uBOL blocks for real once converted.
 - APIs with no Safari equivalent are stubbed so the extension loads, but the
   underlying feature does not work. The analyzer reports each one with a
   suggested remediation.
