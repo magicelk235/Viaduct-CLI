@@ -6,7 +6,7 @@ import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
 import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteChromeSchemeLiterals } from "./input/stage.js";
-import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, deriveProxyHosts } from "./runtime/shim.js";
+import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, deriveProxyHosts } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
 import { synthesizePlaceholderIcons } from "./input/icons.js";
@@ -182,6 +182,16 @@ export function convert(opts: ConvertOptions): ConvertResult {
       for (const n of bridgeNotes) ok(n);
     }
 
+    // Prefer the popover-free in-page hotkey. Only fall back to the synthetic popup (which
+    // makes the toolbar button work but forces Safari's un-closable popover) when the
+    // hotkey can't be wired.
+    const hotkey = wireActionHotkey(stageDir, transformed);
+    if (hotkey) {
+      ok(`Action hotkey: ${hotkey} toggles the extension in-page (popover-free — the toolbar button stays inert to avoid Safari's un-closable popover)`);
+    } else if (wireActionClickBridge(stageDir, transformed)) {
+      ok("Action-click bridge: synthetic popup replays action.onClicked (Safari won't fire it on the toolbar button; shows a brief popover)");
+    }
+
     if (convertServiceWorkerToBackgroundPage(stageDir, transformed, polyfillFile)) {
       ok("Service worker → persistent background page (Safari reachability)");
     }
@@ -194,7 +204,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
 
     writeManifest(stageDir, transformed);
     const popupFile = (transformed.action ?? transformed.browser_action)?.default_popup;
-    if (popupFile) {
+    if (popupFile && popupFile !== "__viaduct-action.html") {
       // A SIDE-PANEL page wired as the popup needs an explicit height or its
       // height:100% layout collapses in a popover (Claude's sidepanel.html). Gate
       // strictly on the side_panel manifest field OR a "side panel" filename —

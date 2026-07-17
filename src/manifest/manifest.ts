@@ -561,6 +561,27 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
     });
   }
 
+  // web_accessible_resources.use_dynamic_url is a Chrome-only feature (rotates the
+  // resource URL per session). Safari does not implement it: an entry carrying
+  // use_dynamic_url:true fails to serve, so chrome.runtime.getURL() hands back a
+  // URL Safari refuses to load. A content script that injects a stylesheet/asset
+  // this way (e.g. a shadow-DOM sidebar's CSS) then renders unstyled and stays
+  // invisible — a silent "the popup/panel never shows". Strip the flag so the
+  // resource loads at its stable static extension URL.
+  const dynamicUrlWar = (Array.isArray(m.web_accessible_resources) ? m.web_accessible_resources : []).some(
+    (e) => typeof e === "object" && e !== null && "use_dynamic_url" in e && e.use_dynamic_url === true,
+  );
+  if (dynamicUrlWar) {
+    issues.push({
+      severity: "warning",
+      category: "resources",
+      message: "web_accessible_resources use_dynamic_url is unsupported in Safari; getURL() returns an unservable URL and the resource silently fails to load.",
+      file: "manifest.json",
+      fix: "Clearing use_dynamic_url (set false) so the resource loads at its static extension URL.",
+      autoFixed: true,
+    });
+  }
+
   if (m.externally_connectable?.ids?.length) {
     issues.push({
       severity: "warning",
@@ -894,6 +915,21 @@ export function transformManifest(
         { resources: looseStrings, matches: ["<all_urls>"] },
         ...objects,
       ] as Manifest["web_accessible_resources"];
+    }
+  }
+
+  // Safari does not implement web_accessible_resources.use_dynamic_url (Chrome-only
+  // per-session URL rotation). An entry left with use_dynamic_url:true is unservable
+  // in Safari, so chrome.runtime.getURL() returns a URL that 404s and any asset
+  // loaded that way (a content script's injected CSS, an <img>/<link>/iframe src)
+  // silently fails. Clear the flag on every object entry so the resource resolves at
+  // its stable static extension URL. Chrome treats the absent/false flag as the
+  // default, so this is a no-op there.
+  if (Array.isArray(out.web_accessible_resources)) {
+    for (const entry of out.web_accessible_resources) {
+      if (typeof entry === "object" && entry !== null && "use_dynamic_url" in entry && entry.use_dynamic_url === true) {
+        entry.use_dynamic_url = false;
+      }
     }
   }
 

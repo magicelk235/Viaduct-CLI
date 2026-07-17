@@ -2326,6 +2326,131 @@ var __C2S_DEBUG__ = false;
       }
     }
 
+    // Safari does not dispatch action.onClicked to a converted background context — the
+    // toolbar button is inert. viaduct wires a synthetic default_popup whose only job is,
+    // on click, to grab this background page via getBackgroundPage() (which is ALSO what
+    // wakes a suspended Safari background — runtime.sendMessage does not) and call
+    // __viaductFireClick() on it. That replays the real onClicked listeners with the
+    // active tab IN THE BACKGROUND REALM — so their tabs.sendMessage reaches the content
+    // script — then refocuses the page to dismiss the popover. getBackgroundPage() returns
+    // the one canonical background page, so there is no multi-instance duplicate firing;
+    // a per-click id dedups the popup's retries. Runs before the bundle's background code
+    // so no onClicked registration is missed.
+    // Which action-toggle path viaduct wired for THIS extension (see wireActionHotkey /
+    // wireActionClickBridge). Each mechanism below runs only when its path is present, so
+    // an extension that uses neither — or only one — pays nothing for the other.
+    var __vManifest = {}; try { __vManifest = chrome.runtime.getManifest() || {}; } catch (e) {}
+    var __vAct = __vManifest.action || __vManifest.browser_action || {};
+    var __vPopupWired = !!(__vAct && __vAct.default_popup === "__viaduct-action.html");
+    var __vHotkeyWired = false;
+    try { var __vcs = __vManifest.content_scripts || []; for (var __ci = 0; __ci < __vcs.length; __ci++) { if ((__vcs[__ci].js || []).indexOf("__viaduct-hotkey.js") >= 0) { __vHotkeyWired = true; break; } } } catch (e) {}
+    if (__vPopupWired) try {
+      var __vClickStore = (self.__viaductOnClicked = self.__viaductOnClicked || []);
+      var __vBridge = false;
+      var __vSetupBridge = function () {
+        if (__vBridge) return;
+        if (!(chrome.tabs && typeof chrome.tabs.query === "function")) return;
+        __vBridge = true;
+        // Signal content scripts (which then hold a keep-alive port) that this background
+        // wired the bridge, and hold those ports — Safari keeps a non-persistent
+        // background loaded while a port is open, so getBackgroundPage() returns without a
+        // multi-second wake and the popover only flashes. Firing is via direct call (not
+        // these ports), so keep-alive can't cause duplicate toggles.
+        try { chrome.storage && chrome.storage.local && chrome.storage.local.set({ __viaductBridgeOn: 1 }); } catch (e) {}
+        try {
+          if (chrome.runtime && chrome.runtime.onConnect) {
+            var __vPorts = [];
+            chrome.runtime.onConnect.addListener(function (port) {
+              if (!port || port.name !== "__viaduct-keepalive") return;
+              __vPorts.push(port);
+              port.onDisconnect.addListener(function () { var i = __vPorts.indexOf(port); if (i >= 0) __vPorts.splice(i, 1); });
+            });
+          }
+        } catch (e) {}
+        var getActive = function (cb) {
+          chrome.tabs.query({ active: true, lastFocusedWindow: true }, function (t1) {
+            if (t1 && t1[0]) return cb(t1[0]);
+            chrome.tabs.query({ active: true, currentWindow: true }, function (t2) {
+              if (t2 && t2[0]) return cb(t2[0]);
+              chrome.tabs.query({ active: true, windowType: "normal" }, function (t3) { cb(t3 && t3[0]); });
+            });
+          });
+        };
+        // Called directly by the popup on the object getBackgroundPage() returns — one
+        // canonical background page, so no duplicate firing. The id dedups popup retries.
+        self.__viaductFireClick = function (id) {
+          if (id && id === self.__viaductLastFireId) return;
+          self.__viaductLastFireId = id;
+          getActive(function (tab) {
+            if (!tab) return;
+            for (var i = 0; i < __vClickStore.length; i++) { try { __vClickStore[i](tab); } catch (e) {} }
+            // Note: Safari will not let script close this popup's popover (window.close/
+            // blur and focus moves are all ignored) — it dismisses on the user's next
+            // interaction. The popover-free path is the in-page hotkey (wireActionHotkey).
+          });
+        };
+      };
+      var __vWrapOnClicked = function (ns) {
+        if (!ns || !ns.onClicked || typeof ns.onClicked.addListener !== "function" || ns.onClicked.__viaductWrapped) return;
+        var add = ns.onClicked.addListener.bind(ns.onClicked);
+        var rm = typeof ns.onClicked.removeListener === "function" ? ns.onClicked.removeListener.bind(ns.onClicked) : null;
+        ns.onClicked.addListener = function (fn) {
+          if (typeof fn === "function" && __vClickStore.indexOf(fn) < 0) { __vClickStore.push(fn); __vSetupBridge(); }
+          try { return add(fn); } catch (e) {}
+        };
+        if (rm) ns.onClicked.removeListener = function (fn) { var i = __vClickStore.indexOf(fn); if (i >= 0) __vClickStore.splice(i, 1); try { return rm(fn); } catch (e) {} };
+        try { ns.onClicked.__viaductWrapped = true; } catch (e) {}
+      };
+      __vWrapOnClicked(chrome.action);
+      __vWrapOnClicked(chrome.browserAction);
+      if (typeof browser !== "undefined" && browser) { __vWrapOnClicked(browser.action); __vWrapOnClicked(browser.browserAction); }
+    } catch (e) {}
+
+    // Content-script side of the keep-alive: hold a port so Safari keeps the converted
+    // non-persistent background LOADED. Safari only delivers action.onClicked to a
+    // responsive background — a suspended one silently drops the click (Apple dev-forum
+    // thread 738567) — so keeping it warm is what makes the toolbar button fire without a
+    // popup. The background wakes on the first connect and holds the port; we reconnect on
+    // disconnect, backing off when the background is NOT holding (no bridge) so extensions
+    // that don't need this aren't repeatedly woken.
+    try {
+      if (__vPopupWired && chrome.runtime && typeof chrome.runtime.connect === "function" && !(chrome.tabs && typeof chrome.tabs.query === "function")) {
+        var __vKAdelay = 500;
+        (function hold() {
+          var t0 = Date.now(), p;
+          try { p = chrome.runtime.connect({ name: "__viaduct-keepalive" }); } catch (e) { setTimeout(hold, 5000); return; }
+          try {
+            p.onDisconnect.addListener(function () {
+              var _ = chrome.runtime && chrome.runtime.lastError;
+              if (Date.now() - t0 > 4000) __vKAdelay = 500; else __vKAdelay = Math.min(__vKAdelay * 2, 60000);
+              setTimeout(hold, __vKAdelay);
+            });
+          } catch (e) { setTimeout(hold, 5000); }
+        })();
+      }
+    } catch (e) {}
+
+    // Content-script: capture the page's runtime.onMessage listeners into a shared array.
+    // Safari never fires action.onClicked and always shows an un-closable popover for a
+    // toolbar popup, so the only popover-free way to trigger an in-page toggle is a
+    // page-level keydown that replays the extension's own message to these listeners. The
+    // generated __viaduct-hotkey.js (present only when viaduct could determine the action
+    // message) does that. The shim runs before the bundle's content script, so its
+    // listeners are captured here.
+    try {
+      if (__vHotkeyWired && typeof window !== "undefined" && !(chrome.tabs && typeof chrome.tabs.query === "function")) {
+        var __vMsg = (self.__viaductMsgListeners = self.__viaductMsgListeners || []);
+        var __vWrapOnMessage = function (rt) {
+          if (!rt || !rt.onMessage || typeof rt.onMessage.addListener !== "function" || rt.onMessage.__viaductWrapped) return;
+          var addM = rt.onMessage.addListener.bind(rt.onMessage);
+          rt.onMessage.addListener = function (fn) { if (typeof fn === "function" && __vMsg.indexOf(fn) < 0) __vMsg.push(fn); try { return addM(fn); } catch (e) {} };
+          try { rt.onMessage.__viaductWrapped = true; } catch (e) {}
+        };
+        __vWrapOnMessage(chrome.runtime);
+        if (typeof browser !== "undefined" && browser) __vWrapOnMessage(browser.runtime);
+      }
+    } catch (e) {}
+
     // chrome.extension (MV2 legacy surface).
     chrome.extension = chrome.extension || {};
     fill(chrome.extension, {

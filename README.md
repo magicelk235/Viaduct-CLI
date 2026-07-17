@@ -80,7 +80,34 @@ Apple's `safari-web-extension-packager` and `xcodebuild` to produce a signed app
     mistake): Safari ignores them there, so they belong in `host_permissions`.
   - Validates the `version` string: flags a missing, non-numeric, or out-of-range
     version that Apple's `CFBundleShortVersionString` rejects (the build fails).
-  - Auto-wires a `default_popup` when the action has none.
+  - Clears `use_dynamic_url` on `web_accessible_resources` (Chrome-only per-session
+    URL rotation): Safari can't serve such an entry, so `chrome.runtime.getURL()`
+    hands back a URL that 404s and any asset loaded that way (a content script's
+    injected CSS, an `<img>`/`<link>`/iframe `src`) silently fails — a common cause
+    of an in-page panel/sidebar that toggles but never appears.
+  - Makes a popup-less toolbar button that toggles in-page UI (a sidebar/overlay) from
+    `chrome.action.onClicked` work in Safari. Safari (26) never dispatches
+    `action.onClicked` — nor `commands.onCommand` — to a converted background, so such a
+    button is otherwise dead. Two paths, in priority order:
+    - **In-page hotkey (popover-free, preferred).** The toggle actually happens inside the
+      content script (its `runtime.onMessage` listener flips the UI). The shim loads before
+      the bundle's content script and captures those listeners; viaduct statically reads the
+      message the `onClicked` handler sends to the tab (e.g. `{type:"TOGGLE_SHELL"}`) and
+      generates a content script that, on a keyboard shortcut, replays that message to the
+      captured listeners — reproducing the toggle with **no toolbar popup and no popover**.
+      The shortcut reuses a declared `commands` key when present (Safari can't fire
+      `onCommand`, so that key is otherwise dead, and the inert command is removed), else
+      `Ctrl+Shift+Y`. When this is wired the toolbar button is intentionally left inert —
+      wiring a popup would force Safari's un-closable popover. Requires the message to be
+      statically determinable and the extension to have content scripts.
+    - **Synthetic popup (fallback).** Only when the hotkey can't be wired, viaduct adds a
+      tiny transparent `default_popup` that, on click, wakes the background via
+      `runtime.getBackgroundPage()` (the only thing that wakes a suspended Safari
+      background — `runtime.sendMessage` does not) and replays the captured `onClicked`
+      listeners **in the background realm** (so their `tabs.sendMessage` reaches the content
+      script), deduped to one toggle. **Safari limitation:** a toolbar popup always draws a
+      popover that script cannot close (`window.close`/`blur`/refocus are ignored), so this
+      path shows a brief popover that dismisses on the next interaction.
 - Generates and injects a compatibility shim into content scripts and every
   extension HTML page (popup, options, side panel). The shim:
   - Routes `storage.sync` to `storage.local` (Safari has no iCloud sync).
