@@ -9,6 +9,7 @@ export const SHIM_FILENAME = "safari-compat-shim.js";
 export const POLYFILL_FILENAME = "browser-polyfill.min.js";
 export const BACKGROUND_PAGE_FILENAME = "background.html";
 export const SW_LIFECYCLE_FILENAME = "viaduct-sw-lifecycle.js";
+export const ACTION_HOTKEY_FILENAME = "__viaduct-hotkey.js";
 
 /**
  * Copy the bundled webextension-polyfill into the staged extension so Chrome code
@@ -288,6 +289,21 @@ export function injectPopupSizing(dir: string, popupFile: string, fullHeight = f
 }
 
 /**
+ * True when a converted service-worker bundle genuinely needs ES-module loading: it
+ * uses top-level `import`/`export` statements or `import.meta`. Dynamic `import()` is
+ * legal in a classic script and does NOT count. Source is usually minified, so match
+ * only at source start or right after `;`/`}`/newline — keeps identifiers and string
+ * contents ("important", "reportExport") from false-positiving.
+ */
+function swNeedsModule(src: string): boolean {
+  if (/\bimport\s*\.\s*meta\b/.test(src)) return true;
+  if (/(^|[;}\n])\s*import\s*["'`{*]/.test(src)) return true;
+  if (/(^|[;}\n])\s*import\s+[\w$]+\s*(?:,\s*[{*]|from\b)/.test(src)) return true;
+  if (/(^|[;}\n])\s*export\s*(?:default\b|[{*]|(?:const|let|var|function|class|async)\b)/.test(src)) return true;
+  return false;
+}
+
+/**
  * Safari starts module service workers unreliably for temp-loaded extensions —
  * the SW often never runs, so anything probing it (e.g. the OAuth content-script
  * bridge) times out with "background not running/reachable". Convert the MV3
@@ -300,6 +316,7 @@ export function injectPopupSizing(dir: string, popupFile: string, fullHeight = f
 export function convertServiceWorkerToBackgroundPage(dir: string, manifest: Manifest, polyfillFile?: string): boolean {
   const sw = manifest.background?.service_worker;
   if (!sw) return false;
+
   const polyTag = polyfillFile && existsSync(join(dir, polyfillFile)) ? `<script src="${polyfillFile}"></script>\n` : "";
   // --no-shim conversions have no shim file; don't reference a missing script.
   const shimTag = existsSync(join(dir, SHIM_FILENAME)) ? `<script src="${SHIM_FILENAME}"></script>\n` : "";
@@ -356,15 +373,240 @@ export function convertServiceWorkerToBackgroundPage(dir: string, manifest: Mani
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 
+  // Load the converted SW CLASSIC (not type="module") when it has no ES-module syntax
+  // of its own. A classic script runs during the page's synchronous parse, so the
+  // shim's action.onClicked capture AND the bundle's own listener registration are
+  // complete by the time the synthetic action popup calls chrome.runtime.
+  // getBackgroundPage() — a deferred module leaves getBackgroundPage with an un-run
+  // background, so the click bridge finds no listeners and the toolbar button stays
+  // dead. (Also avoids the module-background "silent popup failure" the README notes.)
+  // Keep module only for bundles that truly need it (own import/export, import.meta)
+  // or that depend on deferred webpack chunk <script> ordering.
+  const swPath = join(dir, sw);
+  let swSrc = existsSync(swPath) ? readFileSync(swPath, "utf-8") : "";
+  // The OAuth bridge injected `import "./identity-polyfill.js";`. In an otherwise
+  // classic IIFE bundle that lone import is the only module syntax, and it's redundant
+  // — identity-polyfill.js already loads as a classic <script> above. Strip it so the
+  // bundle can load classic; keep it (and module) when the SW has other ESM syntax.
+  const swWithoutInjected = swSrc.replace(/^import\s+["'][^"']*identity-polyfill\.js["'];\s*\n?/, "");
+  const useModule = chunkFiles.length > 0 || swNeedsModule(swWithoutInjected);
+  if (!useModule && swSrc !== swWithoutInjected) {
+    swSrc = swWithoutInjected;
+    writeFileSync(swPath, swSrc, "utf-8");
+  }
+  const swScriptTag = useModule
+    ? `<script type="module" src="${sw}"></script>`
+    : `<script src="${sw}"></script>`;
+
   const html = `<!DOCTYPE html>
 <meta charset="utf-8">
 <title>${title} background</title>
-${lifecycleTag}${polyTag}${shimTag}${idPolyTag}${importTags}<script type="module" src="${sw}"></script>
+${lifecycleTag}${polyTag}${shimTag}${idPolyTag}${importTags}${swScriptTag}
 ${chunkTags}`;
   writeFileSync(join(dir, BACKGROUND_PAGE_FILENAME), html, "utf-8");
   // MV3 (Safari) rejects persistent background: "A manifest_version >= 3 must be non-persistent."
   manifest.background = { page: BACKGROUND_PAGE_FILENAME, persistent: false };
   return true;
+}
+
+/** Synthetic-popup filenames for the action-click bridge (see wireActionClickBridge). */
+const ACTION_BRIDGE_HTML = "__viaduct-action.html";
+const ACTION_BRIDGE_JS = "__viaduct-action.js";
+
+function actionSlot(manifest: Manifest): "action" | "browser_action" | "page_action" {
+  if (manifest.action) return "action";
+  if (manifest.browser_action) return "browser_action";
+  if (manifest.page_action) return "page_action";
+  return (manifest.manifest_version ?? 2) === 3 ? "action" : "browser_action";
+}
+
+/** Heuristic: do the manifest's background scripts register an action click handler? */
+function backgroundRegistersActionOnClicked(dir: string, manifest: Manifest): boolean {
+  const files: string[] = [];
+  const sw = manifest.background?.service_worker;
+  if (typeof sw === "string") files.push(sw);
+  for (const s of manifest.background?.scripts ?? []) if (typeof s === "string") files.push(s);
+  for (const rel of files) {
+    const p = join(dir, rel.replace(/^\.?\//, ""));
+    if (!existsSync(p)) continue;
+    let src: string;
+    try { src = readFileSync(p, "utf-8"); } catch { continue; }
+    // Loose but effective on minified bundles: an onClicked registration alongside an
+    // action/browserAction reference. Favors wiring a working button over a miss.
+    if (/onClicked/.test(src) && /\b(?:action|browserAction)\b/.test(src)) return true;
+  }
+  return false;
+}
+
+/**
+ * Safari never dispatches `action.onClicked` to a converted background context, so a
+ * toolbar button with no popup is inert — an extension that toggles in-page UI from
+ * onClicked (a sidebar, an overlay) does nothing when clicked. Safari DOES reliably
+ * open a `default_popup`, though. So when the action has no popup but the background
+ * registers action.onClicked, wire a tiny synthetic popup that, on open, reaches the
+ * background page via chrome.runtime.getBackgroundPage() and replays the listeners the
+ * shim captured (self.__viaductOnClicked) with the active tab, then closes itself —
+ * reproducing the Chrome click. Mutates `manifest`; returns true when wired. Must run
+ * BEFORE convertServiceWorkerToBackgroundPage so the background scripts are still on
+ * the manifest for the scan and the popup resolves the page the conversion produces.
+ */
+export function wireActionClickBridge(dir: string, manifest: Manifest): boolean {
+  const slot = actionSlot(manifest);
+  const current = manifest[slot];
+  // A real popup already handles the click (and suppresses onClicked anyway).
+  if (current?.default_popup) return false;
+  if (!backgroundRegistersActionOnClicked(dir, manifest)) return false;
+
+  // Transparent so the popover shows no white/colored fill. (Safari enforces a minimum
+  // popover size and draws its own gray chrome, so the popover can't be hidden or shrunk
+  // to nothing — this only removes the page's own background.)
+  const html = `<!doctype html><html style="background:transparent"><meta charset="utf-8"><title></title><body style="margin:0;padding:0;background:transparent;color-scheme:normal"></body><script src="${ACTION_BRIDGE_JS}"></script></html>\n`;
+  const js = `(function () {
+  var api = (typeof browser !== "undefined" && browser && browser.runtime) ? browser : chrome;
+  // Safari refuses to fire action.onClicked, so this (transparent) popover is the only
+  // click signal we get. getBackgroundPage() both WAKES the suspended background and
+  // returns the one canonical background page; we call __viaductFireClick on it, which
+  // replays the real onClicked listeners with the active tab, in the background realm.
+  // (runtime.sendMessage does NOT wake a suspended Safari background, so it can't be used
+  // here.) Retry until the call lands (covers wake latency); the background dedups on the
+  // id, so retries fire exactly one toggle. Safari won't let us close the popover (blur/
+  // close are ignored); it dismisses on the next interaction. The hotkey path avoids it.
+  var id = String(Date.now()) + ":" + Math.random().toString(36).slice(2);
+  var done = false, tries = 0;
+  function finish() { if (done) return; done = true; try { window.blur(); } catch (e) {} try { window.close(); } catch (e) {} }
+  function hit(bg) {
+    if (done || !bg || typeof bg.__viaductFireClick !== "function") return false;
+    try { bg.__viaductFireClick(id); } catch (e) {}
+    finish();
+    return true;
+  }
+  (function poke() {
+    tries++;
+    try {
+      var r = api.runtime.getBackgroundPage(function (bg) { var _ = api.runtime && api.runtime.lastError; hit(bg); });
+      if (r && typeof r.then === "function") r.then(hit, function () {});
+    } catch (e) {}
+    if (!done && tries < 80) setTimeout(poke, 100);
+    else if (!done) finish();
+  })();
+  setTimeout(finish, 10000);
+})();
+`;
+  writeFileSync(join(dir, ACTION_BRIDGE_HTML), html, "utf-8");
+  writeFileSync(join(dir, ACTION_BRIDGE_JS), js, "utf-8");
+  manifest[slot] = { ...(current ?? {}), default_popup: ACTION_BRIDGE_HTML };
+  return true;
+}
+
+/**
+ * Extract the message literal the background's onClicked handler sends to the tab via
+ * tabs.sendMessage. That message (e.g. {type:"TOGGLE_SHELL"}) is what actually toggles
+ * the in-page UI, so an in-page hotkey can replay it to the content-script listeners the
+ * shim captured — no toolbar, no popover. Returns the literal source or null when it
+ * can't be determined statically (dynamic message, nested braces, no match).
+ */
+function extractActionMessage(dir: string, manifest: Manifest): string | null {
+  const files: string[] = [];
+  const sw = manifest.background?.service_worker;
+  if (typeof sw === "string") files.push(sw);
+  for (const s of manifest.background?.scripts ?? []) if (typeof s === "string") files.push(s);
+  for (const rel of files) {
+    const p = join(dir, rel.replace(/^\.?\//, ""));
+    if (!existsSync(p)) continue;
+    let src: string;
+    try { src = readFileSync(p, "utf-8"); } catch { continue; }
+    const idx = src.search(/onClicked/);
+    if (idx < 0) continue;
+    // Within a window after the onClicked registration, find tabs.sendMessage(tab, {..}).
+    const win = src.slice(idx, idx + 600);
+    const m = win.match(/sendMessage\s*\(\s*[^,]+,\s*(\{[^{}]*\})/);
+    if (m && m[1]) return m[1];
+  }
+  return null;
+}
+
+interface HotkeyCombo { meta: boolean; ctrl: boolean; shift: boolean; alt: boolean; key: string; }
+
+/** Parse a WebExtensions command key ("Command+Shift+S", "Ctrl+Shift+Y") into a combo. */
+function parseCombo(key: unknown): HotkeyCombo | null {
+  if (typeof key !== "string" || !key) return null;
+  const combo: HotkeyCombo = { meta: false, ctrl: false, shift: false, alt: false, key: "" };
+  for (const part of key.split("+").map((s) => s.trim().toLowerCase())) {
+    if (part === "command" || part === "cmd") combo.meta = true;
+    else if (part === "ctrl" || part === "control" || part === "macctrl") combo.ctrl = true;
+    else if (part === "shift") combo.shift = true;
+    else if (part === "alt" || part === "option") combo.alt = true;
+    else if (part) combo.key = part.length === 1 ? part : part.replace(/^key/, "");
+  }
+  return combo.key ? combo : null;
+}
+
+/**
+ * Safari's only popover-free way to trigger an in-page toggle: a page-level keydown. The
+ * shim captures the content script's runtime.onMessage listeners; this wires a generated
+ * content script that, on a shortcut, replays the action message (from extractActionMessage)
+ * to them — reproducing the onClicked toggle with NO toolbar popover. Reuses a declared
+ * command's shortcut when present (Safari never fires commands.onCommand, so that key is
+ * otherwise dead) and removes that now-inert command. Returns the human shortcut label, or
+ * null when it can't be wired (no message, no content scripts). Must run BEFORE the SW→page
+ * conversion so the background scripts are still on the manifest for the scan.
+ */
+export function wireActionHotkey(dir: string, manifest: Manifest): string | null {
+  if (!backgroundRegistersActionOnClicked(dir, manifest)) return null;
+  if (!Array.isArray(manifest.content_scripts) || manifest.content_scripts.length === 0) return null;
+  const msg = extractActionMessage(dir, manifest);
+  if (!msg) return null;
+
+  // Pick the shortcut. Prefer the extension's own action command so the binding matches
+  // what users expect: `_execute_action` (the standard "activate the action" command), or
+  // a lone declared command (unambiguously the action for a single-purpose toggle). Reusing
+  // its key is safe because Safari never fires commands.onCommand — the key is otherwise
+  // dead — and we remove that now-inert command so Safari doesn't reserve the combo. With
+  // several ambiguous commands, don't guess: use a viaduct default and leave commands alone.
+  const commands = (manifest.commands ?? {}) as Record<string, { suggested_key?: unknown }>;
+  const keyOf = (name: string): string | undefined => {
+    const sk = commands[name]?.suggested_key as string | { mac?: string; default?: string } | undefined;
+    return typeof sk === "string" ? sk : sk?.mac || sk?.default;
+  };
+  const names = Object.keys(commands);
+  const preferred = names.includes("_execute_action") ? "_execute_action" : names.length === 1 ? names[0] : null;
+  let combo: HotkeyCombo | null = preferred ? parseCombo(keyOf(preferred)) : null;
+  let label = "";
+  let usedCmd: string | null = null;
+  if (combo && preferred) { label = String(keyOf(preferred)); usedCmd = preferred; }
+  if (!combo) { combo = { meta: false, ctrl: true, shift: true, alt: false, key: "y" }; label = "Ctrl+Shift+Y"; }
+  if (usedCmd) {
+    delete commands[usedCmd];
+    if (Object.keys(commands).length === 0) delete manifest.commands;
+    else manifest.commands = commands;
+  }
+
+  const js = `(function () {
+  if (typeof window === "undefined" || self.__viaductHotkeyBound) return;
+  self.__viaductHotkeyBound = true;
+  var COMBO = ${JSON.stringify(combo)};
+  // Safari never fires action.onClicked/commands.onCommand for a converted extension, and
+  // always shows an un-closable popover for a toolbar popup. This page-level keydown is the
+  // popover-free path: replay the action's own message to the runtime.onMessage listeners
+  // the compat shim captured (self.__viaductMsgListeners), reproducing the onClicked toggle.
+  window.addEventListener("keydown", function (e) {
+    if (!!COMBO.meta !== !!e.metaKey || !!COMBO.ctrl !== !!e.ctrlKey || !!COMBO.shift !== !!e.shiftKey || !!COMBO.alt !== !!e.altKey) return;
+    if (String(e.key || "").toLowerCase() !== COMBO.key) return;
+    try { e.preventDefault(); } catch (e0) {}
+    var api = (typeof browser !== "undefined" && browser && browser.runtime) ? browser : chrome;
+    var sender = { id: api && api.runtime && api.runtime.id, url: location.href, tab: { id: 0, url: location.href } };
+    var list = self.__viaductMsgListeners || [];
+    for (var i = 0; i < list.length; i++) { try { list[i](${msg}, sender, function () {}); } catch (e2) {} }
+  }, true);
+})();
+`;
+  writeFileSync(join(dir, ACTION_HOTKEY_FILENAME), js, "utf-8");
+  for (const cs of manifest.content_scripts) {
+    if (Array.isArray(cs.js) && (cs as { world?: string }).world !== "MAIN" && !cs.js.includes(ACTION_HOTKEY_FILENAME)) {
+      cs.js.push(ACTION_HOTKEY_FILENAME);
+    }
+  }
+  return label;
 }
 
 /**
