@@ -39,6 +39,7 @@ export interface Manifest {
     matches?: string[];
     run_at?: string;
     all_frames?: boolean;
+    match_about_blank?: boolean;
     world?: "MAIN" | "ISOLATED";
   }>;
   web_accessible_resources?: unknown;

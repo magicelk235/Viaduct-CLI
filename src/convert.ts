@@ -6,7 +6,7 @@ import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
 import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteChromeSchemeLiterals } from "./input/stage.js";
-import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, deriveProxyHosts } from "./runtime/shim.js";
+import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, deriveProxyHosts } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
 import { synthesizePlaceholderIcons } from "./input/icons.js";
@@ -194,6 +194,15 @@ export function convert(opts: ConvertOptions): ConvertResult {
 
     if (convertServiceWorkerToBackgroundPage(stageDir, transformed, polyfillFile)) {
       ok("Service worker → persistent background page (Safari reachability)");
+    }
+
+    // Content scripts that inject a page-world <script src=getURL(X)> are CSP-blocked in
+    // Safari (Chrome exempts web-accessible-resource scripts from the page CSP; Safari
+    // doesn't). Re-declare each X as a world:"MAIN" content script, which Safari runs
+    // CSP-exempt (Jump Cutter's MediaSource-clone bridge on YouTube).
+    const mainWorld = wirePageWorldMainInjection(stageDir, transformed);
+    if (mainWorld.length > 0) {
+      ok(`Page-world injection → world:"MAIN" content script (Safari 18.4+, CSP-exempt): ${mainWorld.join(", ")}`);
     }
 
     const synthIcons = synthesizePlaceholderIcons(stageDir, transformed, appName);
