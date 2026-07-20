@@ -366,3 +366,9 @@ open "~/Applications/<AppName>.app"
   instead. The tool also warns when static rulesets use `regexFilter` (Safari
   supports a limited regex subset and silently drops rules it cannot compile) or
   when enabled rules exceed the count Safari honors (the overflow is ignored).
+
+## License
+
+Licensed under the [PolyForm Shield License 1.0.0](LICENSE). Copyright (c) 2026
+Yehonatan Cohen (magicelk235). You may freely use, modify, and share it — but
+you may not use the Viaduct CLI to build a product that competes with it.
