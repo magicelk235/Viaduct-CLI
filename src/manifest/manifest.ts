@@ -168,6 +168,7 @@ export const DEFAULT_MIN_SAFARI_VERSION = "15.4";
 export interface ManifestAnalysis {
   issues: Issue[];
   permissionsToRemove: string[];
+  needsCdpShim: boolean;
 }
 
 const MATCH_SCHEMES = new Set(["http", "https", "*", "file", "ftp"]);
@@ -694,7 +695,8 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
     });
   }
 
-  return { issues, permissionsToRemove };
+  const needsCdpShim = allPerms.includes("debugger");
+  return { issues, permissionsToRemove, needsCdpShim };
 }
 
 /**
@@ -796,7 +798,7 @@ export function transformManifest(
   m: Manifest,
   permissionsToRemove: string[],
   extPath: string,
-  opts: { keepModuleBackground: boolean; shimFile?: string; polyfillFile?: string; minSafariVersion?: string }
+  opts: { keepModuleBackground: boolean; shimFile?: string; polyfillFile?: string; minSafariVersion?: string; cdpShim?: boolean }
 ): Manifest {
   const out: Manifest = JSON.parse(JSON.stringify(m));
 
@@ -836,6 +838,15 @@ export function transformManifest(
   }
   if (Array.isArray(out.optional_permissions) && out.optional_permissions.length === 0) delete out.optional_permissions;
 
+  // The CDP shim's executor injects into arbitrary tabs via chrome.scripting, so
+  // when the debugger permission was shimmed we must keep scripting granted (debugger
+  // itself stays stripped). Broad host access (<all_urls>) is added below after the
+  // match-pattern filter so CDP can attach to any tab.
+  if (opts.cdpShim) {
+    if (!Array.isArray(out.permissions)) out.permissions = [];
+    if (!(out.permissions as string[]).includes("scripting")) (out.permissions as string[]).push("scripting");
+  }
+
   // Drop host patterns Safari's match-pattern parser rejects (ws://*/* etc. — valid
   // in Chrome for webRequest websockets, ungrantable in Safari). Keeping them risks
   // Safari discarding host access; removal matches analyzeManifest's auto-fix note.
@@ -844,6 +855,13 @@ export function transformManifest(
     const kept = (out[key] as unknown[]).filter((p) => typeof p !== "string" || matchPatternError(p) === null);
     if (kept.length === 0) delete out[key];
     else out[key] = kept as string[];
+  }
+
+  // CDP attaches to any tab, so ensure broad host access. Placed after the match-
+  // pattern filter above (<all_urls> passes matchPatternError) so it is never dropped.
+  if (opts.cdpShim) {
+    if (!Array.isArray(out.host_permissions)) out.host_permissions = [];
+    if (!(out.host_permissions as string[]).includes("<all_urls>")) (out.host_permissions as string[]).push("<all_urls>");
   }
 
   const mv = out.manifest_version ?? 2;
@@ -960,10 +978,22 @@ export function transformManifest(
   }
   const action = (out[actionKey] as Manifest["action"]) ?? {};
   if (!action.default_popup) {
-    for (const candidate of ["popup.html", "sidepanel.html", "panel.html", "index.html"]) {
-      if (existsSync(join(extPath, candidate))) {
-        action.default_popup = candidate;
-        break;
+    // An extension whose UI is a Chrome side panel (chrome.sidePanel) has no Safari
+    // equivalent; the shim emulates sidePanel.open() by toggling the panel page as
+    // the action popover — which only works when that page is wired here as
+    // default_popup. Prefer the manifest's declared panel (often in a subdir, e.g.
+    // ChatGPT's codex-sidepanel/index.html) over the root-level guesses below;
+    // otherwise the action-click bridge wires an empty placeholder popover and the
+    // panel never shows (live: ChatGPT — empty popup on click).
+    const panelPath = (out.side_panel?.default_path ?? "").split(/[#?]/)[0].replace(/^\/+/, "");
+    if (panelPath && existsSync(join(extPath, panelPath))) {
+      action.default_popup = panelPath;
+    } else {
+      for (const candidate of ["popup.html", "sidepanel.html", "panel.html", "index.html"]) {
+        if (existsSync(join(extPath, candidate))) {
+          action.default_popup = candidate;
+          break;
+        }
       }
     }
   }
@@ -988,5 +1018,12 @@ export function transformManifest(
 }
 
 export function writeManifest(targetDir: string, manifest: Manifest): void {
+  // Chrome tolerates `content_scripts: []`; Safari rejects it outright ("Empty or
+  // invalid content_scripts manifest entry") and refuses to load the extension
+  // (live: ChatGPT ships an empty array). Drop the key when nothing populated it —
+  // this is the final write, after every content-script wiring step has run.
+  if (Array.isArray(manifest.content_scripts) && manifest.content_scripts.length === 0) {
+    delete manifest.content_scripts;
+  }
   writeFileSync(join(targetDir, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n", "utf-8");
 }

@@ -1,4 +1,5 @@
 import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve, basename, sep } from "node:path";
 import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
@@ -6,16 +7,19 @@ import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
 import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteChromeSchemeLiterals } from "./input/stage.js";
-import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, deriveProxyHosts } from "./runtime/shim.js";
+import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireCdpKeepalive, deriveProxyHosts } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
 import { synthesizePlaceholderIcons } from "./input/icons.js";
 import { writeTempLoadInstructions } from "./build/tempload.js";
-import { installToSafari } from "./build/installer.js";
+import { installToSafari, installBrokerAgent } from "./build/installer.js";
 import {
   runPackager,
   patchProjectBundleIds,
-  writeNativeProxyHandler,
+  setBuildVersion,
+  writeNativeHandler,
+  writeAppBroker,
+  unsandboxAppTarget,
   buildXcodeProject,
   verifyBuiltBundleId,
   pluginkitStatus,
@@ -62,7 +66,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
     // check chrome.runtime.id keep working after conversion.
     const chromeId = deriveChromeId(manifest);
 
-    const { issues: manifestIssues, permissionsToRemove } = analyzeManifest(manifest);
+    const { issues: manifestIssues, permissionsToRemove, needsCdpShim } = analyzeManifest(manifest);
     const issues: Issue[] = [...manifestIssues, ...scanExtension(extPath, manifest, opts.platforms)];
     result.issues = issues;
 
@@ -73,7 +77,11 @@ export function convert(opts: ConvertOptions): ConvertResult {
     // Done block spells out the grant step, not just "enable the extension".
     const isMatchPattern = (p: unknown): boolean =>
       typeof p === "string" && (p === "<all_urls>" || /^(\*|https?|wss?|ftp):\/\//.test(p));
+    // The CDP executor injects into arbitrary tabs via chrome.scripting, so it needs
+    // the same website-access grant even if the source manifest declared no host
+    // patterns of its own (a debugger-only extension would otherwise miss this).
     result.needsWebsiteAccessGrant =
+      needsCdpShim ||
       (manifest.permissions ?? []).some(isMatchPattern) ||
       (manifest.host_permissions ?? []).some(isMatchPattern) ||
       (manifest.content_scripts ?? []).some((cs) => (cs?.matches ?? []).length > 0);
@@ -162,9 +170,11 @@ export function convert(opts: ConvertOptions): ConvertResult {
       shimFile = writeShim(stageDir, {
         chromeOrigin: chromeId ? `chrome-extension://${chromeId}` : "",
         proxyHosts,
+        cdp: needsCdpShim,
       });
       const n = injectShimIntoHtmlPages(stageDir, polyfillFile);
       if (n > 0) ok(`Shim${polyfillFile ? " + polyfill" : ""} injected into ${n} HTML page(s)`);
+      if (needsCdpShim) ok("chrome.debugger detected \u2192 enabled CDP emulation shim (kept scripting + <all_urls>)");
     }
 
     const transformed = transformManifest(manifest, permissionsToRemove, stageDir, {
@@ -172,6 +182,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
       shimFile,
       polyfillFile,
       minSafariVersion: opts.minSafariVersion,
+      cdpShim: needsCdpShim,
     });
 
     const dnrNotes = applyDnr(stageDir, transformed);
@@ -194,6 +205,10 @@ export function convert(opts: ConvertOptions): ConvertResult {
 
     if (convertServiceWorkerToBackgroundPage(stageDir, transformed, polyfillFile)) {
       ok("Service worker → persistent background page (Safari reachability)");
+    }
+
+    if (needsCdpShim && wireCdpKeepalive(stageDir, transformed)) {
+      ok("CDP keep-alive content script wired (holds Safari background loaded during debugger sessions)");
     }
 
     // Content scripts that inject a page-world <script src=getURL(X)> are CSP-blocked in
@@ -287,14 +302,45 @@ export function convert(opts: ConvertOptions): ConvertResult {
 
     info("Patching bundle identifiers …");
     patchProjectBundleIds(xcodeproj, bundleId);
+    // Unique version per build so Safari reloads the extension's resources. Safari
+    // caches the shim/background JS keyed on CFBundleShortVersionString (MARKETING_
+    // VERSION), which the packager hardcodes to 1.0 → stale JS survives reinstalls.
+    const buildStamp = Math.floor(Date.now() / 1000);
+    setBuildVersion(xcodeproj, { short: `1.0.${buildStamp % 10000000}`, build: String(buildStamp) });
 
-    // Install the native HTTP proxy handler so requests to the extension's own
-    // backends can be sent with the Chrome origin (the in-browser shim can't set
-    // it). Generic: hosts/origin derived from the manifest, no-op if none.
-    // Reuses the proxyHosts derived above for the shim allowlist.
-    if (proxyHosts.length > 0) {
-      writeNativeProxyHandler(xcodeproj, chromeId ? `chrome-extension://${chromeId}` : "", proxyHosts);
-      ok(`Native proxy handler wired for ${proxyHosts.length} backend host(s)`);
+    // Native handler in the (sandboxed) appex: an out-of-process HTTP proxy (send the
+    // extension's backends the Chrome origin the shim can't set) AND, for native
+    // messaging, a client that forwards to the broker in the container app.
+    const usesNativeMessaging = (manifest.permissions ?? []).includes("nativeMessaging");
+    if (proxyHosts.length > 0 || usesNativeMessaging) {
+      // Loopback broker coordinates, baked into BOTH the appex client and the app
+      // broker. Derived deterministically from the bundle id (not random) so they
+      // always agree even if a stale broker instance from a prior install lingers —
+      // and stable across re-installs. Loopback-only + token gates casual local access.
+      const coordHash = createHash("sha256").update(bundleId).digest();
+      const brokerPort = usesNativeMessaging ? 49152 + (coordHash.readUInt16BE(0) % 16000) : 0;
+      const brokerToken = usesNativeMessaging ? coordHash.subarray(0, 16).toString("hex") : "";
+      writeNativeHandler(xcodeproj, {
+        chromeOrigin: chromeId ? `chrome-extension://${chromeId}` : "",
+        allowHosts: proxyHosts,
+        nativeMessaging: usesNativeMessaging,
+        brokerPort,
+        brokerToken,
+      });
+      const roles = [
+        proxyHosts.length > 0 ? `${proxyHosts.length} backend host(s)` : "",
+        usesNativeMessaging ? "native-messaging broker client" : "",
+      ].filter(Boolean).join(" + ");
+      ok(`Native handler wired: ${roles}`);
+      if (usesNativeMessaging) {
+        // The broker must exec the host + read Chrome's manifest dir — impossible in
+        // the sandbox — so it lives in the container app, which we unsandbox (the
+        // appex stays sandboxed so Safari still registers it).
+        writeAppBroker(xcodeproj, { brokerPort, brokerToken });
+        unsandboxAppTarget(xcodeproj);
+        ok(`Native-messaging broker installed in the app (loopback :${brokerPort}); app target unsandboxed (appex stays sandboxed).`);
+        warn("Native messaging needs the container app running (it hosts the broker) and the companion app's native host installed. The app stays open in the background after you close its window; quitting it stops native messaging.");
+      }
     }
 
     if (opts.openXcode) {
@@ -360,6 +406,9 @@ export function convert(opts: ConvertOptions): ConvertResult {
         result.appPath = inst.installedAppPath;
         result.installedAppPath = inst.installedAppPath;
         ok(`Installed → ${inst.installedAppPath}`);
+        // Keep the broker (in the container app) alive across restarts/idle so the
+        // sandboxed appex can always reach it over loopback.
+        if (usesNativeMessaging) installBrokerAgent(inst.installedAppPath, bundleId);
       } else {
         // The user asked for --install and it didn't happen. The build is fine, so we
         // still surface the app path, but flag the run as install-failed so the CLI

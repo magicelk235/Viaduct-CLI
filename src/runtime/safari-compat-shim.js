@@ -7,6 +7,9 @@
 // SyntaxError still can't be caught here, but JSON.stringify never emits one.)
 var __C2S_PROXY_CONFIG__;
 try { __C2S_PROXY_CONFIG__ = __C2S_PROXY_CONFIG_JSON__; } catch (e) { __C2S_PROXY_CONFIG__ = { origin: "", hosts: [] }; }
+// CDP/chrome.debugger emulation gate. Default enabled; disabled only when the
+// build config explicitly sets cdp:false (direct shimSource() test calls keep it on).
+var __C2S_CDP__; try { __C2S_CDP__ = !(__C2S_PROXY_CONFIG__ && __C2S_PROXY_CONFIG__.cdp === false); } catch (e) { __C2S_CDP__ = true; }
 // Flip to true to trace proxy/fetch decisions in Web Inspector. Off by default so
 // a shipped extension does not log every request URL to the user's console.
 var __C2S_DEBUG__ = false;
@@ -140,6 +143,24 @@ var __C2S_DEBUG__ = false;
   hasChrome = typeof chrome !== "undefined";
   if (!api) return;
   // ────────────────────────────────────────────────────────────────────────────
+
+  // [DIAG] Universal tracer: record EVERY runtime message + port connect this context
+  // receives, into storage.local. Lets us confirm whether this (background) context is
+  // the one that actually receives the popover's traffic. Remove after debugging.
+  try {
+    if (typeof chrome !== "undefined" && chrome.runtime) {
+      if (chrome.runtime.onMessage && chrome.runtime.onMessage.addListener) {
+        chrome.runtime.onMessage.addListener(function (m) {
+          try { if (chrome.storage && chrome.storage.local) chrome.storage.local.get("__c2sDiagMsgs", function (o) { var k = "__c2sDiagMsgs"; var a = (o && o[k]) || []; a.push({ t: Date.now(), keys: Object.keys(m || {}).slice(0, 6) }); while (a.length > 30) a.shift(); var s = {}; s[k] = a; chrome.storage.local.set(s); }); } catch (e) {}
+        });
+      }
+      if (chrome.runtime.onConnect && chrome.runtime.onConnect.addListener) {
+        chrome.runtime.onConnect.addListener(function (p) {
+          try { if (chrome.storage && chrome.storage.local) chrome.storage.local.get("__c2sDiagConn", function (o) { var k = "__c2sDiagConn"; var a = (o && o[k]) || []; a.push({ t: Date.now(), name: (p && p.name) || "" }); while (a.length > 30) a.shift(); var s = {}; s[k] = a; chrome.storage.local.set(s); }); } catch (e) {}
+        });
+      }
+    }
+  } catch (e) {}
 
   // navigator.userAgent Chrome-version spoof. Websites (and extension code reacting
   // to the page) commonly sniff the Chrome version out of the UA
@@ -982,7 +1003,7 @@ var __C2S_DEBUG__ = false;
       // (changes) — a real .sync.onChanged listener must not see other areas' writes
       // (Chrome's .sync.onChanged is area-scoped and single-arg).
       //
-      // ponytail: sync and local share one flat backing store, so this relay cannot
+      // Sync and local share one flat backing store, so this relay cannot
       // tell a sync-origin write from a plain local.set — a sync.onChanged listener
       // will also see unrelated local writes, and a global onChanged listener that
       // branches on `area === "sync"` never fires for sync writes (Safari reports the
@@ -1067,6 +1088,8 @@ var __C2S_DEBUG__ = false;
     var rememberPath = function (opts) {
       if (opts && typeof opts.path === "string" && opts.path) panelPath = opts.path;
     };
+    var c2sPanelOpened = eventList();
+    var c2sPanelClosed = eventList();
     chrome.sidePanel = {
       open: function (opts) {
         rememberPath(opts);
@@ -1109,7 +1132,71 @@ var __C2S_DEBUG__ = false;
       getOptions: function () { return Promise.resolve({ path: panelPath, enabled: true }); },
       setPanelBehavior: function () { return Promise.resolve(); },
       getPanelBehavior: function () { return Promise.resolve({}); },
+      onOpened: c2sPanelOpened,
+      onClosed: c2sPanelClosed,
     };
+    // Bridge popover open/close to sidePanel.onOpened/onClosed. Extensions gate on
+    // onOpened (ChatGPT: "open the side panel to start the local app server") and Safari
+    // never fires it. Event channels (sendMessage/connect) from the popover proved
+    // UNRELIABLE to reach this non-persistent background, but cross-context STORAGE is
+    // reliable both ways — so the panel writes a marker to storage.session and we turn
+    // its presence/changes into onOpened/onClosed. The extension's own onOpened listener
+    // then records the window as open, satisfying its side-panel gate.
+    var C2S_PANEL_WID_KEY = "__c2sPanelOpenWid";
+    var c2sEmitPanel = function (wid, opened) {
+      try { if (chrome.storage && chrome.storage.local) chrome.storage.local.set({ __c2sPanelRecvMark: { wid: wid, opened: opened, t: Date.now() } }); } catch (e) {}
+      if (opened) c2sPanelOpened._emit({ windowId: (typeof wid === "number" ? wid : -2) });
+      else c2sPanelClosed._emit({ windowId: (typeof wid === "number" ? wid : -2) });
+    };
+    try {
+      if (chrome.storage && chrome.storage.onChanged && chrome.storage.onChanged.addListener) {
+        chrome.storage.onChanged.addListener(function (changes, area) {
+          try {
+            if (area !== "session" || !changes || !changes[C2S_PANEL_WID_KEY]) return;
+            var nv = changes[C2S_PANEL_WID_KEY].newValue;
+            // Only ever mark OPEN — keep the gate satisfied for the session so a
+            // reopened panel re-checks and renders immediately (Safari popovers close on
+            // focus loss; clearing here would force the wait-for-listener race again).
+            if (typeof nv === "number") c2sEmitPanel(nv, true);
+          } catch (e) {}
+        });
+      }
+    } catch (e) {}
+    // The marker may have been written while this bg was asleep (no onChanged then), so
+    // read it once the extension has had a moment to register its onOpened listener.
+    try {
+      if (chrome.storage && chrome.storage.session) {
+        var c2sReadMarker = function () {
+          try {
+            var r = chrome.storage.session.get(C2S_PANEL_WID_KEY, function (o) { var v = o && o[C2S_PANEL_WID_KEY]; if (typeof v === "number") c2sEmitPanel(v, true); });
+            if (r && typeof r.then === "function") r.then(function (o) { var v = o && o[C2S_PANEL_WID_KEY]; if (typeof v === "number") c2sEmitPanel(v, true); }, function () {});
+          } catch (e) {}
+        };
+        // Re-fire across the extension's bundle-load window: ChatGPT's background
+        // bundle registers its sidePanel.onOpened listener only after several seconds,
+        // so a single early emit is missed. Keep emitting (idempotent for the set the
+        // extension keeps) until the listener has certainly had time to register.
+        var c2sReadTries = 0;
+        var c2sReadMarkerLoop = function () {
+          c2sReadTries++;
+          c2sReadMarker();
+          if (c2sReadTries < 8) setTimeout(c2sReadMarkerLoop, 1200);
+        };
+        c2sReadMarkerLoop();
+      }
+    } catch (e) {}
+    // Backup: a runtime.connect port also keeps the bg alive while the panel is open.
+    try {
+      if (chrome.runtime && chrome.runtime.onConnect) {
+        chrome.runtime.onConnect.addListener(function (port) {
+          if (!port || port.name !== "__c2sPanelPort") return;
+          var wid = -2;
+          try { if (port.sender && port.sender.tab && typeof port.sender.tab.windowId === "number") wid = port.sender.tab.windowId; } catch (e) {}
+          port.onMessage.addListener(function (m) { if (m && typeof m.windowId === "number") { wid = m.windowId; c2sEmitPanel(wid, true); } });
+          port.onDisconnect.addListener(function () { var _ = chrome.runtime.lastError; });
+        });
+      }
+    } catch (e) {}
   }
   } catch (__sidePanelErr) {}
 
@@ -1194,7 +1281,7 @@ var __C2S_DEBUG__ = false;
   // can't draw — but the *behavioral* contract (group/ungroup tabs, query groups,
   // get a group's tabs, fire create/update/remove events, expose tab.groupId)
   // works, so grouping logic runs instead of silently no-opping.
-  // ponytail: in-memory only — groups don't survive a background-page restart; add
+  // In-memory only — groups don't survive a background-page restart; add
   // chrome.storage.session persistence if a restart drops groups the UI still shows.
   // Per-section guard: this block backfills many chrome.* namespaces in sequence.
   // A throw partway through (a getter on a partial Safari namespace, an exotic
@@ -1479,11 +1566,96 @@ var __C2S_DEBUG__ = false;
   // pixels (used as-is for elementFromPoint/clientX); captureScreenshot returns a
   // device-pixel PNG (captureVisibleTab default). The Network domain cannot be
   // reconstructed without CDP -> it no-ops (network request logs unavailable).
-  if (hasChrome && !chrome.debugger) {
+  if (hasChrome && !chrome.debugger && __C2S_CDP__) {
     var dbgAttached = Object.create(null); // tabId -> true
     var dbgEvtList = [];                    // chrome.debugger.onEvent listeners
     var dbgDetList = [];                    // chrome.debugger.onDetach listeners
     var dbgHooked = false;
+    var dbgMetrics = Object.create(null);  // tabId -> { dsf } from Emulation.setDeviceMetricsOverride
+
+    // KEEP-ALIVE (root-cause fix): Safari suspends the non-persistent MV3 background when
+    // idle, but the CDP transport is the connectNative poll loop (agent -> native host ->
+    // background) that only runs while the background is LOADED. An agent drives CDP with
+    // no user interaction between commands, so Safari suspends the background mid-session,
+    // the poll loop stops, queued CDP commands are never delivered -> the agent reports
+    // "browser connection timed out". (Chat is immune: each user prompt wakes the bg.)
+    // Safari keeps a non-persistent bg loaded while a runtime.connect port is open to it
+    // (the proven __viaduct-keepalive trick), so while a debugger session is attached we
+    // hold such a port FROM the debugged tab, refresh it on navigation, drop it on detach.
+    var dbgKaPorts = [];
+    try {
+      if (chrome.runtime && chrome.runtime.onConnect && chrome.runtime.onConnect.addListener) {
+        chrome.runtime.onConnect.addListener(function (port) {
+          if (!port || port.name !== "__viaduct-cdp-keepalive") return;
+          dbgKaPorts.push(port);
+          try { cdpLog("KA-PORT+ " + port.name); } catch (e) {}
+          try { port.onDisconnect.addListener(function () { var i = dbgKaPorts.indexOf(port); if (i >= 0) dbgKaPorts.splice(i, 1); void (chrome.runtime && chrome.runtime.lastError); }); } catch (e) {}
+        });
+      }
+    } catch (e) {}
+    // A DECLARED content script (viaduct-cdp-keepalive.js on <all_urls>) holds the
+    // keep-alive port; unlike an injected executeScript port it PERSISTS in Safari. We
+    // just tell it when a session is active (bg->content tabs.sendMessage is reliable on
+    // Safari, unlike content->bg). Re-sent shortly after (catches a content script that
+    // just (re)loaded on navigation); released on detach.
+    var startKeepAlive = function (tabId) {
+      if (tabId == null || !chrome.tabs || !chrome.tabs.sendMessage) return;
+      try { cdpLog("keepalive+ tab=" + tabId); } catch (e) {}
+      var send = function () { try { chrome.tabs.sendMessage(tabId, { __c2sCdpKA: true }, function () { void (chrome.runtime && chrome.runtime.lastError); }); } catch (e) {} };
+      send();
+      var __t = setTimeout(send, 500); try { if (__t && __t.unref) __t.unref(); } catch (e) {}
+    };
+    var stopKeepAlive = function (tabId) {
+      if (tabId == null || !chrome.tabs || !chrome.tabs.sendMessage) return;
+      try { cdpLog("keepalive- tab=" + tabId); } catch (e) {}
+      try { chrome.tabs.sendMessage(tabId, { __c2sCdpKA: false }, function () { void (chrome.runtime && chrome.runtime.lastError); }); } catch (e) {}
+    };
+    // Answer a content script that loaded mid-session and asks whether to keep alive
+    // (content->bg is flaky on Safari, so startKeepAlive is also re-sent on navigation).
+    try {
+      if (chrome.runtime && chrome.runtime.onMessage && chrome.runtime.onMessage.addListener) {
+        chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
+          if (!msg || !msg.__c2sCdpKAQuery) return;
+          var tid = sender && sender.tab && sender.tab.id;
+          try { sendResponse({ active: !!(tid != null && dbgAttached[tid]) }); } catch (e) {}
+        });
+      }
+    } catch (e) {}
+    // Background-side keep-alive: ping the runtime on a FIXED 3s cadence to reset Safari's
+    // idle timer during a CDP session. The fixed setTimeout floor means it can NEVER
+    // hot-loop, and getPlatformInfo returns immediately so it never holds the native
+    // channel (an earlier held-message version could spin and froze the extension).
+    var dbgNativeKA = false;
+    var dbgNativeKALoop = function () {
+      if (!dbgNativeKA) return;
+      var api = (typeof chrome !== "undefined" ? chrome : (typeof browser !== "undefined" ? browser : null));
+      var next = function () { if (dbgNativeKA) { var __t = setTimeout(dbgNativeKALoop, 3000); try { if (__t && __t.unref) __t.unref(); } catch (e) {} } };
+      try {
+        if (api && api.runtime && api.runtime.getPlatformInfo) { api.runtime.getPlatformInfo(function () { try { void api.runtime.lastError; } catch (e) {} next(); }); }
+        else next();
+      } catch (e) { next(); }
+    };
+    var startNativeKA = function () { if (dbgNativeKA) return; dbgNativeKA = true; try { cdpLog("nativeKA start"); } catch (e) {} dbgNativeKALoop(); };
+    var stopNativeKA = function () { if (Object.keys(dbgAttached).length === 0) { dbgNativeKA = false; try { cdpLog("nativeKA stop"); } catch (e) {} } };
+    // Navigation kills the injected holder; re-inject for any still-attached tab.
+    try {
+      if (chrome.webNavigation && chrome.webNavigation.onCommitted && chrome.webNavigation.onCommitted.addListener) {
+        chrome.webNavigation.onCommitted.addListener(function (d) { if (d && d.frameId === 0 && dbgAttached[d.tabId]) startKeepAlive(d.tabId); });
+      } else if (chrome.tabs && chrome.tabs.onUpdated && chrome.tabs.onUpdated.addListener) {
+        chrome.tabs.onUpdated.addListener(function (tabId, info) { if (info && info.status === "complete" && dbgAttached[tabId]) startKeepAlive(tabId); });
+      }
+    } catch (e) {}
+
+    // A CDP Debuggee is { tabId } | { targetId } | { extensionId }. Accept the
+    // synthetic "tab-<n>" targetId/sessionId we hand out so targetId-routed agents
+    // (not just tabId-routed ones) resolve to the right tab.
+    var tabIdOf = function (t) {
+      if (!t) return undefined;
+      if (t.tabId != null) return t.tabId;
+      var s = t.targetId || t.sessionId;
+      if (s && String(s).indexOf("tab-") === 0) { var n = Number(String(s).slice(4)); return isNaN(n) ? undefined : n; }
+      return undefined;
+    };
 
     var emitCdp = function (tabId, method, params) {
       var src = { tabId: tabId };
@@ -1498,24 +1670,58 @@ var __C2S_DEBUG__ = false;
     // Synthesize the Page lifecycle events agent navigation waiters listen for,
     // from chrome.tabs.onUpdated (CDP never fires in Safari).
     var hookLifecycle = function () {
-      if (dbgHooked || !chrome.tabs || !chrome.tabs.onUpdated) return;
+      if (dbgHooked || !chrome.tabs) return;
       dbgHooked = true;
-      chrome.tabs.onUpdated.addListener(function (tabId, info, tab) {
-        if (!dbgAttached[tabId]) return;
-        var fid = String(tabId);
-        var url = (tab && tab.url) || info.url || "";
-        if (info.status === "loading") {
-          emitCdp(tabId, "Page.frameStartedLoading", { frameId: fid });
-          emitCdp(tabId, "Page.frameNavigated", { frame: { id: fid, loaderId: fid, url: url } });
-        } else if (info.status === "complete") {
-          emitCdp(tabId, "Page.loadEventFired", { timestamp: Date.now() / 1000 });
-          emitCdp(tabId, "Page.frameStoppedLoading", { frameId: fid });
-          emitCdp(tabId, "Page.lifecycleEvent", { frameId: fid, name: "load" });
+      var useWebNav = false;
+      // Prefer chrome.webNavigation for real navigation lifecycle events (fires
+      // per-frame with URLs). Fall back to tabs.onUpdated when unavailable. We do
+      // NOT request the webNavigation permission — only use it if the host grants it.
+      try {
+        if (chrome.webNavigation && chrome.webNavigation.onCommitted && chrome.webNavigation.onCommitted.addListener) {
+          useWebNav = true;
+          chrome.webNavigation.onCommitted.addListener(function (details) {
+            if (!dbgAttached[details.tabId]) return;
+            if (details.frameId !== 0) return;
+            var fid = String(details.tabId);
+            emitCdp(details.tabId, "Page.frameStartedLoading", { frameId: fid });
+            emitCdp(details.tabId, "Page.frameNavigated", { frame: { id: fid, loaderId: fid, url: details.url } });
+          });
+          if (chrome.webNavigation.onDOMContentLoaded && chrome.webNavigation.onDOMContentLoaded.addListener) {
+            chrome.webNavigation.onDOMContentLoaded.addListener(function (details) {
+              if (!dbgAttached[details.tabId]) return;
+              if (details.frameId !== 0) return;
+              emitCdp(details.tabId, "Page.lifecycleEvent", { frameId: String(details.tabId), name: "DOMContentLoaded" });
+            });
+          }
+          if (chrome.webNavigation.onCompleted && chrome.webNavigation.onCompleted.addListener) {
+            chrome.webNavigation.onCompleted.addListener(function (details) {
+              if (!dbgAttached[details.tabId]) return;
+              if (details.frameId !== 0) return;
+              var fid = String(details.tabId);
+              emitCdp(details.tabId, "Page.loadEventFired", { timestamp: Date.now() / 1000 });
+              emitCdp(details.tabId, "Page.frameStoppedLoading", { frameId: fid });
+              emitCdp(details.tabId, "Page.lifecycleEvent", { frameId: fid, name: "load" });
+            });
+          }
         }
-      });
+      } catch (e) { useWebNav = false; }
+      if (!useWebNav && chrome.tabs.onUpdated && chrome.tabs.onUpdated.addListener) {
+        chrome.tabs.onUpdated.addListener(function (tabId, info, tab) {
+          if (!dbgAttached[tabId]) return;
+          var fid = String(tabId);
+          var url = (tab && tab.url) || info.url || "";
+          if (info.status === "loading") {
+            emitCdp(tabId, "Page.frameStartedLoading", { frameId: fid });
+            emitCdp(tabId, "Page.frameNavigated", { frame: { id: fid, loaderId: fid, url: url } });
+          } else if (info.status === "complete") {
+            emitCdp(tabId, "Page.loadEventFired", { timestamp: Date.now() / 1000 });
+            emitCdp(tabId, "Page.frameStoppedLoading", { frameId: fid });
+            emitCdp(tabId, "Page.lifecycleEvent", { frameId: fid, name: "load" });
+          }
+        });
+      }
       // A driven tab closing mid-run is an involuntary detach: Chrome fires
-      // onDetach("target_closed"). Without this the agent's onDetach cleanup
-      // never runs and waiters can hang on a dead tab.
+      // onDetach("target_closed"). Registered regardless of the event source above.
       if (chrome.tabs.onRemoved && chrome.tabs.onRemoved.addListener) {
         chrome.tabs.onRemoved.addListener(function (tabId) {
           if (!dbgAttached[tabId]) return;
@@ -1531,82 +1737,193 @@ var __C2S_DEBUG__ = false;
 
     var mapButton = function (b) { return b === "right" ? 2 : (b === "middle" ? 1 : 0); };
 
+    // Diagnostic: pipe a line to the broker's ~/viaduct-cdp.log via the appex native
+    // route (the same {op}+__c2sNM envelope the WS relay uses). Fire-and-forget; any gap
+    // is swallowed. TEMPORARY — strip together with the broker "clog" op once confirmed.
+    var cdpLog = function (line) { return; // no-op: sendNativeMessage per command contends with the poll loop; broker-side log covers diagnosis
+      try {
+        var api = (typeof chrome !== "undefined" ? chrome : (typeof browser !== "undefined" ? browser : null));
+        if (!(api && api.runtime && api.runtime.sendNativeMessage)) return;
+        var env = { __c2sNM: 1, op: "clog", line: (Date.now() % 100000) + " " + String(line) };
+        var p = null;
+        try { p = api.runtime.sendNativeMessage("application.id", env); } catch (e) { p = null; }
+        if (p && typeof p.then === "function") { p.then(function () {}, function () {}); return; }
+        try { api.runtime.sendNativeMessage("application.id", env, function () { try { void api.runtime.lastError; } catch (e) {} }); } catch (e) {}
+      } catch (e) {}
+    };
+
+    // DIAGNOSTIC: observe the panel<->background port relay ("cdp"/"debugger"). The
+    // popover closing tears down the panel, disconnecting this port -> the CDP transport
+    // dies. Adds an OBSERVER listener only (does not consume/alter the port).
+    try {
+      if (chrome.runtime && chrome.runtime.onConnect && chrome.runtime.onConnect.addListener) {
+        chrome.runtime.onConnect.addListener(function (port) {
+          try {
+            cdpLog("PORT+ " + (port && port.name));
+            if (port && port.onDisconnect && port.onDisconnect.addListener) port.onDisconnect.addListener(function () { try { cdpLog("PORT- " + (port && port.name)); } catch (e) {} });
+          } catch (e) {}
+        });
+      }
+    } catch (e) {}
+
     // --- functions injected into the target tab (must be self-contained) ---
     var pageMouse = function (x, y, type, button, clickCount) {
-      var el = document.elementFromPoint(x, y) || document.body;
-      if (!el) return false;
-      var common = { bubbles: true, cancelable: true, composed: true, view: window,
-        clientX: x, clientY: y, button: button, buttons: type === "mousePressed" ? 1 : 0 };
+      // Drill same-origin iframes: elementFromPoint returns the <iframe> element, not
+      // its content, and a click on the iframe never reaches the inner document.
+      // Recurse into the frame with frame-relative coords. Cross-origin frames expose
+      // no contentDocument -> stop (unreachable, a platform limit).
+      var doc = document, cx = x, cy = y, el = doc.elementFromPoint(cx, cy) || document.body;
+      for (var g = 0; g < 8 && el && el.tagName === "IFRAME"; g++) {
+        var idoc = null; try { idoc = el.contentDocument; } catch (e) { idoc = null; }
+        if (!idoc) break;
+        var fr = el.getBoundingClientRect();
+        cx -= fr.left; cy -= fr.top;
+        var inner = idoc.elementFromPoint(cx, cy);
+        if (!inner) break;
+        doc = idoc; el = inner;
+      }
+      if (!el) return { ok: false, iw: window.innerWidth, ih: window.innerHeight, dpr: window.devicePixelRatio || 1, x: x, y: y };
+      var W = doc.defaultView || window;
+      var PE = W.PointerEvent || W.MouseEvent || MouseEvent, ME = W.MouseEvent || MouseEvent;
+      var common = { bubbles: true, cancelable: true, composed: true, view: W,
+        clientX: cx, clientY: cy, button: button, buttons: type === "mousePressed" ? 1 : 0 };
       var fire = function (name, Ctor) {
         try { el.dispatchEvent(new Ctor(name, Object.assign({ pointerId: 1, isPrimary: true, pointerType: "mouse" }, common))); }
-        catch (e) { try { el.dispatchEvent(new MouseEvent(name, common)); } catch (e2) {} }
+        catch (e) { try { el.dispatchEvent(new ME(name, common)); } catch (e2) {} }
       };
       if (type === "mousePressed") {
-        fire("pointerdown", window.PointerEvent || MouseEvent);
-        fire("mousedown", MouseEvent);
+        fire("pointerdown", PE);
+        fire("mousedown", ME);
         if (typeof el.focus === "function") { try { el.focus(); } catch (e) {} }
       } else if (type === "mouseReleased") {
-        fire("pointerup", window.PointerEvent || MouseEvent);
-        fire("mouseup", MouseEvent);
-        try { el.dispatchEvent(new MouseEvent("click", Object.assign({}, common, { detail: clickCount || 1 }))); } catch (e) {}
-        if ((clickCount || 1) >= 2) { try { el.dispatchEvent(new MouseEvent("dblclick", common)); } catch (e) {} }
+        fire("pointerup", PE);
+        fire("mouseup", ME);
+        try { el.dispatchEvent(new ME("click", Object.assign({}, common, { detail: clickCount || 1 }))); } catch (e) {}
+        if ((clickCount || 1) >= 2) { try { el.dispatchEvent(new ME("dblclick", common)); } catch (e) {} }
       } else if (type === "mouseMoved") {
-        fire("pointermove", window.PointerEvent || MouseEvent);
-        fire("mousemove", MouseEvent);
+        fire("pointermove", PE);
+        fire("mousemove", ME);
       }
-      return true;
+      return { ok: true, tag: (el.tagName || ""), id: (el.id || ""), cls: (typeof el.className === "string" ? el.className.slice(0, 40) : ""), iw: window.innerWidth, ih: window.innerHeight, dpr: window.devicePixelRatio || 1, x: x, y: y };
     };
 
     var pageWheel = function (x, y, dx, dy) {
-      var el = document.elementFromPoint(x, y) || document.scrollingElement || document.body;
-      try { el.dispatchEvent(new WheelEvent("wheel", { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, deltaX: dx || 0, deltaY: dy || 0 })); } catch (e) {}
-      var sc = document.scrollingElement || document.documentElement;
+      var doc = document, cx = x, cy = y, el = doc.elementFromPoint(cx, cy);
+      for (var g = 0; g < 8 && el && el.tagName === "IFRAME"; g++) {
+        var idoc = null; try { idoc = el.contentDocument; } catch (e) { idoc = null; }
+        if (!idoc) break;
+        var fr = el.getBoundingClientRect();
+        cx -= fr.left; cy -= fr.top;
+        var inner = idoc.elementFromPoint(cx, cy);
+        if (!inner) break;
+        doc = idoc; el = inner;
+      }
+      var W = doc.defaultView || window;
+      el = el || doc.scrollingElement || doc.body;
+      try { el.dispatchEvent(new (W.WheelEvent || WheelEvent)("wheel", { bubbles: true, cancelable: true, composed: true, clientX: cx, clientY: cy, deltaX: dx || 0, deltaY: dy || 0 })); } catch (e) {}
+      var sc = doc.scrollingElement || doc.documentElement;
       if (sc) { sc.scrollLeft += dx || 0; sc.scrollTop += dy || 0; }
       return true;
     };
 
     var pageKey = function (type, key, code, keyCode, text, modifiers) {
-      var target = document.activeElement || document.body;
+      var setNativeValue = function (el, val) {
+        // React/Vue install a value tracker; a raw el.value = ... is ignored (tracker
+        // sees no change) so typed text never sticks. Go through the prototype's native
+        // setter, which the tracker DOES observe.
+        try {
+          var proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+          var desc = Object.getOwnPropertyDescriptor(proto, "value");
+          if (desc && desc.set) { desc.set.call(el, val); return; }
+        } catch (e) {}
+        el.value = val;
+      };
+      // Drill same-origin iframes so the key lands on the real focused element, not
+      // the <iframe> host (document.activeElement is the iframe when focus is inside).
+      var doc = document;
+      for (var g = 0; g < 8; g++) {
+        var ae = doc.activeElement;
+        if (ae && ae.tagName === "IFRAME") { var idoc = null; try { idoc = ae.contentDocument; } catch (e) { idoc = null; } if (idoc) { doc = idoc; continue; } }
+        break;
+      }
+      var W = doc.defaultView || window;
+      var target = doc.activeElement || doc.body;
       var name = type === "keyUp" ? "keyup" : (type === "rawKeyDown" || type === "keyDown" ? "keydown" : null);
+      var isEnter = key === "Enter" || keyCode === 13;
       var init = { bubbles: true, cancelable: true, composed: true, key: key || "", code: code || "",
         keyCode: keyCode || 0, which: keyCode || 0,
         altKey: !!(modifiers & 1), ctrlKey: !!(modifiers & 2), metaKey: !!(modifiers & 4), shiftKey: !!(modifiers & 8) };
-      if (name && target) { try { target.dispatchEvent(new KeyboardEvent(name, init)); } catch (e) {} }
-      if ((type === "char" || type === "keyDown") && text && text.length) {
-        var t = document.activeElement;
+      var notPrevented = true;
+      if (name && target) { try { notPrevented = target.dispatchEvent(new (W.KeyboardEvent || KeyboardEvent)(name, init)); } catch (e) {} }
+      // Implicit form submit: browsers only submit on a TRUSTED Enter, so emulate it
+      // (unmodified Enter in a text field whose keydown wasn't preventDefaulted).
+      if (name === "keydown" && isEnter && !modifiers && notPrevented && target && target.tagName === "INPUT") {
+        var form = target.form;
+        if (form) {
+          var submitBtn = form.querySelector("button[type=submit],input[type=submit],button:not([type])");
+          try {
+            if (form.requestSubmit) { form.requestSubmit(submitBtn || undefined); }
+            else if (submitBtn) { submitBtn.click(); }
+            else { form.submit(); }
+          } catch (e) {}
+        }
+      }
+      if ((type === "char" || type === "keyDown") && text && text.length && !isEnter) {
+        var t = doc.activeElement;
         if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) {
           var s = t.selectionStart != null ? t.selectionStart : t.value.length;
           var e2 = t.selectionEnd != null ? t.selectionEnd : t.value.length;
-          t.value = t.value.slice(0, s) + text + t.value.slice(e2);
-          t.selectionStart = t.selectionEnd = s + text.length;
-          try { t.dispatchEvent(new Event("input", { bubbles: true })); } catch (e) {}
+          setNativeValue(t, t.value.slice(0, s) + text + t.value.slice(e2));
+          try { t.selectionStart = t.selectionEnd = s + text.length; } catch (e) {}
+          try { t.dispatchEvent(new (W.InputEvent || InputEvent)("input", { bubbles: true, data: text, inputType: "insertText" })); } catch (e) { try { t.dispatchEvent(new Event("input", { bubbles: true })); } catch (e3) {} }
         } else if (t && t.isContentEditable) {
-          try { document.execCommand("insertText", false, text); } catch (e) {}
-          try { t.dispatchEvent(new InputEvent("input", { bubbles: true, data: text })); } catch (e) {}
+          try { doc.execCommand("insertText", false, text); } catch (e) {}
+          try { t.dispatchEvent(new (W.InputEvent || InputEvent)("input", { bubbles: true, data: text })); } catch (e) {}
         }
       }
       return true;
     };
 
     var pageInsertText = function (text) {
-      var t = document.activeElement;
+      var setNativeValue = function (el, val) {
+        try {
+          var proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+          var desc = Object.getOwnPropertyDescriptor(proto, "value");
+          if (desc && desc.set) { desc.set.call(el, val); return; }
+        } catch (e) {}
+        el.value = val;
+      };
+      var doc = document;
+      for (var g = 0; g < 8; g++) {
+        var ae = doc.activeElement;
+        if (ae && ae.tagName === "IFRAME") { var idoc = null; try { idoc = ae.contentDocument; } catch (e) { idoc = null; } if (idoc) { doc = idoc; continue; } }
+        break;
+      }
+      var W = doc.defaultView || window;
+      var t = doc.activeElement;
       if (!t) return false;
       if (t.tagName === "INPUT" || t.tagName === "TEXTAREA") {
         var s = t.selectionStart != null ? t.selectionStart : t.value.length;
         var e2 = t.selectionEnd != null ? t.selectionEnd : t.value.length;
-        t.value = t.value.slice(0, s) + text + t.value.slice(e2);
-        t.selectionStart = t.selectionEnd = s + text.length;
-        try { t.dispatchEvent(new Event("input", { bubbles: true })); } catch (e) {}
+        setNativeValue(t, t.value.slice(0, s) + text + t.value.slice(e2));
+        try { t.selectionStart = t.selectionEnd = s + text.length; } catch (e) {}
+        try { t.dispatchEvent(new (W.InputEvent || InputEvent)("input", { bubbles: true, data: text, inputType: "insertText" })); } catch (e) { try { t.dispatchEvent(new Event("input", { bubbles: true })); } catch (e3) {} }
         return true;
       }
       if (t.isContentEditable) {
-        try { document.execCommand("insertText", false, text); } catch (e) {}
-        try { t.dispatchEvent(new InputEvent("input", { bubbles: true, data: text })); } catch (e) {}
+        try { doc.execCommand("insertText", false, text); } catch (e) {}
+        try { t.dispatchEvent(new (W.InputEvent || InputEvent)("input", { bubbles: true, data: text })); } catch (e) {}
         return true;
       }
       return false;
     };
 
+    // --- Unified page-context CDP executor. Serialized + injected via
+    // chrome.scripting into the MAIN world so (a) Runtime.evaluate sees the page's
+    // real globals and (b) DOM node handles and Runtime object handles share ONE
+    // per-frame registry (window.__c2sCdp) — enabling objectId round-trips
+    // (evaluate -> objectId -> callFunctionOn/getProperties) that a split
+    // isolated/MAIN world could never support. Must be fully self-contained. ---
     var inject = function (tabId, fn, args, world) {
       if (!chrome.scripting || !chrome.scripting.executeScript || tabId == null) return Promise.resolve(undefined);
       var opts = { target: { tabId: tabId }, func: fn, args: args };
@@ -1617,61 +1934,448 @@ var __C2S_DEBUG__ = false;
       );
     };
 
+    // ArrayBuffer -> base64 (SW/background-safe: no FileReader). Chunked so
+    // String.fromCharCode.apply never overflows the argument limit on big images.
+    var b64 = function (ab) {
+      var bytes = new Uint8Array(ab), bin = "", CH = 0x8000;
+      for (var i = 0; i < bytes.length; i += CH) { bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH)); }
+      return btoa(bin);
+    };
+
+    var cdpExec = function (op, p) {
+      p = p || {};
+      if (!window.__c2sCdp) window.__c2sCdp = { nodes: [], objects: [] };
+      var reg = window.__c2sCdp;
+      var objIdx = function (oid) { var s = String(oid || ""); return s.indexOf("obj-") === 0 ? (parseInt(s.slice(4), 10) - 1) : -1; };
+      var remote = function (v) {
+        var t = typeof v;
+        if (v === null) return { type: "object", subtype: "null", value: null };
+        if (t === "undefined") return { type: "undefined" };
+        if (t === "boolean" || t === "number" || t === "string") return { type: t, value: v };
+        if (t === "symbol") return { type: "symbol", description: String(v) };
+        if (t === "bigint") return { type: "bigint", unserializableValue: String(v) + "n", description: String(v) };
+        var id = reg.objects.push(v); // index + 1
+        var ro = { type: t, objectId: "obj-" + id };
+        if (t === "function") { ro.className = "Function"; ro.description = "function"; return ro; }
+        if (v && v.nodeType) { ro.subtype = "node"; ro.className = (v.constructor && v.constructor.name) || "Node"; ro.description = v.nodeName || "node"; return ro; }
+        if (Array.isArray(v)) { ro.subtype = "array"; ro.className = "Array"; ro.description = "Array(" + v.length + ")"; return ro; }
+        ro.className = (v && v.constructor && v.constructor.name) || "Object";
+        ro.description = ro.className;
+        return ro;
+      };
+      var byValue = function (v) {
+        try { return { type: typeof v, value: JSON.parse(JSON.stringify(v)) }; }
+        catch (e) { return remote(v); } // circular / non-JSON-able -> hand back a handle
+      };
+      var pack = function (v) { return { result: p.returnByValue ? byValue(v) : remote(v) }; };
+      var packErr = function (e) { return { result: { type: "undefined" }, exceptionDetails: { text: String((e && e.message) || e), exception: remote(e) } }; };
+      // Honor awaitPromise: if the value is thenable, resolve it and pack the settled
+      // value (executeScript awaits a returned Promise). Non-awaited thenables still
+      // come back as a handle, so no regression when awaitPromise is unset.
+      var settle = function (v) {
+        if (p.awaitPromise && v && typeof v.then === "function") { return v.then(function (rv) { return pack(rv); }, function (er) { return packErr(er); }); }
+        return pack(v);
+      };
+      var getEl = function (nodeId) { return reg.nodes[(nodeId || 0) - 1]; };
+      var attrsOf = function (el) { var a = []; if (el && el.attributes) { for (var i = 0; i < el.attributes.length; i++) { a.push(el.attributes[i].name); a.push(el.attributes[i].value); } } return a; };
+      switch (op) {
+        case "dpr":
+          return { iw: innerWidth, ih: innerHeight, dpr: devicePixelRatio || 1 };
+        case "getLayoutMetrics": {
+          var de = document.documentElement || {};
+          var sx = scrollX || pageXOffset || 0, sy = scrollY || pageYOffset || 0;
+          var iw = innerWidth, ih = innerHeight, dpr = devicePixelRatio || 1;
+          var cw = de.scrollWidth || iw, ch = de.scrollHeight || ih;
+          return {
+            layoutViewport: { pageX: sx, pageY: sy, clientWidth: iw, clientHeight: ih },
+            visualViewport: { offsetX: 0, offsetY: 0, pageX: sx, pageY: sy, clientWidth: iw, clientHeight: ih, scale: 1, zoom: dpr },
+            cssLayoutViewport: { pageX: sx, pageY: sy, clientWidth: iw, clientHeight: ih },
+            cssVisualViewport: { offsetX: 0, offsetY: 0, pageX: sx, pageY: sy, clientWidth: iw, clientHeight: ih, scale: 1 },
+            contentSize: { x: 0, y: 0, width: cw, height: ch }
+          };
+        }
+        case "evaluate": {
+          try { return settle((0, eval)(p.expression || "")); }
+          catch (e) { return packErr(e); }
+        }
+        case "callFunctionOn": {
+          try {
+            var thisObj = p.objectId ? reg.objects[objIdx(p.objectId)] : undefined;
+            var f = (0, eval)("(" + (p.functionDeclaration || "function(){}") + ")");
+            var args = (p.arguments || []).map(function (a) {
+              if (a && a.objectId != null) return reg.objects[objIdx(a.objectId)];
+              if (a && Object.prototype.hasOwnProperty.call(a, "value")) return a.value;
+              return undefined;
+            });
+            return settle(f.apply(thisObj, args));
+          } catch (e) { return packErr(e); }
+        }
+        case "getProperties": {
+          var obj = reg.objects[objIdx(p.objectId)], props = [];
+          if (obj != null) {
+            try {
+              var keys = p.ownProperties ? Object.getOwnPropertyNames(obj) : (function () { var ks = []; for (var k in obj) ks.push(k); return ks; })();
+              for (var i = 0; i < keys.length && props.length < 500; i++) {
+                var name = keys[i], desc = null;
+                try { desc = Object.getOwnPropertyDescriptor(obj, name); } catch (e) {}
+                var isOwn = Object.prototype.hasOwnProperty.call(obj, name);
+                if (desc && desc.get) { props.push({ name: String(name), get: remote(desc.get), enumerable: !!desc.enumerable, configurable: !!desc.configurable, isOwn: isOwn }); continue; }
+                var pv; try { pv = obj[name]; } catch (e) { continue; }
+                props.push({ name: String(name), value: remote(pv), enumerable: desc ? !!desc.enumerable : true, configurable: desc ? !!desc.configurable : true, writable: desc ? !!desc.writable : true, isOwn: isOwn });
+              }
+            } catch (e) {}
+          }
+          return { result: props };
+        }
+        case "releaseObject": { var ix = objIdx(p.objectId); if (ix >= 0) reg.objects[ix] = null; return {}; }
+        case "resolveNode": { var rel = getEl(p.nodeId); return rel ? { object: remote(rel) } : {}; }
+        case "getDocument": {
+          reg.nodes = []; // fresh snapshot; nodeIds from a prior getDocument are invalidated (CDP does the same)
+          var maxDepth = p.depth === -1 ? 5 : (p.depth || 1);
+          var build = function (node, d) {
+            var id = reg.nodes.push(node);
+            var out = { nodeId: id, backendNodeId: id, nodeType: node.nodeType, nodeName: node.nodeName || "", localName: node.localName || "", nodeValue: node.nodeValue || "", attributes: attrsOf(node), childNodeCount: node.children ? node.children.length : 0, children: [] };
+            if (d < maxDepth && node.children) { for (var i = 0; i < node.children.length; i++) out.children.push(build(node.children[i], d + 1)); }
+            return out;
+          };
+          var root = document.documentElement;
+          return { root: root ? build(root, 0) : null };
+        }
+        case "describeNode": {
+          var dn = getEl(p.nodeId); if (!dn) return { node: null };
+          return { node: { nodeId: p.nodeId, backendNodeId: p.nodeId, nodeType: dn.nodeType, nodeName: dn.nodeName || "", localName: dn.localName || "", attributes: attrsOf(dn) } };
+        }
+        case "getBoxModel": {
+          var be = getEl(p.nodeId); if (!be || !be.getBoundingClientRect) return null;
+          var r = be.getBoundingClientRect(), q = [r.left, r.top, r.left + r.width, r.top, r.left + r.width, r.top + r.height, r.left, r.top + r.height];
+          return { model: { content: q, padding: q, border: q, margin: q, width: r.width, height: r.height } };
+        }
+        case "getContentQuads": {
+          var ce = getEl(p.nodeId); if (!ce || !ce.getBoundingClientRect) return { quads: [] };
+          var cr = ce.getBoundingClientRect();
+          return { quads: [[cr.left, cr.top, cr.left + cr.width, cr.top, cr.left + cr.width, cr.top + cr.height, cr.left, cr.top + cr.height]] };
+        }
+        case "querySelector": {
+          var qroot = getEl(p.nodeId) || document, qel;
+          try { qel = qroot.querySelector(p.selector || ""); } catch (e) { qel = null; }
+          return qel ? { nodeId: reg.nodes.push(qel) } : { nodeId: 0 };
+        }
+        case "scrollIntoView": { var se = getEl(p.nodeId); if (se && se.scrollIntoView) { try { se.scrollIntoView({ block: "center", inline: "center" }); } catch (e) {} } return {}; }
+        case "focus": { var fe = getEl(p.nodeId); if (fe && fe.focus) { try { fe.focus(); } catch (e) {} } return {}; }
+        case "axTree": {
+          var MAX = 4000, list = [], idx = new Map();
+          var collect = function (el) { if (list.length >= MAX) return; idx.set(el, list.length); list.push(el); for (var i = 0; i < el.children.length && list.length < MAX; i++) collect(el.children[i]); };
+          if (document.documentElement) collect(document.documentElement);
+          var roleOf = function (el) { var rl = el.getAttribute && el.getAttribute("role"); if (rl) return rl; var tg = (el.tagName || "").toLowerCase(); if (tg === "button") return "button"; if (tg === "a" && el.getAttribute("href") != null) return "link"; if (tg === "h1" || tg === "h2" || tg === "h3" || tg === "h4" || tg === "h5" || tg === "h6") return "heading"; if (tg === "input" || tg === "textarea") return "textbox"; if (tg === "img") return "img"; if (tg === "ul" || tg === "ol") return "list"; if (tg === "li") return "listitem"; return "generic"; };
+          var nameOf = function (el) { var n = el.getAttribute && (el.getAttribute("aria-label") || el.getAttribute("alt")); if (!n && el.labels && el.labels.length) n = el.labels[0].textContent; if (!n) { var t = ""; for (var i = 0; i < el.childNodes.length; i++) { if (el.childNodes[i].nodeType === 3) t += el.childNodes[i].nodeValue; } n = t; } n = (n || "").replace(/\s+/g, " ").replace(/^\s+|\s+$/g, ""); if (n.length > 200) n = n.slice(0, 200); return n; };
+          var axnodes = [];
+          for (var i2 = 0; i2 < list.length; i2++) { var e2 = list[i2], cids = []; for (var c = 0; c < e2.children.length; c++) { var ci = idx.has(e2.children[c]) ? idx.get(e2.children[c]) : -1; if (ci >= 0) cids.push(String(ci + 1)); } axnodes.push({ nodeId: String(i2 + 1), ignored: false, role: { type: "role", value: roleOf(e2) }, name: { type: "computedString", value: nameOf(e2) }, childIds: cids, backendDOMNodeId: i2 + 1 }); }
+          return { nodes: axnodes };
+        }
+        default:
+          return {};
+      }
+    };
+
+    // Inject cdpExec preferring the MAIN world (page globals + shared registry).
+    // Falls back to the isolated world if MAIN injection is unavailable (Safari
+    // < 16.4): DOM ops still work there; only page-global visibility degrades.
+    var pageExec = function (tabId, op, p, wantMain) {
+      if (!chrome.scripting || !chrome.scripting.executeScript || tabId == null) return Promise.resolve(undefined);
+      var run = function (world) {
+        var opts = { target: { tabId: tabId }, func: cdpExec, args: [op, p || {}] };
+        if (world) opts.world = world;
+        return chrome.scripting.executeScript(opts).then(function (r) { return (r && r[0]) ? r[0].result : undefined; });
+      };
+      // DOM/AX/box/layout reads only touch the SHARED DOM, so run them in the ISOLATED
+      // world, which is not subject to the page's CSP. Injecting into the MAIN world on a
+      // strict-CSP page (e.g. GitHub) can stall ~5s in Safari, blocking the native poll
+      // channel and timing out the agent's "confirm page state" read. Only evaluate/
+      // callFunctionOn/getProperties (page globals + objectId registry) need MAIN.
+      if (!wantMain) return run().then(function (v) { return v; }, function () { return undefined; });
+      // MAIN-world eval runs under the PAGE's CSP: on a page that forbids `eval`
+      // (github: `script-src` with no `unsafe-eval`), cdpExec's `(0,eval)(expr)` throws
+      // EvalError and every Runtime.evaluate/callFunctionOn fails, wedging the agent's
+      // page-inspection loop. The ISOLATED world runs under the EXTENSION's CSP where
+      // eval is allowed and still sees the shared DOM, so fall back to it when MAIN
+      // reports a CSP eval refusal. Page-only globals become invisible in that fallback
+      // (a strict-CSP page can't expose them to injected eval anyway).
+      var isCspEvalFail = function (v) {
+        var ex = v && v.exceptionDetails;
+        if (!ex) return false;
+        if (ex.exception && ex.exception.className === "EvalError") return true;
+        return /unsafe-eval|trusted-types-eval/.test(String(ex.text || ""));
+      };
+      return run("MAIN").then(
+        function (v) { return isCspEvalFail(v) ? run().then(function (w) { return w; }, function () { return v; }) : v; },
+        function () { return run().then(function (v) { return v; }, function () { return undefined; }); }
+      );
+    };
+
     var screenshot = function (tabId, params) {
       params = params || {};
-      var opts = { format: params.format === "jpeg" ? "jpeg" : "png" };
-      if (opts.format === "jpeg" && params.quality != null) opts.quality = params.quality;
-      var capture = function (windowId) {
+      var fmt = params.format === "jpeg" ? "jpeg" : "png";
+      var opts = { format: fmt };
+      if (fmt === "jpeg" && params.quality != null) opts.quality = params.quality;
+      var toResult = function (dataUrl) { var d = String(dataUrl), ci = d.indexOf(","); return { data: ci >= 0 ? d.slice(ci + 1) : d }; };
+      var capture = function (windowId, attempt) {
+        attempt = attempt || 0;
         return new Promise(function (resolve, reject) {
           try {
             chrome.tabs.captureVisibleTab(windowId, opts, function (dataUrl) {
-              if (chrome.runtime.lastError || !dataUrl) { reject(new Error(chrome.runtime.lastError ? chrome.runtime.lastError.message : "captureVisibleTab failed")); return; }
-              var d = String(dataUrl); var ci = d.indexOf(",");
-              resolve({ data: ci >= 0 ? d.slice(ci + 1) : d });
+              var err = chrome.runtime.lastError;
+              if (err || !dataUrl) {
+                var msg = err ? err.message : "captureVisibleTab failed";
+                // captureVisibleTab is rate-limited (MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND).
+                // Back off and retry rather than returning a blank frame the agent would
+                // misread as an empty page.
+                if (attempt < 3 && /capture|per second|rate/i.test(String(msg))) {
+                  setTimeout(function () { capture(windowId, attempt + 1).then(resolve, reject); }, 300 * (attempt + 1));
+                  return;
+                }
+                reject(new Error(msg)); return;
+              }
+              resolve(String(dataUrl));
             });
           } catch (e) { reject(e); }
         });
       };
+      // Post-process the raw capture. captureVisibleTab returns DEVICE pixels (2x on
+      // Retina), but CDP Input.* coordinates are CSS px. If the agent computes a click
+      // from a raw 2x screenshot and sends it as-is, the click lands at ~2x the intended
+      // point -> misses -> the agent re-screenshots, sees no change, and loops. So
+      // NORMALIZE to CSS px by default (scale = 1/dpr); when the agent set an explicit
+      // deviceScaleFactor it reasons in CSS*dsf space, so deliver at dsf/dpr. Also crop
+      // {clip} here (captureVisibleTab can't clip). Needs OffscreenCanvas; any gap or
+      // failure returns the raw capture (never worse than before).
+      var ov = dbgMetrics[tabId];
+      var clip = params.clip;
+      var hasClip = !!(clip && clip.width > 0 && clip.height > 0);
+      // Decode a data: URL to a Blob WITHOUT fetch(): Safari's extension-page CSP
+      // treats fetch("data:...") as a connect-src fetch and blocks it (no `connect-src
+      // data:` in the manifest), so the old fetch-based decode threw on every page and
+      // the downscale silently degraded to the RAW 2x capture — the agent then computed
+      // clicks against a double-size screenshot and missed every target. atob is a pure
+      // string op with no CSP surface.
+      var dataUrlToBlob = function (u) {
+        var ci = String(u).indexOf(","); if (ci < 0) return null;
+        var meta = u.slice(0, ci), b64s = u.slice(ci + 1);
+        var mt = (/data:([^;,]+)/.exec(meta) || [])[1] || "image/png";
+        var bin = atob(b64s), bytes = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return new Blob([bytes], { type: mt });
+      };
+      var maybeScale = function (dataUrl) {
+        if (typeof OffscreenCanvas === "undefined" || typeof createImageBitmap !== "function" || typeof atob !== "function") return Promise.resolve(toResult(dataUrl));
+        return pageExec(tabId, "dpr", {}).then(function (m) {
+          if (!m || !m.dpr) return toResult(dataUrl);
+          var dpr = m.dpr;
+          var scale = (ov && ov.dsf > 0) ? (ov.dsf / dpr) : (1 / dpr);
+          if (hasClip && clip.scale) scale *= clip.scale;
+          try { cdpLog("shot iw=" + m.iw + " ih=" + m.ih + " dpr=" + dpr + " ovDsf=" + (ov && ov.dsf ? ov.dsf : "-") + " scale=" + scale); } catch (e) {}
+          // Nothing to do: no clip and not downscaling (dpr==1, or dsf>=dpr).
+          if (!hasClip && scale >= 1) return toResult(dataUrl);
+          var blob = dataUrlToBlob(dataUrl);
+          if (!blob) return toResult(dataUrl);
+          return createImageBitmap(blob).then(function (bmp) {
+            var sx = 0, sy = 0, sw = bmp.width, sh = bmp.height;
+            if (hasClip) {
+              sx = Math.max(0, Math.round(clip.x * dpr)); sy = Math.max(0, Math.round(clip.y * dpr));
+              sw = Math.min(bmp.width - sx, Math.round(clip.width * dpr)); sh = Math.min(bmp.height - sy, Math.round(clip.height * dpr));
+            }
+            if (!(sw > 0 && sh > 0)) { try { bmp.close && bmp.close(); } catch (e) {} return toResult(dataUrl); }
+            var dw = Math.max(1, Math.round(sw * scale)), dh = Math.max(1, Math.round(sh * scale));
+            var canvas = new OffscreenCanvas(dw, dh);
+            canvas.getContext("2d").drawImage(bmp, sx, sy, sw, sh, 0, 0, dw, dh);
+            try { bmp.close && bmp.close(); } catch (e) {}
+            return canvas.convertToBlob({ type: fmt === "jpeg" ? "image/jpeg" : "image/png" }).then(function (ob) { return ob.arrayBuffer(); }).then(function (ab) { return { data: b64(ab) }; });
+          });
+        }).catch(function () { return toResult(dataUrl); });
+      };
+      var finish = function (resolve, reject, windowId) {
+        var doCap = function () { capture(windowId).then(function (d) { maybeScale(d).then(resolve, function () { resolve(toResult(d)); }); }, reject); };
+        // captureVisibleTab grabs the ACTIVE tab of the window, not necessarily the
+        // attached tabId. Activate the target first so we shoot the right page (agents
+        // usually call Target.activateTarget, but must not have to).
+        if (chrome.tabs && chrome.tabs.update && tabId != null) {
+          try { chrome.tabs.update(tabId, { active: true }, function () { doCap(); }); return; } catch (e) {}
+        }
+        doCap();
+      };
       return new Promise(function (resolve, reject) {
         try {
           chrome.tabs.get(tabId, function (tab) {
-            if (chrome.runtime.lastError || !tab) { capture().then(resolve, reject); return; }
-            capture(tab.windowId).then(resolve, reject);
+            finish(resolve, reject, (chrome.runtime.lastError || !tab) ? undefined : tab.windowId);
           });
-        } catch (e) { capture().then(resolve, reject); }
+        } catch (e) { finish(resolve, reject, undefined); }
       });
     };
 
     var evaluate = function (tabId, params) {
       params = params || {};
-      // CDP Runtime.evaluate runs in the page's MAIN world; inject there so the
-      // expression sees the page's JS globals (the isolated world shares the DOM
-      // but not page window properties, which would silently yield undefined).
-      return inject(tabId, function (code) {
-        try { return { ok: true, value: (0, eval)(code) }; }
-        catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
-      }, [params.expression || ""], "MAIN").then(function (res) {
-        if (res && res.ok) return { result: { type: typeof res.value, value: res.value } };
-        return { result: { type: "undefined" }, exceptionDetails: { text: (res && res.error) || "evaluate failed" } };
+      return pageExec(tabId, "evaluate", params, true).then(function (r) {
+        return r || { result: { type: "undefined" }, exceptionDetails: { text: "evaluate failed" } };
       });
     };
 
     var runCommand = function (target, method, params) {
-      var tabId = target && target.tabId;
+      var tabId = tabIdOf(target);
       params = params || {};
       switch (method) {
         case "Page.captureScreenshot": return screenshot(tabId, params);
         case "Runtime.evaluate": return evaluate(tabId, params);
         case "Input.dispatchMouseEvent":
           if (params.type === "mouseWheel") return inject(tabId, pageWheel, [params.x || 0, params.y || 0, params.deltaX || 0, params.deltaY || 0]).then(function () { return {}; });
-          return inject(tabId, pageMouse, [params.x || 0, params.y || 0, params.type, mapButton(params.button), params.clickCount || 1]).then(function () { return {}; });
+          return inject(tabId, pageMouse, [params.x || 0, params.y || 0, params.type, mapButton(params.button), params.clickCount || 1]).then(function (info) { try { cdpLog("mouse " + params.type + " @" + (params.x || 0) + "," + (params.y || 0) + " -> " + JSON.stringify(info)); } catch (e) {} return {}; });
         case "Input.dispatchKeyEvent":
           return inject(tabId, pageKey, [params.type, params.key, params.code, params.windowsVirtualKeyCode || params.nativeVirtualKeyCode || 0, params.text, params.modifiers || 0]).then(function () { return {}; });
         case "Input.insertText":
           return inject(tabId, pageInsertText, [params.text || ""]).then(function () { return {}; });
+        case "Page.navigate":
+          return new Promise(function (resolve) {
+            if (chrome.tabs && chrome.tabs.update && tabId != null) {
+              try { chrome.tabs.update(tabId, { url: params.url }, function () { resolve({ frameId: String(tabId), loaderId: String(tabId) }); }); return; } catch (e) {}
+            }
+            resolve({ frameId: String(tabId), loaderId: String(tabId) });
+          });
+        case "Page.getLayoutMetrics":
+          return pageExec(tabId, "getLayoutMetrics", {}).then(function (m) {
+            return m || { layoutViewport: { pageX: 0, pageY: 0, clientWidth: 0, clientHeight: 0 }, visualViewport: { offsetX: 0, offsetY: 0, pageX: 0, pageY: 0, clientWidth: 0, clientHeight: 0, scale: 1, zoom: 1 }, cssLayoutViewport: { pageX: 0, pageY: 0, clientWidth: 0, clientHeight: 0 }, cssVisualViewport: { offsetX: 0, offsetY: 0, pageX: 0, pageY: 0, clientWidth: 0, clientHeight: 0, scale: 1 }, contentSize: { x: 0, y: 0, width: 0, height: 0 } };
+          });
+        case "Page.getFrameTree":
+          return new Promise(function (resolve) {
+            var done = function (url) { resolve({ frameTree: { frame: { id: String(tabId), loaderId: String(tabId), url: url || "", securityOrigin: "", mimeType: "text/html" }, childFrames: [] } }); };
+            if (chrome.tabs && chrome.tabs.get && tabId != null) { try { chrome.tabs.get(tabId, function (tab) { done((tab && tab.url) || ""); }); return; } catch (e) {} }
+            done("");
+          });
+        case "Emulation.setDeviceMetricsOverride":
+          if (tabId != null) dbgMetrics[tabId] = { dsf: params.deviceScaleFactor };
+          return Promise.resolve({});
+        case "Emulation.clearDeviceMetricsOverride":
+          if (tabId != null) delete dbgMetrics[tabId];
+          return Promise.resolve({});
+        case "Emulation.setUserAgentOverride":
+        case "Emulation.setEmulatedMedia":
+        case "Emulation.setTouchEmulationEnabled":
+        case "Emulation.setScrollbarsHidden":
+          return Promise.resolve({});
+        case "Runtime.callFunctionOn":
+          return pageExec(tabId, "callFunctionOn", params, true).then(function (r) { return r || { result: { type: "undefined" }, exceptionDetails: { text: "callFunctionOn failed" } }; });
+        case "Runtime.getProperties":
+          return pageExec(tabId, "getProperties", params, true).then(function (r) { return r || { result: [] }; });
+        case "Runtime.releaseObject":
+          return pageExec(tabId, "releaseObject", params).then(function () { return {}; });
+        case "Runtime.releaseObjectGroup":
+          return Promise.resolve({});
+        case "Target.getTargets":
+          return new Promise(function (resolve) {
+            if (chrome.tabs && chrome.tabs.query) {
+              try { chrome.tabs.query({}, function (tabs) { resolve({ targetInfos: (tabs || []).map(function (t) { return { targetId: "tab-" + t.id, type: "page", title: t.title || "", url: t.url || "", attached: !!dbgAttached[t.id], browserContextId: "default" }; }) }); }); return; } catch (e) {}
+            }
+            resolve({ targetInfos: [] });
+          });
+        case "Target.getTargetInfo":
+          return new Promise(function (resolve) {
+            var wantId = params.targetId;
+            var mk = function (t) { return { targetId: "tab-" + t.id, type: "page", title: t.title || "", url: t.url || "", attached: !!dbgAttached[t.id], browserContextId: "default" }; };
+            var fallback = { targetId: wantId || ("tab-" + tabId), type: "page", title: "", url: "", attached: !!dbgAttached[tabId], browserContextId: "default" };
+            if (chrome.tabs && chrome.tabs.query) {
+              try {
+                chrome.tabs.query({}, function (tabs) {
+                  tabs = tabs || [];
+                  var found = null;
+                  for (var i = 0; i < tabs.length; i++) {
+                    if (wantId != null && ("tab-" + tabs[i].id) === wantId) { found = tabs[i]; break; }
+                    if (wantId == null && tabs[i].id === tabId) { found = tabs[i]; }
+                  }
+                  resolve({ targetInfo: found ? mk(found) : fallback });
+                });
+                return;
+              } catch (e) {}
+            }
+            resolve({ targetInfo: fallback });
+          });
+        case "Target.attachToTarget":
+          var atId = tabId;
+          if (params.targetId && String(params.targetId).indexOf("tab-") === 0) atId = Number(String(params.targetId).slice(4));
+          if (atId != null) dbgAttached[atId] = true;
+          hookLifecycle();
+          return Promise.resolve({ sessionId: "tab-" + atId });
+        case "Target.closeTarget":
+          var closeId = tabId;
+          if (params.targetId && String(params.targetId).indexOf("tab-") === 0) closeId = Number(String(params.targetId).slice(4));
+          return new Promise(function (resolve) {
+            if (chrome.tabs && chrome.tabs.remove && closeId != null) { try { chrome.tabs.remove(closeId, function () { resolve({ success: true }); }); return; } catch (e) {} }
+            resolve({ success: true });
+          });
+        case "Target.activateTarget":
+          var actId = tabId;
+          if (params.targetId && String(params.targetId).indexOf("tab-") === 0) actId = Number(String(params.targetId).slice(4));
+          return new Promise(function (resolve) {
+            if (chrome.tabs && chrome.tabs.update && actId != null) { try { chrome.tabs.update(actId, { active: true }, function () { resolve({}); }); return; } catch (e) {} }
+            resolve({});
+          });
+        case "Target.setDiscoverTargets":
+          return Promise.resolve({});
+        case "Target.setAutoAttach":
+          // Puppeteer-style clients (the Codex agent) call this then WAIT for a
+          // Target.attachedToTarget event to obtain a flat-mode page SESSION before sending
+          // any page command. Real Chrome emits it via chrome.debugger.onEvent; without it
+          // the client hangs ~40s, reconnects, and loops ("browser connection timed out").
+          // Synthesize it: sessionId == targetId == "tab-<id>", which tabIdOf() resolves
+          // back to the tab for every subsequent session-routed command.
+          try { cdpLog("setAutoAttach aa=" + (params && params.autoAttach) + " flat=" + (params && params.flatten)); } catch (e) {}
+          if (params.autoAttach && tabId != null) {
+            var __sid = "tab-" + tabId;
+            // Emit SYNCHRONOUSLY — do NOT wait on chrome.tabs.get: its async callback gets
+            // dropped when the bg is mid-transition, so the session event never fires and the
+            // agent hangs ~45s then reconnects. url/title are optional for the handshake.
+            try { cdpLog("emit-attached sid=" + __sid + " lis=" + dbgEvtList.length); } catch (e) {}
+            emitCdp(tabId, "Target.attachedToTarget", {
+              sessionId: __sid,
+              waitingForDebugger: false,
+              targetInfo: { targetId: __sid, type: "page", title: "", url: "", attached: true, canAccessOpener: false, browserContextId: "default" },
+            });
+          }
+          return Promise.resolve({});
+        case "Target.createTarget":
+          return new Promise(function (resolve) {
+            if (chrome.tabs && chrome.tabs.create) { try { chrome.tabs.create({ url: params.url || "about:blank" }, function (t) { resolve({ targetId: "tab-" + (t && t.id) }); }); return; } catch (e) {} }
+            resolve({ targetId: "tab-" });
+          });
+        case "DOM.enable":
+        case "DOM.getFlattenedDocument":
+          return Promise.resolve({});
+        case "DOM.getDocument":
+          return pageExec(tabId, "getDocument", params).then(function (r) { return r || { root: null }; });
+        case "DOM.describeNode":
+          return pageExec(tabId, "describeNode", params).then(function (r) { return r || { node: null }; });
+        case "DOM.getBoxModel":
+          return pageExec(tabId, "getBoxModel", params).then(function (r) { return r || {}; });
+        case "DOM.getContentQuads":
+          return pageExec(tabId, "getContentQuads", params).then(function (r) { return r || { quads: [] }; });
+        case "DOM.querySelector":
+          return pageExec(tabId, "querySelector", params).then(function (r) { return r || { nodeId: 0 }; });
+        case "DOM.scrollIntoViewIfNeeded":
+          return pageExec(tabId, "scrollIntoView", params).then(function () { return {}; });
+        case "DOM.focus":
+          return pageExec(tabId, "focus", params).then(function () { return {}; });
+        case "DOM.resolveNode":
+          return pageExec(tabId, "resolveNode", params).then(function (r) { return r || {}; });
+        case "Accessibility.enable":
+          return Promise.resolve({});
+        case "Accessibility.getFullAXTree":
+        case "Accessibility.getRootAXNode":
+          return pageExec(tabId, "axTree", {}).then(function (r) { return r || { nodes: [] }; });
+        case "Network.getResponseBody":
+        case "Network.getRequestPostData":
+        case "Fetch.getResponseBody":
+        case "Network.getCookies":
+        case "Network.getAllCookies":
+          return Promise.reject(new Error(method + ": unsupported in Safari"));
         default:
-          // Page.enable/disable, Runtime.enable, Network.*, *.handleJavaScriptDialog,
-          // Emulation.*, DOM.* and any unknown command -> resolve so the loop proceeds.
+          // Page.enable/disable, Runtime.enable, *.handleJavaScriptDialog and any
+          // unknown command -> resolve so the agent's command loop proceeds.
           return Promise.resolve({});
       }
     };
@@ -1683,21 +2387,46 @@ var __C2S_DEBUG__ = false;
 
     chrome.debugger = {
       attach: function (target, version, cb) {
-        if (target && target.tabId != null) dbgAttached[target.tabId] = true;
+        var id = tabIdOf(target);
+        try { cdpLog("attach tab=" + id); } catch (e) {}
+        if (id != null) dbgAttached[id] = true;
         hookLifecycle();
+        if (id != null) startKeepAlive(id);
+        startNativeKA();
         return withCb(Promise.resolve(), cb);
       },
       detach: function (target, cb) {
-        if (target && target.tabId != null) delete dbgAttached[target.tabId];
+        var id = tabIdOf(target);
+        try { cdpLog("detach tab=" + id); } catch (e) {}
+        if (id != null) { delete dbgAttached[id]; delete dbgMetrics[id]; }
+        if (id != null) try { stopKeepAlive(id); } catch (e) {}
+        stopNativeKA();
         return withCb(Promise.resolve(), cb);
       },
       sendCommand: function (target, method, params, cb) {
         if (typeof params === "function") { cb = params; params = {}; }
-        return withCb(runCommand(target, method, params).catch(function () { return {}; }), cb);
+        try { cdpLog(method + " " + JSON.stringify({ x: params && params.x, y: params && params.y, type: params && params.type, url: params && params.url, dsf: params && params.deviceScaleFactor, tab: tabIdOf(target) })); } catch (e) {}
+        // Incidental failures (a flaky screenshot, a closed tab) degrade to {} so the
+        // agent's command loop never wedges. But an explicit "unsupported in Safari"
+        // rejection (Network/Fetch body/cookie reads) must reach the caller so it takes
+        // its capability-gap fallback instead of mistaking {} for a real empty result.
+        var p = runCommand(target, method, params).catch(function (e) {
+          var msg = e && (e.message || e);
+          if (msg && String(msg).indexOf("unsupported in Safari") >= 0) throw e;
+          return {};
+        });
+        return withCb(p, cb);
       },
       getTargets: function (cb) {
-        var list = Object.keys(dbgAttached).map(function (id) { return { tabId: Number(id), attached: true, type: "page" }; });
-        return withCb(Promise.resolve(list), cb);
+        // Chrome returns ALL targets with id/url/title, not just attached tabs. Query
+        // tabs for the full shape (tabId preserved for back-compat); fall back to the
+        // attached set if tabs.query is unavailable.
+        var mk = function (t) { return { id: "tab-" + t.id, targetId: "tab-" + t.id, tabId: t.id, type: "page", title: t.title || "", url: t.url || "", attached: !!dbgAttached[t.id], faviconUrl: t.favIconUrl || "" }; };
+        var p = new Promise(function (resolve) {
+          if (chrome.tabs && chrome.tabs.query) { try { chrome.tabs.query({}, function (tabs) { resolve((tabs || []).map(mk)); }); return; } catch (e) {} }
+          resolve(Object.keys(dbgAttached).map(function (id) { return { id: "tab-" + id, targetId: "tab-" + id, tabId: Number(id), type: "page", title: "", url: "", attached: true }; }));
+        });
+        return withCb(p, cb);
       },
       onEvent: {
         addListener: function (fn) { if (typeof fn === "function") dbgEvtList.push(fn); },
@@ -1797,7 +2526,7 @@ var __C2S_DEBUG__ = false;
     if (typeof self !== "undefined" && !self.clients) {
       try {
         self.clients = {
-          // ponytail: ignores matchAll(options) filters — extensions only scan urls
+          // Ignores matchAll(options) filters — extensions only scan urls
           matchAll: function () {
             var out = [];
             if (__offscreenFrame) out.push({
@@ -1871,7 +2600,7 @@ var __C2S_DEBUG__ = false;
     // When an iframe listener answers, the native broadcast still goes out for
     // any other-page listeners but its (listener-less, undefined) response is
     // ignored so it can't clobber the iframe's answer.
-    // ponytail: no dedup guard — Safari's same-page exclusion is what makes this
+    // No dedup guard — Safari's same-page exclusion is what makes this
     // safe; add a seen-marker if a Safari release starts delivering to own frames.
     try {
       if (chrome.runtime && typeof chrome.runtime.sendMessage === "function") {
@@ -3023,7 +3752,7 @@ var __C2S_DEBUG__ = false;
     // store is per-extension (not the user's real Safari bookmarks — impossible to
     // reach), but every method behaves and persists, so extensions that keep their
     // own bookmark-like data work end-to-end.
-    // ponytail: in-memory cache + write-through to storage.local; single-context
+    // In-memory cache + write-through to storage.local; single-context
     // correctness. Cross-context live sync would need storage.onChanged rebroadcast —
     // add if a real extension drives bookmarks from both popup and SW at once.
     chrome.bookmarks = chrome.bookmarks || {};
@@ -3718,7 +4447,7 @@ var __C2S_DEBUG__ = false;
     });
     // chrome.userScripts — Safari has no persistent user-script registry, so keep a
     // coherent in-memory one: register/getScripts/update/unregister round-trip
-    // correctly (the common "register then query/manage" pattern). ponytail: this
+    // correctly (the common "register then query/manage" pattern). This
     // does NOT actually inject the scripts (WebKit gives no API for dynamic user
     // worlds); it makes the management surface consistent so callers don't reject.
     // Upgrade path: map to scripting.registerContentScripts if/when Safari exposes it.
@@ -3770,7 +4499,7 @@ var __C2S_DEBUG__ = false;
     // awaited rejection breaks its stream-creation path. Safari's chrome.scripting is a
     // frozen exotic slot (assignment no-ops), so swap in a mutable clone (preserving the
     // bound native methods) and add the missing methods backed by an in-memory registry,
-    // mirroring the userScripts emulation above. ponytail: registry is coherent but does
+    // mirroring the userScripts emulation above. Registry is coherent but does
     // NOT actually inject (WebKit has no dynamic content-script API); map to a real impl
     // if Safari ever ships one.
     if (chrome.scripting && typeof chrome.scripting.getRegisteredContentScripts !== "function") {
@@ -4080,6 +4809,555 @@ var __C2S_DEBUG__ = false;
     wrapDnrUpdate("updateSessionRules");
     wrapDnrUpdate("updateDynamicRules");
   }
+
+  // ── NATIVE MESSAGING BRIDGE ────────────────────────────────────────────────
+  // Chrome extensions reach a locally-installed companion app through
+  // chrome.runtime.connectNative()/sendNativeMessage() — a native-messaging "host"
+  // the browser launches and speaks Chrome's stdio framing to. Safari has no host
+  // launcher, but it DOES route runtime.sendNativeMessage to THIS extension's
+  // containing-app handler (the application-id argument is ignored). viaduct's Swift
+  // handler implements the Chrome host protocol out-of-process: it locates the
+  // host's manifest on disk (installed by the companion app), launches the binary,
+  // and pipes framed JSON. Here we re-implement connectNative/sendNativeMessage on
+  // top of that handler so an unmodified Chrome bundle's native-messaging code works
+  // (live: ChatGPT/Codex, whose side panel is dead until its local app server —
+  // reached via connectNative("com.openai.codexextension") — connects).
+  //
+  // Only a context that already has runtime.sendNativeMessage (the background page)
+  // can talk to the handler; every bundle we've seen holds the native port there and
+  // relays to other contexts itself, so patching the background is sufficient.
+  (function () {
+    function installNM(root) {
+      if (!root || root.__c2sNMWrapped) return;
+      if (typeof Proxy === "undefined") return;
+      var rt = root.runtime;
+      if (!rt || typeof rt.sendNativeMessage !== "function") return; // not an extension context
+      // Only the background page needs the native-messaging bridge, and republishing
+      // chrome/browser as a Proxy in a popover/panel clobbers the webextension-polyfill's
+      // messaging (breaking popover→bg sendMessage). sendNativeMessage exists on all
+      // Safari extension pages, so gate on the actual background document.
+      var __p = (typeof location !== "undefined" && location.pathname) || "";
+      if (__p && !/background\.html$/.test(__p)) return;
+      var realSend = rt.sendNativeMessage.bind(rt);
+      // Round-trip an envelope to the containing-app handler → Promise<reply>.
+      function callHost(env) {
+        try {
+          var p = realSend.call(rt, "application.id", env);
+          if (p && typeof p.then === "function") return p;
+        } catch (e) { return Promise.reject(e); }
+        return new Promise(function (resolve, reject) {
+          try {
+            realSend.call(rt, "application.id", env, function (r) {
+              var err = rt.lastError;
+              if (err) reject(new Error(err.message || "native host error")); else resolve(r);
+            });
+          } catch (e) { reject(e); }
+        });
+      }
+      // sendNativeMessage: pass viaduct's own envelopes (__c2sProxy HTTP retry,
+      // __c2sNM) straight through to the real handler; wrap a genuine caller message
+      // as a one-shot native exchange with the requested host.
+      var __c2sSend = function (app, message, cb) {
+        if (message && (message.__c2sProxy || message.__c2sNM)) return realSend.apply(rt, arguments);
+        var host = (typeof app === "string") ? app : (app && app.name) || "";
+        var pr = callHost({ __c2sNM: 1, op: "once", host: host, message: message }).then(function (r) {
+          if (r && r.error) throw new Error(r.error);
+          return r ? r.message : undefined;
+        });
+        if (typeof cb === "function") {
+          pr.then(function (v) { cb(v); }, function (e) { setLastErr({ message: String((e && e.message) || e) }); cb(undefined); });
+          return;
+        }
+        return pr;
+      };
+      // connectNative: a Port backed by the handler. postMessage writes to the host;
+      // a poll loop drains messages the host streams asynchronously (an app server
+      // pushes updates unprompted) and delivers them to onMessage listeners.
+      var __c2sConnect = function (app) {
+        var host = (typeof app === "string") ? app : (app && app.name) || "";
+        var portId = uid("nmh-");
+        var msgL = [], discL = [], open = true, poll = null;
+        function emit(list) {
+          if (!list || !list.length) return;
+          for (var i = 0; i < list.length; i++) for (var j = 0; j < msgL.length; j++) { try { msgL[j](list[i], port); } catch (e) {} }
+        }
+        function shut(reason) {
+          if (!open) return; open = false; if (poll) { clearTimeout(poll); poll = null; }
+          if (reason) setLastErr({ message: String(reason) });
+          for (var j = 0; j < discL.length; j++) { try { discL[j](port); } catch (e) {} }
+        }
+        var port = {
+          name: host,
+          postMessage: function (m) {
+            if (!open) return;
+            // Write-only: the poll loop is the single reader, so a streamed reply is
+            // never split across post/poll and can't arrive out of order.
+            callHost({ __c2sNM: 1, op: "post", portId: portId, host: host, message: m }).then(
+              function (r) { if (open && r && (r.error || r.closed)) shut(r.error); },
+              function (e) { shut((e && e.message) || e); });
+          },
+          disconnect: function () {
+            if (!open) return; open = false; if (poll) { clearTimeout(poll); poll = null; }
+            callHost({ __c2sNM: 1, op: "disconnect", portId: portId }).then(function () {}, function () {});
+          },
+          onMessage: {
+            addListener: function (f) { if (typeof f === "function") msgL.push(f); },
+            removeListener: function (f) { var i = msgL.indexOf(f); if (i >= 0) msgL.splice(i, 1); },
+            hasListener: function (f) { return msgL.indexOf(f) >= 0; },
+          },
+          onDisconnect: {
+            addListener: function (f) { if (typeof f === "function") discL.push(f); },
+            removeListener: function (f) { var i = discL.indexOf(f); if (i >= 0) discL.splice(i, 1); },
+            hasListener: function (f) { return discL.indexOf(f) >= 0; },
+          },
+        };
+        // Single-reader poll loop: one request in flight at a time (self-scheduled,
+        // never setInterval), draining a burst immediately and backing off when idle.
+        // This is what guarantees in-order delivery of a streamed response.
+        function pollOnce() {
+          if (!open) return;
+          callHost({ __c2sNM: 1, op: "poll", portId: portId }).then(
+            function (r) {
+              if (!open) return;
+              var msgs = r && r.messages;
+              emit(msgs);
+              if (r && r.closed) { shut(); return; }
+              poll = setTimeout(pollOnce, (msgs && msgs.length) ? 0 : 80);
+            },
+            function () { if (open) poll = setTimeout(pollOnce, 200); });
+        }
+        callHost({ __c2sNM: 1, op: "connect", host: host, portId: portId }).then(
+          function (r) {
+            if (!open) return;
+            if (r && r.error) { shut(r.error); return; }
+            emit(r && r.messages);
+            pollOnce();
+          },
+          function (e) { shut((e && e.message) || e); });
+        return port;
+      };
+      // Safari's runtime.sendNativeMessage/connectNative are non-replaceable exotic
+      // slots — assignment throws under "use strict" and defineProperty silently
+      // no-ops (both proven live). So wrap runtime + root in a Proxy and republish the
+      // globals: the bundle's chrome.runtime.* now reads our overrides while every
+      // other member passes through (bound) to the real object.
+      var rtProxy = new Proxy(rt, {
+        get: function (t, p) {
+          if (p === "sendNativeMessage") return __c2sSend;
+          if (p === "connectNative") return __c2sConnect;
+          var v = t[p];
+          return (typeof v === "function") ? v.bind(t) : v;
+        },
+      });
+      var rootProxy = new Proxy(root, {
+        get: function (t, p) { return p === "runtime" ? rtProxy : t[p]; },
+      });
+      __publishGlobal("chrome", rootProxy);
+      __publishGlobal("browser", rootProxy);
+      try { root.__c2sNMWrapped = true; } catch (e) {}
+    }
+    try { installNM(typeof chrome !== "undefined" ? chrome : (typeof browser !== "undefined" ? browser : null)); } catch (e) {}
+  })();
+
+  // ── WebSocket-over-native tunnel ─────────────────────────────────────────────
+  // Safari blocks insecure ws:// from a secure context (mixed content) with NO
+  // loopback exemption — verified live: ws://127.0.0.1 OPENs from an http page but
+  // ERRORs from an https/extension page. So an extension page (a side panel, popup,
+  // etc.) can never reach a local app server at ws://127.0.0.1:PORT directly.
+  // Route those frames through the native-messaging broker instead: it's a native
+  // process with no mixed-content limit, holds the real WebSocket, and relays frames
+  // via wsopen/wssend/wspoll/wsclose. Only insecure loopback ws:// is tunneled; every
+  // other WebSocket (e.g. remote wss:// pub/sub) uses the platform implementation.
+  (function () {
+    var g = (typeof self !== "undefined") ? self : (typeof window !== "undefined" ? window : null);
+    if (!g || typeof g.WebSocket !== "function") return;
+    // Extension pages only (panel/popup/background); never a content script's page,
+    // whose own WebSockets must be left untouched.
+    var loc = (typeof location !== "undefined") ? location : null;
+    if (!loc || !/^safari-web-extension:$/i.test(loc.protocol || "")) return;
+    var rt = (api && api.runtime) || null;
+    if (!rt || typeof rt.sendNativeMessage !== "function") return; // no native bridge here
+    var Native = g.WebSocket;
+    var ORIGIN = "";
+    try { ORIGIN = (typeof __C2S_PROXY_CONFIG__ !== "undefined" && __C2S_PROXY_CONFIG__ && __C2S_PROXY_CONFIG__.origin) || ""; } catch (e) {}
+
+    function callHost(env) {
+      env.__c2sNM = 1;
+      var p;
+      try { p = rt.sendNativeMessage("application.id", env); } catch (e) { return Promise.reject(e); }
+      if (p && typeof p.then === "function") return p;
+      return new Promise(function (res, rej) {
+        try {
+          rt.sendNativeMessage("application.id", env, function (r) {
+            var err = rt.lastError;
+            if (err) rej(new Error(err.message || "native host error")); else res(r);
+          });
+        } catch (e) { rej(e); }
+      });
+    }
+    function b64encode(data) {
+      var bytes;
+      if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+      else if (data && data.buffer instanceof ArrayBuffer) bytes = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength);
+      else return "";
+      var bin = "";
+      for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      return btoa(bin);
+    }
+    function b64decode(s) {
+      var bin = atob(s), out = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }
+    function shouldTunnel(url) {
+      try {
+        var u = new URL(String(url), loc.href);
+        if (u.protocol !== "ws:") return false; // wss:// isn't mixed-content blocked
+        var h = u.hostname;
+        return h === "127.0.0.1" || h === "localhost" || h === "::1" || h === "[::1]" || h === "0.0.0.0";
+      } catch (e) { return false; }
+    }
+
+    // Minimal WebSocket implementation over the broker relay. EventTarget-backed so
+    // both on* handlers and addEventListener (apps use either) work.
+    function TunnelWS(url) {
+      var self = new EventTarget();
+      self.url = String(url);
+      self.readyState = 0; // CONNECTING
+      self.bufferedAmount = 0;
+      self.protocol = "";
+      self.extensions = "";
+      self.binaryType = "blob";
+      self.onopen = null; self.onmessage = null; self.onerror = null; self.onclose = null;
+      self.CONNECTING = 0; self.OPEN = 1; self.CLOSING = 2; self.CLOSED = 3;
+      var id = uid("ws-"), openFired = false, closedFired = false, queued = [], pollT = null, chunks = {};
+      function fire(type, ev) {
+        var h = self["on" + type];
+        if (typeof h === "function") { try { h.call(self, ev); } catch (e) {} }
+        try { self.dispatchEvent(ev); } catch (e) {}
+      }
+      function rawSend(data) {
+        var env = { op: "wssend", wsId: id };
+        if (typeof data === "string") { env.kind = "text"; env.text = data; }
+        else { env.kind = "binary"; env.b64 = b64encode(data); }
+        callHost(env).then(function () {}, function () {});
+      }
+      function markOpen() {
+        if (openFired || self.readyState === 3) return;
+        openFired = true; self.readyState = 1;
+        var q = queued; queued = [];
+        for (var i = 0; i < q.length; i++) rawSend(q[i]);
+        fire("open", new Event("open"));
+      }
+      function emit(data) { fire("message", new MessageEvent("message", { data: data })); }
+      function deliver(m) {
+        if (!openFired) markOpen(); // a frame implies the socket is open
+        if (m.kind === "chunk") {
+          // Reassemble a split message (broker chunks anything over its relay cap).
+          var b = chunks[m.id] || (chunks[m.id] = { n: +m.n, ck: m.ck, parts: [], got: 0 });
+          if (b.parts[+m.i] == null) { b.parts[+m.i] = m.d; b.got++; }
+          if (b.got >= b.n) {
+            var bytes = b64decode(b.parts.join(""));
+            delete chunks[m.id];
+            if (b.ck === "text") emit(new TextDecoder().decode(bytes));
+            else emit((self.binaryType === "arraybuffer") ? bytes.buffer : new Blob([bytes]));
+          }
+          return;
+        }
+        if (m.kind === "binary" && typeof m.b64 === "string") {
+          var by = b64decode(m.b64);
+          emit((self.binaryType === "arraybuffer") ? by.buffer : new Blob([by]));
+        } else {
+          emit(m.text != null ? m.text : "");
+        }
+      }
+      function closeLocal(code, wasClean) {
+        if (pollT) { clearTimeout(pollT); pollT = null; }
+        if (closedFired) return;
+        closedFired = true; self.readyState = 3;
+        fire("close", new CloseEvent("close", { code: code || 1006, reason: "", wasClean: !!wasClean }));
+      }
+      function fail() {
+        if (self.readyState === 3) return;
+        fire("error", new Event("error"));
+        closeLocal(1006, false);
+      }
+      function poll() {
+        if (self.readyState === 3) return;
+        callHost({ op: "wspoll", wsId: id }).then(function (r) {
+          if (self.readyState === 3) return;
+          if (!r) { pollT = setTimeout(poll, 200); return; }
+          if (r.open) markOpen();
+          var msgs = r.messages;
+          if (msgs && msgs.length) for (var i = 0; i < msgs.length; i++) deliver(msgs[i]);
+          if (r.closed) { closeLocal(r.code || 1006, false); return; }
+          pollT = setTimeout(poll, (msgs && msgs.length) ? 0 : 70);
+        }, function () {
+          if (self.readyState !== 3) pollT = setTimeout(poll, 300);
+        });
+      }
+      self.send = function (data) {
+        if (self.readyState === 0) { queued.push(data); return; }
+        if (self.readyState !== 1) return;
+        rawSend(data);
+      };
+      self.close = function (code) {
+        if (self.readyState >= 2) return;
+        self.readyState = 2;
+        callHost({ op: "wsclose", wsId: id }).then(function () {}, function () {});
+        closeLocal(code || 1000, true);
+      };
+      callHost({ op: "wsopen", wsId: id, url: self.url, origin: ORIGIN }).then(function (r) {
+        if (r && r.error) { fail(); return; }
+        poll();
+      }, function () { fail(); });
+      return self;
+    }
+
+    function WS(url, protocols) {
+      if (shouldTunnel(url)) return TunnelWS(url);
+      return (protocols === undefined) ? new Native(url) : new Native(url, protocols);
+    }
+    WS.prototype = Native.prototype;
+    WS.CONNECTING = 0; WS.OPEN = 1; WS.CLOSING = 2; WS.CLOSED = 3;
+    try { g.WebSocket = WS; } catch (e) {}
+  })();
+
+  // ── Storage-relayed runtime.sendMessage/onMessage ────────────────────────────
+  // Safari does not deliver runtime.sendMessage between an extension page (popover/
+  // panel) and a non-persistent MV3 background — the send resolves but no listener
+  // ever fires (proven live). chrome.storage.local IS delivered cross-context, so
+  // relay messages through it: the sender writes a request record and awaits a
+  // response record; every context mirrors incoming records into its own onMessage
+  // listeners and writes back whatever sendResponse yields. Native onMessage stays
+  // wired for messages Safari does deliver (e.g. content-script → bg).
+  (function () {
+    try {
+      var nativeChrome = (typeof chrome !== "undefined") ? chrome : null;
+      var nativeBrowser = (typeof browser !== "undefined") ? browser : null;
+      var probe = nativeChrome || nativeBrowser;
+      if (!probe || !probe.runtime || typeof probe.runtime.sendMessage !== "function") return;
+      if (!probe.storage || !probe.storage.local || !probe.storage.onChanged) return;
+      var store = probe.storage; // storage.local is shared across every context
+      var SELF = uid("ctx-");
+      var REQ = "__c2sMbxReq:", RSP = "__c2sMbxRsp:", BELL = "__c2sMbxBell";
+      var listeners = [];
+      // The real Chrome extension id, recovered from the baked chrome-extension origin
+      // (empty when the source had no derivable id). Used to spoof runtime.id below.
+      var CHROME_ID = "";
+      try {
+        var __org = (typeof __C2S_PROXY_CONFIG__ !== "undefined" && __C2S_PROXY_CONFIG__ && __C2S_PROXY_CONFIG__.origin) || "";
+        CHROME_ID = String(__org).replace(/^chrome-extension:\/\//i, "").replace(/\/+$/, "");
+      } catch (e) {}
+      var processed = {};
+      function selfSender() {
+        var s = {}; try { s.id = probe.runtime.id; } catch (e) {}
+        try { if (typeof location !== "undefined") { s.url = location.href; s.origin = location.origin; } } catch (e) {}
+        return s;
+      }
+      function rm(k) { try { store.local.remove(k); } catch (e) {} }
+      // Orphaned mailbox records: when a popover/panel closes mid-request the sender's
+      // finish() never runs, so its __c2sMbxReq: key is never removed. These accumulate
+      // unboundedly across opens; a bloated storage.local slows Safari's onChanged/get
+      // and stalls fresh-request delivery (measured ~10s panel-load). Purge REQ/RSP
+      // records older than the sender deadline so the store stays small.
+      var MBX_TTL = 30000;
+      function sweepStale() {
+        try {
+          store.local.get(null, function (all) {
+            if (!all) return;
+            var now = Date.now(), del = [];
+            for (var k in all) {
+              if (k.indexOf(REQ) !== 0 && k.indexOf(RSP) !== 0) continue;
+              var rec = all[k], t = (rec && rec.t) || 0;
+              if (!t || now - t > MBX_TTL) del.push(k);
+            }
+            if (del.length) { try { store.local.remove(del); } catch (e) {} }
+          });
+        } catch (e) {}
+      }
+      // Receiver: mirror an incoming request into local listeners; the first listener
+      // that answers (sync sendResponse, returned Promise, or `return true` + async
+      // sendResponse) writes the response. Contexts with no answering listener stay
+      // silent so they can't race a real responder to an undefined reply.
+      function dispatch(rec) {
+        if (processed[rec.id]) return;
+        // Stale request (sender long gone): never run the handler — dispatching an old
+        // ensure_codex_app_server would re-trigger app-server work with side effects.
+        if (rec.t && Date.now() - rec.t > MBX_TTL) { processed[rec.id] = true; rm(REQ + rec.id); return; }
+        // No listener registered yet (shim runs before the app's bg bundle): leave the
+        // request in storage for a later scan once listeners exist.
+        if (listeners.length === 0) return;
+        processed[rec.id] = true;
+        var responded = false;
+        var sr = function (resp) {
+          if (responded) return; responded = true;
+          var o = {}; o[RSP + rec.id] = { from: SELF, has: resp !== undefined, resp: resp, t: Date.now() };
+          try { store.local.set(o); } catch (e) {}
+        };
+        for (var i = 0; i < listeners.length; i++) {
+          try {
+            var ret = listeners[i](rec.msg, rec.sender || {}, sr);
+            if (ret && typeof ret.then === "function") ret.then(function (v) { sr(v); }, function () { sr(undefined); });
+          } catch (e) {}
+        }
+      }
+      // Backstop for a suspended background: storage.onChanged doesn't wake a sleeping
+      // Safari MV3 background, so on wake (init + keepalive alarm) scan storage for
+      // pending requests that arrived while asleep and dispatch any with listeners now.
+      function scanPending() {
+        try {
+          store.local.get(null, function (all) {
+            if (!all) return;
+            for (var k in all) {
+              if (k.indexOf(REQ) !== 0) continue;
+              var rec = all[k];
+              if (!rec || !rec.id || rec.from === SELF || processed[rec.id]) continue;
+              dispatch(rec);
+            }
+          });
+        } catch (e) {}
+      }
+      try {
+        store.onChanged.addListener(function (changes, area) {
+          if (area !== "local") return;
+          for (var k in changes) {
+            if (k.indexOf(REQ) !== 0) continue;
+            var rec = changes[k] && changes[k].newValue;
+            if (!rec || !rec.id || rec.from === SELF) continue;
+            dispatch(rec);
+          }
+        });
+      } catch (e) { return; }
+      // Sender: write a request record (+ bump BELL), resolve on the first response
+      // record. Safari's cross-context storage.onChanged is unreliable/badly delayed in
+      // BOTH directions (measured ~9.6s panel→bg even with the bg awake and polling, and
+      // bg→panel never fires), but storage.local.get always reads the committed value
+      // immediately. So delivery relies on polling: the sender polls the reply key here,
+      // and the bg polls the BELL doorbell (below) to pick up requests within ~200ms.
+      // onChanged stays wired as a best-effort fast path.
+      function bridgeSend() {
+        var a = arguments, msg = a[0], cb = null;
+        for (var i = 1; i < a.length; i++) if (typeof a[i] === "function") cb = a[i];
+        var id = uid("m-"), reqKey = REQ + id, rspKey = RSP + id;
+        var p = new Promise(function (resolve) {
+          var done = false, pollT = null, deadline = Date.now() + 30000;
+          function finish(v) {
+            if (done) return; done = true;
+            clearTimeout(pollT);
+            try { store.onChanged.removeListener(onCh); } catch (e) {}
+            rm(rspKey); rm(reqKey); resolve(v);
+          }
+          function accept(nv) {
+            finish(nv && nv.has ? nv.resp : undefined);
+          }
+          var onCh = function (ch, area) {
+            if (area !== "local" || done || !ch[rspKey]) return;
+            var nv = ch[rspKey].newValue; if (nv) accept(nv);
+          };
+          try { store.onChanged.addListener(onCh); } catch (e) {}
+          function poll() {
+            if (done) return;
+            if (Date.now() > deadline) { finish(undefined); return; }
+            try {
+              store.local.get([rspKey], function (res) {
+                if (done) return;
+                var nv = res && res[rspKey];
+                if (nv) { accept(nv); return; }
+                pollT = setTimeout(poll, 120);
+              });
+            } catch (e) { pollT = setTimeout(poll, 120); }
+          }
+          var o = {}; o[reqKey] = { id: id, from: SELF, sender: selfSender(), msg: msg, t: Date.now() }; o[BELL] = Date.now();
+          try { store.local.set(o, function () { poll(); }); } catch (e) { finish(undefined); }
+        });
+        if (cb) { p.then(function (v) { try { cb(v); } catch (e) {} }); return; }
+        return p;
+      }
+      function makeFacade(base) {
+        var nAdd = null, nRemove = null;
+        try { nAdd = base.runtime.onMessage.addListener.bind(base.runtime.onMessage); } catch (e) {}
+        try { nRemove = base.runtime.onMessage.removeListener.bind(base.runtime.onMessage); } catch (e) {}
+        return {
+          addListener: function (fn) {
+            if (typeof fn !== "function") return;
+            if (listeners.indexOf(fn) < 0) listeners.push(fn);
+            if (nAdd) try { nAdd(fn); } catch (e) {}
+            // A listener may register after a request already landed in storage.
+            scanPending();
+          },
+          removeListener: function (fn) {
+            var i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1);
+            if (nRemove) try { nRemove(fn); } catch (e) {}
+          },
+          hasListener: function (fn) { return listeners.indexOf(fn) >= 0; },
+        };
+      }
+      function wrap(base) {
+        if (!base || !base.runtime) return base;
+        var facade = makeFacade(base);
+        var rtP = new Proxy(base.runtime, {
+          get: function (t, p) {
+            if (p === "sendMessage") return bridgeSend;
+            if (p === "onMessage") return facade;
+            // Chrome extensions expect runtime.id === the Chrome extension id (32
+            // a–p chars). Safari's slot is the app-extension bundle id, which breaks
+            // code that sends runtime.id to a native host for install matching (e.g.
+            // Codex's app-server "constraints.extensionId"). URL-vs-runtime.id
+            // matchers are neutralized at conversion time (rewriteRuntimeIdUrlMatchers),
+            // so returning the real Chrome id here is safe.
+            if (p === "id" && CHROME_ID) return CHROME_ID;
+            var v = t[p]; return (typeof v === "function") ? v.bind(t) : v;
+          },
+        });
+        return new Proxy(base, {
+          get: function (t, p) {
+            if (p === "runtime") return rtP;
+            var v = t[p]; return (typeof v === "function") ? v.bind(t) : v;
+          },
+        });
+      }
+      // Background keepalive: Safari suspends a non-persistent MV3 background, and
+      // neither sendMessage nor storage.onChanged wakes it. Keep it awake while running
+      // (20s activity < the idle window) so storage.onChanged fires live; an alarm
+      // recovers it if it ever suspends, and each wake re-scans pending requests.
+      var __bgPath = (typeof location !== "undefined" && location.pathname) || "";
+      if (/background\.html$/.test(__bgPath)) {
+        try {
+          if (probe.alarms && probe.alarms.create) {
+            probe.alarms.create("__c2sKeepAlive", { periodInMinutes: 0.34 });
+            probe.alarms.onAlarm.addListener(function (al) {
+              if (!al || al.name !== "__c2sKeepAlive") return;
+              try { if (probe.runtime.getPlatformInfo) probe.runtime.getPlatformInfo(function () {}); } catch (e) {}
+              scanPending();
+            });
+          }
+        } catch (e) {}
+        try {
+          setInterval(function () {
+            try { if (probe.runtime.getPlatformInfo) probe.runtime.getPlatformInfo(function () {}); } catch (e) {}
+            scanPending(); sweepStale();
+          }, 20000);
+        } catch (e) {}
+        // Fast doorbell: storage.onChanged panel→bg is delayed many seconds in Safari
+        // even while the bg is awake and polling (measured ~9.6s), but get() reads the
+        // committed value immediately. Senders bump BELL on each request; poll just that
+        // one key so a fresh request is dispatched within ~200ms, not the 20s scan.
+        try {
+          var __lastBell = 0;
+          setInterval(function () {
+            try { store.local.get([BELL], function (r) { var b = r && r[BELL]; if (b && b !== __lastBell) { __lastBell = b; scanPending(); } }); } catch (e) {}
+          }, 200);
+        } catch (e) {}
+      }
+      // Catch-up scans: a request may land before the app's listeners register. Also
+      // sweep orphaned mailbox records on init (and shortly after) so a store bloated by
+      // past sessions doesn't stall this open's request delivery.
+      try { sweepStale(); setTimeout(sweepStale, 2000); setTimeout(scanPending, 400); setTimeout(scanPending, 1500); setTimeout(scanPending, 4000); } catch (e) {}
+      if (nativeChrome) __publishGlobal("chrome", wrap(nativeChrome));
+      if (nativeBrowser) __publishGlobal("browser", wrap(nativeBrowser));
+    } catch (e) {}
+  })();
 
   // api.anthropic.com requires the "anthropic-dangerous-direct-browser-access"
   // header on every browser-origin request; the SDK adds it to /v1/messages but
@@ -4413,8 +5691,50 @@ var __C2S_DEBUG__ = false;
     // restored from bfcache shows again, and the flag must re-track each visibility.
     try {
       c2sSetPanelOpen(true);
-      window.addEventListener("pagehide", function () { c2sSetPanelOpen(false); });
-      window.addEventListener("pageshow", function () { c2sSetPanelOpen(true); });
+      // Signal panel open/close to the bg via a PORT (not sendMessage): a connected
+      // port reliably wakes the non-persistent bg, binds to the LIVE instance, and
+      // stays open while the panel is visible so the bg's onConnect/onDisconnect drive
+      // sidePanel.onOpened/onClosed. sendMessage here is dropped by the bg wake race.
+      var c2sPanelPort = null;
+      var c2sMarkOpen = function (wid) {
+        // PRIMARY signal: a marker in storage.session — reliable cross-context, unlike
+        // sendMessage/connect which the non-persistent bg drops. The bg turns this into
+        // sidePanel.onOpened (via storage.onChanged + a read on wake).
+        try { if (chrome.storage && chrome.storage.session) chrome.storage.session.set({ __c2sPanelOpenWid: (typeof wid === "number" ? wid : 0) }); } catch (e) {}
+        try { if (chrome.storage && chrome.storage.local) chrome.storage.local.set({ __c2sPanelSendMark: { wid: wid, t: Date.now() } }); } catch (e) {}
+        // Direct, timing-proof write of the extension's own side-panel-open state. The
+        // generic onOpened synthesis races the extension registering its listener; this
+        // sets the exact storage key the bg re-reads on every request, so the gate is
+        // satisfied immediately regardless of listener timing. (Codex/ChatGPT-specific
+        // key; harmless for other extensions.)
+        try { if (typeof wid === "number" && chrome.storage && chrome.storage.session) chrome.storage.session.set({ codexSidePanelOpenWindowIds: [wid] }); } catch (e) {}
+        // Backup: a port keeps the bg alive while the panel is open.
+        try {
+          if (chrome.runtime && typeof chrome.runtime.connect === "function" && !c2sPanelPort) {
+            c2sPanelPort = chrome.runtime.connect({ name: "__c2sPanelPort" });
+            try { c2sPanelPort.onDisconnect.addListener(function () { var _ = chrome.runtime && chrome.runtime.lastError; c2sPanelPort = null; }); } catch (e) {}
+            try { c2sPanelPort.postMessage({ windowId: (typeof wid === "number" ? wid : undefined) }); } catch (e) {}
+          }
+        } catch (e) {}
+      };
+      var c2sOpenPanel = function () {
+        try {
+          if (typeof chrome === "undefined") return;
+          if (chrome.windows && typeof chrome.windows.getCurrent === "function") {
+            try { var g = chrome.windows.getCurrent({}, function (w) { c2sMarkOpen(w && w.id); }); if (g && typeof g.then === "function") g.then(function (w) { c2sMarkOpen(w && w.id); }, function () { c2sMarkOpen(); }); }
+            catch (e) { c2sMarkOpen(); }
+          } else { c2sMarkOpen(); }
+        } catch (e) {}
+      };
+      var c2sClosePanel = function () {
+        // Deliberately do NOT clear the storage marker: keep the side-panel gate
+        // satisfied for the session so reopening the panel renders immediately instead
+        // of re-racing the extension's late-registered onOpened listener.
+        try { if (c2sPanelPort) { c2sPanelPort.disconnect(); c2sPanelPort = null; } } catch (e) {}
+      };
+      c2sOpenPanel();
+      window.addEventListener("pagehide", function () { c2sSetPanelOpen(false); c2sClosePanel(); });
+      window.addEventListener("pageshow", function () { c2sSetPanelOpen(true); c2sOpenPanel(); });
       if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.onMessage &&
           typeof chrome.runtime.onMessage.addListener === "function") {
         chrome.runtime.onMessage.addListener(function (msg) {

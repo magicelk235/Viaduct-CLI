@@ -8,7 +8,7 @@ import type { Issue } from "../types.js";
 /** Permissions Safari does not implement. Value = remediation note. */
 export const UNSUPPORTED_PERMISSIONS: Record<string, string> = {
   identity: "Safari lacks chrome.identity; use a hosted web OAuth2 flow + window.postMessage.",
-  debugger: "chrome.debugger (CDP) is unsupported; build a Web Inspector Extension (devtools_page).",
+  debugger: "chrome.debugger (Chrome DevTools Protocol) is emulated by the viaduct CDP shim (attach/detach/sendCommand/getTargets plus a Page/Target/Input/DOM/Runtime/Accessibility subset over Safari tabs + scripting). Network/Fetch domains and OS-trusted input are not available.",
   sidePanel: "Safari has no native sidePanel API; the shim emulates it (open via the action popover on Safari 17.4+, tab fallback on older; setOptions/getOptions/setPanelBehavior).",
   tabGroups: "Safari has no native tabGroups API; the shim emulates it in memory (no tab-bar coloring).",
   offscreen: "Safari has no offscreen documents API; the shim emulates it via an extension-origin iframe (createDocument/close/hasDocument/getContexts) so SW→offscreen messaging keeps working. The offscreen doc still has no DOM in a true SW context.",
@@ -86,6 +86,10 @@ export const SHIMMED_PERMISSIONS = new Set([
   // permission — so it never reaches this set.)
   "tts",
   "power",
+  // chrome.debugger → CDP subset (Page/Target/Input/DOM/Runtime/Accessibility)
+  // emulated over Safari tabs + scripting in safari-compat-shim.js. Network/Fetch
+  // and OS-trusted input remain unavailable, but the core capability is backed.
+  "debugger",
 ]);
 
 /** chrome.* API call patterns flagged during JS scans. */
@@ -105,9 +109,10 @@ export const UNSUPPORTED_APIS: Record<
     shimmed: true,
   },
   "chrome.debugger": {
-    severity: "warning",
-    message: "chrome.debugger (Chrome DevTools Protocol) is unsupported.",
-    fix: "Build a Safari Web Inspector Extension via the devtools_page manifest key.",
+    severity: "info",
+    shimmed: true,
+    message: "chrome.debugger (Chrome DevTools Protocol) is emulated by the viaduct CDP shim.",
+    fix: "A CDP subset (Page/Target/Input/DOM/Runtime/Accessibility) is backed by Safari tabs + scripting; Network/Fetch and trusted-input gaps remain.",
   },
   "chrome.gcm": {
     severity: "warning",
@@ -137,14 +142,16 @@ export const UNSUPPORTED_APIS: Record<
     shimmed: true,
   },
   "runtime.connectNative": {
-    severity: "warning",
-    message: "connectNative has no Chrome-style native host in Safari; messages route to the containing app.",
-    fix: "Handle the message in the macOS app's SafariWebExtensionHandler (beginRequest); there is no native-messaging-hosts manifest.",
+    severity: "info",
+    message: "connectNative is bridged: the (unsandboxed) container app runs a loopback broker that launches the Chrome native-messaging host from its on-disk manifest and pipes stdio framing; the sandboxed appex relays to it.",
+    fix: "Keep the container app running (it hosts the broker) and install the companion app that registered the native host.",
+    shimmed: true,
   },
   "runtime.sendNativeMessage": {
-    severity: "warning",
-    message: "sendNativeMessage has no Chrome-style native host in Safari; messages route to the containing app.",
-    fix: "Respond from the macOS app's SafariWebExtensionHandler (beginRequest) instead of a registered host binary.",
+    severity: "info",
+    message: "sendNativeMessage is bridged: the container app's broker launches the manifest-declared native host for one exchange and returns its reply; the sandboxed appex relays over loopback.",
+    fix: "Keep the container app running and install the companion app that registered the native host.",
+    shimmed: true,
   },
   "tabs.move": { severity: "warning", message: "tabs.move is unsupported.", fix: "Remove or rework UX." },
   "tabs.highlighted": {

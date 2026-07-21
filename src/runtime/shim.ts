@@ -10,6 +10,7 @@ export const POLYFILL_FILENAME = "browser-polyfill.min.js";
 export const BACKGROUND_PAGE_FILENAME = "background.html";
 export const SW_LIFECYCLE_FILENAME = "viaduct-sw-lifecycle.js";
 export const ACTION_HOTKEY_FILENAME = "__viaduct-hotkey.js";
+export const CDP_KEEPALIVE_FILENAME = "viaduct-cdp-keepalive.js";
 
 /**
  * Copy the bundled webextension-polyfill into the staged extension so Chrome code
@@ -27,6 +28,25 @@ export function writePolyfill(targetDir: string): string | undefined {
 }
 
 /**
+ * Wire the CDP keep-alive content script (declared on <all_urls>) for extensions that
+ * use chrome.debugger. Safari suspends the non-persistent MV3 background between the
+ * agent's CDP command bursts, stalling the connectNative poll loop and dropping the
+ * agent's connection. Safari keeps the background LOADED while a runtime.connect port is
+ * open to it, and (unlike an injected executeScript port) a DECLARED content script's
+ * port persists — so this script holds that port for the duration of a debugger session.
+ * Idempotent; a no-op if the extension has no matching content-script host.
+ */
+export function wireCdpKeepalive(dir: string, manifest: Manifest): boolean {
+  const src = join(TEMPLATE_DIR, CDP_KEEPALIVE_FILENAME);
+  if (!existsSync(src)) return false;
+  copyFileSync(src, join(dir, CDP_KEEPALIVE_FILENAME));
+  const cs = Array.isArray(manifest.content_scripts) ? manifest.content_scripts : [];
+  cs.push({ matches: ["<all_urls>"], js: [CDP_KEEPALIVE_FILENAME], run_at: "document_start", all_frames: false });
+  manifest.content_scripts = cs;
+  return true;
+}
+
+/**
  * Runtime compatibility shim, prepended to content scripts.
  * Patches the gaps documented in the engineering guide so calls degrade
  * gracefully instead of throwing.
@@ -41,6 +61,8 @@ export interface ShimConfig {
    *  externally_connectable). A cross-origin request to one of these that the
    *  browser blocks (CORS/401/403) is retried through the native host. */
   proxyHosts?: string[];
+  /** Install the chrome.debugger / CDP emulation block. convert.ts passes needsCdpShim; when omitted the shim block self-defaults ON (so direct shimSource() calls in tests keep it enabled). */
+  cdp?: boolean;
 }
 
 export function shimSource(config: ShimConfig = {}): string {
@@ -56,6 +78,7 @@ export function shimSource(config: ShimConfig = {}): string {
   const proxyCfg = JSON.stringify({
     origin: config.chromeOrigin || "",
     hosts: config.proxyHosts || [],
+    cdp: config.cdp !== false,
   }).replace(/[\u2028\u2029]/g, (c) => c === "\u2028" ? "\\u2028" : "\\u2029");
   const runtime = readFileSync(join(RUNTIME_DIR, SHIM_FILENAME), "utf-8");
   // split/join = global replace; the placeholder appears once today, but a stray
@@ -250,7 +273,7 @@ export function injectPopupSizing(dir: string, popupFile: string, fullHeight = f
   //    that loses to any size the app's own CSS sets, so it only takes effect when
   //    the app declares nothing (the empty-at-load case). No fixed width/height,
   //    no max caps: the popover follows the content/app, Safari clamps the ceiling.
-  // ponytail: floor-only; if some app still opens too small add a per-extension
+  // Floor-only; if some app still opens too small add a per-extension
   // size override, don't reintroduce a global fixed size.
   //
   // fullHeight: a SIDE-PANEL page wired as the popup (Claude's sidepanel.html).
@@ -266,8 +289,11 @@ export function injectPopupSizing(dir: string, popupFile: string, fullHeight = f
   // popups; a modest width floor + fit-content height lets content-sized popups stay
   // tight while still rescuing a genuinely empty body. `width:fit-content` makes the
   // body shrink-wrap its content in Safari's over-wide popover so there's no slack.
+  // fullHeight is the side-panel-converted-to-popup case. A Chrome side panel has a
+  // defined width; as a Safari popover the app's own CSS (built for a sized side-panel
+  // container) collapses to a strip, so force a standard side-panel width AND height.
   const sizeFloor = fullHeight
-    ? `html,body{margin:0!important;height:600px!important;min-width:380px;}`
+    ? `html,body{margin:0!important;height:600px!important;width:400px!important;min-width:400px!important;}`
     : `html,body{margin:0!important;}body{min-width:180px;width:-webkit-fit-content;width:fit-content;}`;
   // Anchor a flex `:root` to the start. uBlock makes `<html>` a flex container with
   // `justify-content:flex-end` (popup-fenix.css `:root.desktop`) and relies on Chrome
