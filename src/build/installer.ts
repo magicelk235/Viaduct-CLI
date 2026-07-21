@@ -1,8 +1,8 @@
-import { mkdirSync, existsSync, rmSync, statSync } from "node:fs";
+import { mkdirSync, existsSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve, relative, isAbsolute } from "node:path";
+import { join, resolve, relative, isAbsolute, basename } from "node:path";
 import { run, info, ok, warn, fail, moveBundle } from "../util.js";
-import { pluginkitStatus } from "./packager.js";
+import { pluginkitStatus, defaultBundleId, deriveAppName } from "./packager.js";
 
 /** Full path to LaunchServices' lsregister (not on PATH). */
 export const LSREGISTER =
@@ -201,6 +201,9 @@ export function uninstallFromSafari(appName: string, installDir?: string): boole
     return false;
   }
 
+  // Remove the broker LaunchAgent (best-effort; keyed on the default bundle id).
+  uninstallBrokerAgent(defaultBundleId(deriveAppName(cleanName)));
+
   // Unregister BEFORE deleting so LaunchServices drops the appex record cleanly.
   const unreg = run(LSREGISTER, ["-u", dest]);
   if (unreg.code === 0) ok("Unregistered from LaunchServices");
@@ -215,4 +218,79 @@ export function uninstallFromSafari(appName: string, installDir?: string): boole
   ok(`Removed ${dest}`);
   warn("Quit and reopen Safari for it to drop the extension from Settings → Extensions.");
   return true;
+}
+
+/** Path to the per-user LaunchAgent plist that keeps the broker alive. */
+function brokerAgentPlistPath(bundleId: string): string {
+  return join(homedir(), "Library", "LaunchAgents", `${bundleId}.broker.plist`);
+}
+
+/**
+ * Install a LaunchAgent that keeps the container app (the native-messaging broker)
+ * running. macOS auto-terminates the idle GUI app (observed live), which kills the
+ * broker. The agent launches it via `open -g -W`: `open` gives the app a real GUI
+ * session so AppKit initializes and the broker actually starts (launching the binary
+ * directly does NOT — applicationDidFinishLaunching never fires), `-g` keeps it in the
+ * background, and `-W` blocks until the app exits so KeepAlive relaunches it. RunAtLoad
+ * starts it at login.
+ */
+export function installBrokerAgent(appPath: string, bundleId: string): boolean {
+  if (!existsSync(appPath)) {
+    warn(`Broker app not found at ${appPath}; native messaging will only work while the app is open manually.`);
+    return false;
+  }
+  const label = `${bundleId}.broker`;
+  const plist = brokerAgentPlistPath(bundleId);
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/open</string>
+    <string>-g</string>
+    <string>-W</string>
+    <string>${appPath}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+`;
+  try {
+    mkdirSync(join(homedir(), "Library", "LaunchAgents"), { recursive: true });
+    writeFileSync(plist, xml, "utf-8");
+  } catch (e) {
+    warn(`Could not write broker LaunchAgent: ${(e as Error).message}`);
+    return false;
+  }
+  const uid = String(process.getuid?.() ?? "");
+  const domain = `gui/${uid}`;
+  // Re-bootstrap cleanly: bootout an old instance (ignore errors), then bootstrap.
+  run("launchctl", ["bootout", `${domain}/${label}`]);
+  const boot = run("launchctl", ["bootstrap", domain, plist]);
+  if (boot.code !== 0) {
+    // Fall back to the legacy load verb on older macOS.
+    const legacy = run("launchctl", ["load", "-w", plist]);
+    if (legacy.code !== 0) {
+      warn(`Could not load broker LaunchAgent (${boot.stderr.trim() || legacy.stderr.trim() || "launchctl failed"}); the broker will only run while the app is open.`);
+      return false;
+    }
+  }
+  ok(`Broker LaunchAgent installed (${label}) — keeps native messaging alive across restarts.`);
+  return true;
+}
+
+/** Remove and unload the broker LaunchAgent, if present. */
+export function uninstallBrokerAgent(bundleId: string): void {
+  const label = `${bundleId}.broker`;
+  const plist = brokerAgentPlistPath(bundleId);
+  const uid = String(process.getuid?.() ?? "");
+  run("launchctl", ["bootout", `gui/${uid}/${label}`]);
+  if (existsSync(plist)) {
+    run("launchctl", ["unload", "-w", plist]);
+    try { rmSync(plist, { force: true }); } catch { /* best effort */ }
+  }
 }

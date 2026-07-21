@@ -67,6 +67,26 @@ export function runPackager(opts: PackageOptions): string | null {
 }
 
 /**
+ * Stamp a unique version on every target so Safari reloads the extension's resources.
+ * Apple's packager hardcodes MARKETING_VERSION = 1.0 and CURRENT_PROJECT_VERSION = 1,
+ * so a re-converted extension keeps version "1.0 (1)" forever — and Safari keys its
+ * cached copy of the resources (shim, background JS, …) on the user-facing
+ * CFBundleShortVersionString (MARKETING_VERSION), serving STALE JS across reinstalls
+ * even after a full uninstall + Safari restart (observed live: shim fixes never
+ * loaded until this bumped). Both `short` (≤3 dotted ints, CFBundleShortVersionString)
+ * and `build` (CFBundleVersion) must be dotted integers.
+ */
+export function setBuildVersion(xcodeproj: string, opts: { short: string; build: string }): void {
+  const pbxproj = join(xcodeproj, "project.pbxproj");
+  if (!existsSync(pbxproj)) return;
+  const content = readFileSync(pbxproj, "utf-8");
+  const next = content
+    .replace(/CURRENT_PROJECT_VERSION = [^;]+;/g, `CURRENT_PROJECT_VERSION = ${opts.build};`)
+    .replace(/MARKETING_VERSION = [^;]+;/g, `MARKETING_VERSION = ${opts.short};`);
+  if (next !== content) writeFileSync(pbxproj, next, "utf-8");
+}
+
+/**
  * Force every PRODUCT_BUNDLE_IDENTIFIER in the project to the intended value.
  * App targets → bundleId; extension/appex targets → bundleId.Extension.
  * This is best-effort; the authoritative check is verifyBuiltBundleId().
@@ -101,7 +121,7 @@ export function patchProjectBundleIds(xcodeproj: string, bundleId: string): void
   // native HTTP proxy. Grant outgoing network to every sandboxed target that
   // lacks it. Idempotent: skips a block that already has the setting.
   // Add the key right after the sandbox line in any block that doesn't already
-  // declare it on the immediately following line. ponytail: the app target also
+  // declare it on the immediately following line. The app target also
   // has it on a separate line, so it ends up duplicated within that block —
   // xcodebuild takes last-wins on identical values, so this is harmless; a
   // proper pbxproj parser would dedupe but isn't worth it for a cosmetic repeat.
@@ -121,52 +141,124 @@ export function patchProjectBundleIds(xcodeproj: string, bundleId: string): void
     }
   }
 }
-
 /**
- * Replace the generated echo SafariWebExtensionHandler with one that proxies
- * `__c2sProxy` messages: it performs the HTTP request server-side (no browser
- * CORS) and can set the Chrome-extension Origin the in-browser shim cannot.
- * This is the only way to satisfy a backend whose CORS/org gate keys on the
- * Origin header, since Safari forbids JS and DNR from setting it.
+ * Rewrite the generated echo SafariWebExtensionHandler (in the sandboxed appex) to:
  *
- * `allowHosts` (derived from the manifest) is enforced server-side too, so the
- * host can never be coerced into proxying an arbitrary URL. No-op (leaves the
- * echo handler) when there are no hosts to proxy.
+ *  1. HTTP proxy — perform `__c2sProxy` requests server-side (no browser CORS) and
+ *     set the Chrome-extension Origin header Safari forbids JS/DNR from setting.
+ *
+ *  2. Native-messaging client — forward `__c2sNM` envelopes over loopback TCP to the
+ *     broker that runs in the (unsandboxed) container app. The sandbox forbids the
+ *     appex from exec'ing the host or reading Chrome's manifest dir, so the actual
+ *     launch happens in the app; here we only relay. `network.client` permits the
+ *     loopback connection.
+ *
+ * Writes the handler when there's a proxy allowlist OR native messaging is used.
  */
-export function writeNativeProxyHandler(
+export function writeNativeHandler(
   xcodeproj: string,
-  chromeOrigin: string,
-  allowHosts: string[]
+  opts: { chromeOrigin: string; allowHosts: string[]; nativeMessaging: boolean; brokerPort?: number; brokerToken?: string }
 ): void {
-  if (allowHosts.length === 0) return;
+  const { chromeOrigin, allowHosts, nativeMessaging } = opts;
+  if (allowHosts.length === 0 && !nativeMessaging) return;
   const root = xcodeproj.replace(/[^/]+\.xcodeproj$/, "");
   const handlers = findFiles(root, (n) => n === "SafariWebExtensionHandler.swift", 4);
   if (handlers.length === 0) return;
 
-  // These values land inside Swift string literals. Stripping only `"` is unsafe:
-  // a host/origin carrying a backslash or newline (a malformed or hostile manifest
-  // can produce one — deriveProxyHosts' [^/]+ host capture permits them) would
-  // break the literal, failing the build or worse. Whitelist to the characters
-  // actually valid in a hostname / origin and drop anything that survives empty.
+  // These values land inside Swift string literals. Whitelist to characters valid in
+  // a hostname / origin so a malformed manifest can't break the literal.
   const hostsLiteral = allowHosts
     .map((h) => h.replace(/[^a-zA-Z0-9.\-:]/g, ""))
     .filter((h) => h.length > 0)
     .map((h) => `"${h}"`)
     .join(", ");
   const originLiteral = chromeOrigin.replace(/[^a-zA-Z0-9.\-:/]/g, "");
+  const port = String(opts.brokerPort ?? 0);
+  const token = (opts.brokerToken ?? "").replace(/[^a-zA-Z0-9]/g, "");
+  // Swift below uses string concatenation, never interpolation (\\(x)), which this JS
+  // template literal would corrupt.
   const swift = `//
-//  SafariWebExtensionHandler.swift — native-messaging HTTP proxy.
+//  SafariWebExtensionHandler.swift — HTTP proxy + native-messaging broker client.
 //  Auto-generated by viaduct. Do not edit.
 //
 import SafariServices
 import Foundation
-import os.log
 
 class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling, URLSessionTaskDelegate {
-    // Backends the extension declares it talks to; only these may be proxied.
     static let allowHosts: Set<String> = [${hostsLiteral}]
-    // Origin the in-browser shim cannot set (Safari forbids it). "" → none.
     static let chromeOrigin = "${originLiteral}"
+    static let brokerPort: UInt16 = ${port}
+    static let brokerToken = "${token}"
+
+    // ── loopback framing (4-byte LE length + JSON), shared with the app broker ──
+    static func frameData(_ obj: Any) -> Data? {
+        guard JSONSerialization.isValidJSONObject(obj),
+              let body = try? JSONSerialization.data(withJSONObject: obj) else { return nil }
+        let n = UInt32(truncatingIfNeeded: body.count)
+        var out = Data([UInt8(n & 0xff), UInt8((n >> 8) & 0xff), UInt8((n >> 16) & 0xff), UInt8((n >> 24) & 0xff)])
+        out.append(body)
+        return out
+    }
+    static func readN(_ fd: Int32, _ n: Int) -> Data? {
+        if n == 0 { return Data() }
+        var out = Data(); out.reserveCapacity(n)
+        var tmp = [UInt8](repeating: 0, count: n)
+        while out.count < n {
+            let need = n - out.count
+            let r = tmp.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, need) }
+            if r <= 0 { return nil }
+            out.append(contentsOf: tmp[0..<r])
+        }
+        return out
+    }
+    static func readFrame(_ fd: Int32) -> Any? {
+        guard let h = readN(fd, 4) else { return nil }
+        let b = [UInt8](h)
+        let len = Int(UInt32(b[0]) | (UInt32(b[1]) << 8) | (UInt32(b[2]) << 16) | (UInt32(b[3]) << 24))
+        if len <= 0 || len > 64 * 1024 * 1024 { return nil }
+        guard let body = readN(fd, len) else { return nil }
+        return try? JSONSerialization.jsonObject(with: body, options: [.allowFragments])
+    }
+    static func writeAll(_ fd: Int32, _ data: Data) -> Bool {
+        var ok = true
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard var p = raw.baseAddress else { ok = false; return }
+            var rem = raw.count
+            while rem > 0 { let w = Darwin.write(fd, p, rem); if w <= 0 { ok = false; break }; p = p.advanced(by: w); rem -= w }
+        }
+        return ok
+    }
+    // One request/reply round-trip to the broker over 127.0.0.1. Returns nil when the
+    // broker (container app) isn't running.
+    static func brokerCall(_ obj: [String: Any]) -> [String: Any]? {
+        if brokerPort == 0 { return nil }
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        if fd < 0 { return nil }
+        defer { close(fd) }
+        _ = fcntl(fd, F_SETNOSIGPIPE, 1)
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = brokerPort.bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let c = withUnsafePointer(to: &addr) { p in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if c < 0 { return nil }
+        guard let frame = frameData(obj), writeAll(fd, frame) else { return nil }
+        return readFrame(fd) as? [String: Any]
+    }
+
+    func handleNative(_ context: NSExtensionContext, _ dict: [String: Any]) {
+        var env = dict
+        env["token"] = Self.brokerToken
+        if let reply = Self.brokerCall(env) {
+            self.reply(context, reply)
+        } else {
+            self.reply(context, ["error": "native-messaging broker unavailable — open the extension's app", "closed": true])
+        }
+    }
 
     func beginRequest(with context: NSExtensionContext) {
         let item = context.inputItems.first as? NSExtensionItem
@@ -177,13 +269,22 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling, URLSessio
             message = item?.userInfo?["message"]
         }
 
-        guard let dict = message as? [String: Any],
-              dict["__c2sProxy"] as? Bool == true,
+        guard let dict = message as? [String: Any] else {
+            self.reply(context, ["echo": message as Any])
+            return
+        }
+
+        if dict["__c2sNM"] != nil {
+            self.handleNative(context, dict)
+            return
+        }
+
+        guard dict["__c2sProxy"] as? Bool == true,
+              !Self.allowHosts.isEmpty,
               let urlString = dict["url"] as? String,
               let url = URL(string: urlString),
               let host = url.host,
               Self.hostAllowed(host) else {
-            // Not a proxy request (or not allowlisted): preserve the echo contract.
             self.reply(context, ["echo": message as Any])
             return
         }
@@ -196,28 +297,15 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling, URLSessio
         if !Self.chromeOrigin.isEmpty {
             req.setValue(Self.chromeOrigin, forHTTPHeaderField: "Origin")
         }
-        // Auth: the shim forwards the request's cookies as a "cookie" field, read
-        // from chrome.cookies (Safari's real jar, httpOnly INCLUDED) — not from
-        // document.cookie, which can't see an httpOnly session cookie. URLSession
-        // does not share Safari's cookie jar, so this forwarded header is the only
-        // way the backend sees the session. We must therefore stop URLSession from
-        // applying/overwriting cookies from its own (empty) shared storage, or it
-        // would clobber our explicit Cookie header and the backend would 401.
         if let cookie = dict["cookie"] as? String, !cookie.isEmpty {
             req.setValue(cookie, forHTTPHeaderField: "Cookie")
         }
         req.httpShouldHandleCookies = false
         if let body = dict["body"] as? String { req.httpBody = body.data(using: .utf8) }
 
-        // Don't let the (empty) shared storage inject/replace cookies — the request
-        // already carries the authenticated Cookie header built from chrome.cookies.
         let cfg = URLSessionConfiguration.default
         cfg.httpShouldSetCookies = false
         cfg.httpCookieAcceptPolicy = .never
-        // Follow redirects only within the allowlist: URLSession copies our Cookie/
-        // Origin headers onto the redirected request, so an open/hostile redirect
-        // would leak the Safari session cookie off-allowlist. The delegate below
-        // vetoes any cross-host hop that isn't allowlisted.
         let session = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
         let task = session.dataTask(with: req) { data, response, error in
             if let error = error {
@@ -242,8 +330,6 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling, URLSessio
         if let host = request.url?.host, Self.hostAllowed(host) {
             completionHandler(request)
         } else {
-            // Refuse the redirect; the shim receives the 3xx status/headers instead of
-            // silently forwarding credentials to an off-allowlist host.
             completionHandler(nil)
         }
     }
@@ -266,6 +352,485 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling, URLSessio
 }
 `;
   for (const h of handlers) writeFileSync(h, swift, "utf-8");
+}
+
+/**
+ * Disable the App Sandbox on the APP target only. Safari REQUIRES the appex to keep
+ * com.apple.security.app-sandbox or it refuses to register the extension, but the
+ * container app can be unsandboxed — and must be, since it hosts the broker that
+ * reads Chrome's host-manifest dir and exec's the host binary (both forbidden under
+ * the sandbox). ENABLE_APP_SANDBOX precedes PRODUCT_BUNDLE_IDENTIFIER in every Xcode
+ * build-config block (settings are emitted alphabetically), so pair them and flip
+ * only blocks whose bundle id is NOT the ".Extension" appex.
+ */
+export function unsandboxAppTarget(xcodeproj: string): void {
+  const pbxproj = join(xcodeproj, "project.pbxproj");
+  if (!existsSync(pbxproj)) return;
+  const content = readFileSync(pbxproj, "utf-8");
+  const next = content.replace(
+    /ENABLE_APP_SANDBOX = YES;([\s\S]*?PRODUCT_BUNDLE_IDENTIFIER = "?)([\w.\-$()]+)("?;)/g,
+    (m, mid, bid, tail) => (bid.endsWith(".Extension") ? m : "ENABLE_APP_SANDBOX = NO;" + mid + bid + tail),
+  );
+  if (next !== content) writeFileSync(pbxproj, next, "utf-8");
+}
+
+/**
+ * Install the native-messaging broker into the (unsandboxed) container app by
+ * rewriting its AppDelegate.swift. The broker listens on 127.0.0.1:<port>, gated by
+ * a build-time token, and for each `__c2sNM` op the appex forwards it: locates the
+ * Chrome native-messaging host manifest, launches the host binary, and pipes Chrome's
+ * stdio framing — persisting each launched host across ops keyed by the JS port id.
+ * The app stays alive after its window closes so the broker keeps serving.
+ */
+export function writeAppBroker(xcodeproj: string, opts: { brokerPort: number; brokerToken: string }): void {
+  const root = xcodeproj.replace(/[^/]+\.xcodeproj$/, "");
+  const delegates = findFiles(root, (n) => n === "AppDelegate.swift", 4);
+  if (delegates.length === 0) return;
+  const port = String(opts.brokerPort);
+  const token = opts.brokerToken.replace(/[^a-zA-Z0-9]/g, "");
+  const swift = `//
+//  AppDelegate.swift — host app + native-messaging broker.
+//  Auto-generated by viaduct. Do not edit.
+//
+import Cocoa
+import Foundation
+
+@main
+class AppDelegate: NSObject, NSApplicationDelegate {
+    // Retain the activity token for the whole process lifetime — releasing it ends the
+    // activity and re-arms automatic termination.
+    var activityToken: NSObjectProtocol?
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // The broker is a windowless background helper. macOS "automatic termination"
+        // reaps such a process when it looks idle (observed live: the app was terminated
+        // and KeepAlive-relaunched), which WIPES the broker's in-memory host map and
+        // orphans live native hosts → every subsequent poll returns closed. Holding a
+        // background activity for the whole process lifetime is the documented, reliable
+        // opt-out (it disables both automatic and sudden termination while held).
+        NSApp.setActivationPolicy(.accessory)
+        activityToken = ProcessInfo.processInfo.beginActivity(
+            options: [.automaticTerminationDisabled, .suddenTerminationDisabled, .background],
+            reason: "native-messaging broker")
+        NMBroker.shared.start()
+    }
+    // Stay alive after the window closes so the broker keeps serving the extension.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        return false
+    }
+}
+
+// One launched Chrome native-messaging host, keyed by the JS-side port id.
+final class NMHost {
+    let proc = Process()
+    let stdinPipe = Pipe()
+    let stdoutPipe = Pipe()
+    var inbox: [Any] = []
+    var buf = Data()
+    var closed = false
+    let lock = NSLock()
+    let writeLock = NSLock()
+}
+
+// One tunneled WebSocket to a loopback app server, keyed by the JS-side ws id.
+// Safari blocks insecure ws:// from the (secure) extension page as mixed content
+// (no loopback exemption), so the panel's WebSocket to the local app server is
+// relayed here: this native process holds the real connection (URLSession has no
+// mixed-content limit) and the extension sends/polls frames over the broker.
+final class NMWS: NSObject, URLSessionWebSocketDelegate {
+    var session: URLSession?
+    var task: URLSessionWebSocketTask?
+    var inbox: [[String: String]] = []
+    var open = false
+    var closed = false
+    var code = 0
+    var lastSeen = Date()
+    var clientId = ""
+    let lock = NSLock()
+    func connect(_ urlStr: String, _ origin: String) {
+        guard let u = URL(string: urlStr) else { finish(1006); return }
+        var req = URLRequest(url: u)
+        if !origin.isEmpty { req.setValue(origin, forHTTPHeaderField: "Origin") }
+        let s = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+        session = s
+        let t = s.webSocketTask(with: req)
+        // URLSessionWebSocketTask defaults to a 1 MiB max frame; a single app-server
+        // message (e.g. an echoed user turn carrying injected page/tab context, or thread
+        // state) can exceed that, which fails receive() and drops the socket. Raise it.
+        t.maximumMessageSize = 100 * 1024 * 1024
+        task = t
+        t.resume()
+        receive()
+    }
+    static let CHUNK = 100_000
+    func receive() {
+        task?.receive { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .failure:
+                self.finish(1006)
+            case .success(let m):
+                switch m {
+                case .string(let str): self.enqueueText(str)
+                case .data(let d): self.enqueueBinary(d.base64EncodedString())
+                @unknown default: break
+                }
+                NMBroker.shared.blog("WS-RECV<-appserver")
+                self.receive()
+            }
+        }
+    }
+    // Safari's native-messaging relay (broker→panel via sendNativeMessage) caps a single
+    // message; a large app-server frame (e.g. an echoed turn carrying page/tab context)
+    // must be split so each wspoll response stays small. Small messages pass whole.
+    func enqueueText(_ str: String) {
+        if str.utf8.count <= NMWS.CHUNK { lock.lock(); inbox.append(["kind": "text", "text": str]); lock.unlock(); return }
+        chunkInto(Data(str.utf8).base64EncodedString(), "text")
+    }
+    func enqueueBinary(_ b64: String) {
+        if b64.utf8.count <= NMWS.CHUNK { lock.lock(); inbox.append(["kind": "binary", "b64": b64]); lock.unlock(); return }
+        chunkInto(b64, "binary")
+    }
+    func chunkInto(_ b64: String, _ ck: String) {
+        let chars = Array(b64.utf8)  // base64 is ASCII → 1 byte per char, safe to split
+        let n = (chars.count + NMWS.CHUNK - 1) / NMWS.CHUNK
+        let id = UUID().uuidString
+        lock.lock(); defer { lock.unlock() }
+        var i = 0, idx = 0
+        while idx < chars.count {
+            let end = min(idx + NMWS.CHUNK, chars.count)
+            let part = String(decoding: chars[idx..<end], as: UTF8.self)
+            inbox.append(["kind": "chunk", "id": id, "i": String(i), "n": String(n), "ck": ck, "d": part])
+            i += 1; idx = end
+        }
+    }
+    func urlSession(_ s: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol proto: String?) {
+        lock.lock(); open = true; lock.unlock()
+        NMBroker.shared.blog("WS-OPEN cid=" + clientId)
+    }
+    func urlSession(_ s: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith c: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        finish(c.rawValue)
+    }
+    func finish(_ c: Int) {
+        lock.lock(); if !closed { closed = true; code = c }; lock.unlock()
+        NMBroker.shared.blog("WS-CLOSE code=" + String(c))
+    }
+    func shutdown() {
+        task?.cancel(with: .goingAway, reason: nil)
+        session?.invalidateAndCancel()
+    }
+}
+
+final class NMBroker {
+    static let shared = NMBroker()
+    static let port: UInt16 = ${port}
+    static let token = "${token}"
+    let lock = NSLock()
+    let blogLock = NSLock()
+    func blog(_ s: String) {
+        let p = (NSHomeDirectory() as NSString).appendingPathComponent("viaduct-broker.log")
+        let t = Int(Date().timeIntervalSince1970 * 1000) % 1000000
+        let bytes = (String(t) + " " + s + "\\n").data(using: .utf8) ?? Data()
+        blogLock.lock()
+        if let fh = FileHandle(forWritingAtPath: p) { fh.seekToEndOfFile(); fh.write(bytes); try? fh.close() }
+        else { try? bytes.write(to: URL(fileURLWithPath: p)) }
+        blogLock.unlock()
+    }
+    var hosts: [String: NMHost] = [:]
+    var wsConns: [String: NMWS] = [:]
+    let queue = DispatchQueue(label: "viaduct.nmbroker", attributes: .concurrent)
+    func start() {
+        signal(SIGPIPE, SIG_IGN)   // writing to a dead host/socket must not kill us
+        queue.async { self.serve() }
+    }
+
+    func serve() {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        if fd < 0 { return }
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = NMBroker.port.bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")   // loopback only
+        let bound = withUnsafePointer(to: &addr) { p in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if bound < 0 { close(fd); return }
+        if listen(fd, 32) < 0 { close(fd); return }
+        while true {
+            let c = accept(fd, nil, nil)
+            if c < 0 { if errno == EINTR { continue }; break }
+            _ = fcntl(c, F_SETNOSIGPIPE, 1)
+            queue.async { self.handleConn(c) }
+        }
+        close(fd)
+    }
+
+    // ── framing (shared shape with the appex client) ──
+    static func frameData(_ obj: Any) -> Data? {
+        let body: Data
+        if JSONSerialization.isValidJSONObject(obj) {
+            guard let d = try? JSONSerialization.data(withJSONObject: obj) else { return nil }
+            body = d
+        } else {
+            let enc = JSONEncoder()
+            if let s = obj as? String, let d = try? enc.encode(s) { body = d }
+            else if let b = obj as? Bool, let d = try? enc.encode(b) { body = d }
+            else if let i = obj as? Int, let d = try? enc.encode(i) { body = d }
+            else if let x = obj as? Double, let d = try? enc.encode(x) { body = d }
+            else { return nil }
+        }
+        let n = UInt32(truncatingIfNeeded: body.count)
+        var out = Data([UInt8(n & 0xff), UInt8((n >> 8) & 0xff), UInt8((n >> 16) & 0xff), UInt8((n >> 24) & 0xff)])
+        out.append(body)
+        return out
+    }
+    func readN(_ fd: Int32, _ n: Int) -> Data? {
+        if n == 0 { return Data() }
+        var out = Data(); out.reserveCapacity(n)
+        var tmp = [UInt8](repeating: 0, count: n)
+        while out.count < n {
+            let need = n - out.count
+            let r = tmp.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, need) }
+            if r <= 0 { return nil }
+            out.append(contentsOf: tmp[0..<r])
+        }
+        return out
+    }
+    func readFrame(_ fd: Int32) -> Any? {
+        guard let h = readN(fd, 4) else { return nil }
+        let b = [UInt8](h)
+        let len = Int(UInt32(b[0]) | (UInt32(b[1]) << 8) | (UInt32(b[2]) << 16) | (UInt32(b[3]) << 24))
+        if len <= 0 || len > 64 * 1024 * 1024 { return nil }
+        guard let body = readN(fd, len) else { return nil }
+        return try? JSONSerialization.jsonObject(with: body, options: [.allowFragments])
+    }
+    func writeAll(_ fd: Int32, _ data: Data) -> Bool {
+        var ok = true
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard var p = raw.baseAddress else { ok = false; return }
+            var rem = raw.count
+            while rem > 0 { let w = Darwin.write(fd, p, rem); if w <= 0 { ok = false; break }; p = p.advanced(by: w); rem -= w }
+        }
+        return ok
+    }
+    func handleConn(_ fd: Int32) {
+        defer { close(fd) }
+        guard let req = readFrame(fd) as? [String: Any] else { return }
+        guard (req["token"] as? String) == NMBroker.token else { return }
+        let reply = handleOp(req)
+        if let frame = NMBroker.frameData(reply) { _ = writeAll(fd, frame) }
+    }
+
+    // ── Chrome native-messaging host management ──
+    func manifestDirs() -> [String] {
+        let home = NSHomeDirectory()
+        let bases = [
+            "Google/Chrome", "Google/Chrome Beta", "Google/Chrome Canary", "Google/Chrome Dev",
+            "Google/Chrome for Testing", "Chromium", "Microsoft Edge", "Microsoft Edge Beta",
+            "BraveSoftware/Brave-Browser", "Vivaldi", "com.operasoftware.Opera", "Arc/User Data"
+        ]
+        var dirs: [String] = []
+        for b in bases { dirs.append(home + "/Library/Application Support/" + b + "/NativeMessagingHosts") }
+        dirs.append("/Library/Google/Chrome/NativeMessagingHosts")
+        dirs.append("/Library/Application Support/Chromium/NativeMessagingHosts")
+        dirs.append("/Library/Microsoft/Edge/NativeMessagingHosts")
+        return dirs
+    }
+    func findManifest(_ host: String) -> [String: Any]? {
+        let allowed = Set("abcdefghijklmnopqrstuvwxyz0123456789._")
+        let safe = String(host.lowercased().filter { allowed.contains($0) })
+        if safe.isEmpty { return nil }
+        for dir in manifestDirs() {
+            let path = dir + "/" + safe + ".json"
+            guard let data = FileManager.default.contents(atPath: path) else { continue }
+            if let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] { return obj }
+        }
+        return nil
+    }
+    func drainFrames(_ h: NMHost) {
+        while h.buf.count >= 4 {
+            let b = [UInt8](h.buf.subdata(in: 0..<4))
+            let len = Int(UInt32(b[0]) | (UInt32(b[1]) << 8) | (UInt32(b[2]) << 16) | (UInt32(b[3]) << 24))
+            let total = 4 + len
+            if len < 0 || h.buf.count < total { break }
+            let body = h.buf.subdata(in: 4..<total)
+            h.buf.removeSubrange(0..<total)
+            if let obj = try? JSONSerialization.jsonObject(with: body, options: [.allowFragments]) { h.inbox.append(obj) }
+        }
+    }
+    func drain(_ h: NMHost) -> [Any] {
+        h.lock.lock(); let o = h.inbox; h.inbox.removeAll(); h.lock.unlock(); return o
+    }
+    func launch(_ host: String) -> NMHost? {
+        guard let manifest = findManifest(host) else { return nil }
+        guard let path = manifest["path"] as? String, !path.isEmpty else { return nil }
+        let h = NMHost()
+        h.proc.executableURL = URL(fileURLWithPath: path)
+        var origin = ""
+        if let origins = manifest["allowed_origins"] as? [String], let first = origins.first, !first.isEmpty { origin = first }
+        h.proc.arguments = origin.isEmpty ? [] : [origin]
+        h.proc.standardInput = h.stdinPipe
+        h.proc.standardOutput = h.stdoutPipe
+        h.proc.standardError = FileHandle.nullDevice
+        h.stdoutPipe.fileHandleForReading.readabilityHandler = { fh in
+            let d = fh.availableData
+            if d.isEmpty { fh.readabilityHandler = nil; h.lock.lock(); h.closed = true; h.lock.unlock(); return }
+            h.lock.lock(); h.buf.append(d); self.drainFrames(h); h.lock.unlock()
+        }
+        h.proc.terminationHandler = { _ in h.lock.lock(); h.closed = true; h.lock.unlock() }
+        do { try h.proc.run() } catch { return nil }
+        _ = fcntl(h.stdinPipe.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
+        return h
+    }
+    func writeToHost(_ h: NMHost, _ message: Any) -> Bool {
+        guard let frame = NMBroker.frameData(message) else { return false }
+        h.writeLock.lock()
+        let ok = writeAll(h.stdinPipe.fileHandleForWriting.fileDescriptor, frame)
+        h.writeLock.unlock()
+        if !ok { h.lock.lock(); h.closed = true; h.lock.unlock() }
+        return ok
+    }
+
+    func handleOp(_ dict: [String: Any]) -> [String: Any] {
+        let op = dict["op"] as? String ?? ""
+        switch op {
+        case "connect":
+            let host = dict["host"] as? String ?? ""
+            let portId = dict["portId"] as? String ?? ""
+            lock.lock()
+            var conn = hosts[portId]
+            if conn == nil { conn = launch(host); if let c = conn { hosts[portId] = c } }
+            lock.unlock()
+            guard let h = conn else { return ["error": "native host '" + host + "' not found or failed to launch"] }
+            let __m = drain(h); blog("connect host=" + host + " port=" + portId + " msgs=" + String(__m.count)); return ["ok": true, "messages": __m]
+        case "post":
+            let portId = dict["portId"] as? String ?? ""
+            lock.lock(); let conn = hosts[portId]; lock.unlock()
+            guard let h = conn else { return ["error": "port closed", "closed": true] }
+            blog("post port=" + portId)
+            var wrote = true
+            if let message = dict["message"] { wrote = writeToHost(h, message) }
+            if !wrote { return ["error": "write failed", "closed": true] }
+            return ["ok": true]
+        case "poll":
+            let portId = dict["portId"] as? String ?? ""
+            lock.lock(); let conn = hosts[portId]; lock.unlock()
+            guard let h = conn else { return ["closed": true, "messages": []] }
+            let msgs = drain(h); blog("poll port=" + portId + " msgs=" + String(msgs.count) + (h.closed ? " CLOSED" : ""))
+            if h.closed && msgs.isEmpty {
+                h.stdoutPipe.fileHandleForReading.readabilityHandler = nil
+                lock.lock(); hosts.removeValue(forKey: portId); lock.unlock()
+                return ["closed": true, "messages": []]
+            }
+            return ["messages": msgs, "closed": false]
+        case "disconnect":
+            let portId = dict["portId"] as? String ?? ""
+            lock.lock(); let h = hosts.removeValue(forKey: portId); lock.unlock()
+            h?.stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            h?.proc.terminate()
+            return ["ok": true]
+        case "once":
+            let host = dict["host"] as? String ?? ""
+            guard let h = launch(host) else { return ["error": "native host '" + host + "' not found"] }
+            if let message = dict["message"] { _ = writeToHost(h, message) }
+            var reply: Any? = nil
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
+                h.lock.lock(); if !h.inbox.isEmpty { reply = h.inbox.removeFirst() }; let closed = h.closed; h.lock.unlock()
+                if reply != nil || closed { break }
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+            h.stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            h.proc.terminate()
+            if let r = reply { return ["message": r] }
+            return ["error": "no reply from native host '" + host + "'"]
+        case "wsopen":
+            let wsId = dict["wsId"] as? String ?? ""
+            let url = dict["url"] as? String ?? ""
+            let origin = dict["origin"] as? String ?? ""
+            if wsId.isEmpty || url.isEmpty { return ["error": "bad wsopen params"] }
+            var cid = ""
+            if let comps = URLComponents(string: url), let items = comps.queryItems {
+                for it in items where it.name == "clientId" { cid = it.value ?? "" }
+            }
+            let w = NMWS(); w.clientId = cid
+            lock.lock()
+            // Retire (a) connections unpolled for a while — a live tunnel polls
+            // continuously, so silence means the panel context went away without closing
+            // it (a GC'd/torn-down page never sends wsclose), and (b) any prior connection
+            // for the same client id. Many local app servers allow only ONE connection per
+            // client (identified by a clientId query param) and drop the older when a new
+            // one arrives; retiring it here — instead of letting the server kill it — keeps
+            // the broker's live set in step with the panel and avoids a reconnect war.
+            let now = Date()
+            for (k, v) in wsConns where now.timeIntervalSince(v.lastSeen) > 60 || (!cid.isEmpty && v.clientId == cid) {
+                v.shutdown(); wsConns.removeValue(forKey: k)
+            }
+            wsConns[wsId] = w
+            lock.unlock()
+            w.connect(url, origin)
+            blog("wsopen cid=" + cid + " url=" + url)
+            return ["ok": true]
+        case "wssend":
+            let sid = dict["wsId"] as? String ?? ""
+            lock.lock(); let sw = wsConns[sid]; lock.unlock()
+            guard let sconn = sw, let stask = sconn.task else { return ["error": "ws not open", "closed": true] }
+            let kind = dict["kind"] as? String ?? "text"
+            blog("wssend kind=" + kind)
+            if kind == "binary", let b64 = dict["b64"] as? String, let d = Data(base64Encoded: b64) {
+                stask.send(.data(d)) { _ in }
+            } else if let text = dict["text"] as? String {
+                stask.send(.string(text)) { _ in }
+            }
+            return ["ok": true]
+        case "wspoll":
+            let pid = dict["wsId"] as? String ?? ""
+            lock.lock(); let pw = wsConns[pid]; pw?.lastSeen = Date(); lock.unlock()
+            guard let pconn = pw else { return ["closed": true, "messages": []] }
+            pconn.lock.lock()
+            // Drain up to ~200 KB of records per poll so each native-messaging response
+            // stays within Safari's relay cap; the shim polls again for the rest.
+            var msgs: [[String: String]] = []
+            var used = 0
+            while !pconn.inbox.isEmpty {
+                let rec = pconn.inbox[0]
+                let sz = (rec["text"]?.utf8.count ?? 0) + (rec["b64"]?.utf8.count ?? 0) + (rec["d"]?.utf8.count ?? 0)
+                if !msgs.isEmpty && used + sz > 200_000 { break }
+                msgs.append(rec); pconn.inbox.removeFirst(); used += sz
+            }
+            let isOpen = pconn.open; let isClosed = pconn.closed; let ccode = pconn.code
+            pconn.lock.unlock()
+            blog("wspoll msgs=" + String(msgs.count) + (isClosed ? " CLOSED" : ""))
+            if isClosed && msgs.isEmpty {
+                pconn.shutdown()
+                lock.lock(); wsConns.removeValue(forKey: pid); lock.unlock()
+                return ["closed": true, "messages": [], "code": ccode]
+            }
+            return ["messages": msgs, "open": isOpen, "closed": false]
+        case "wsclose":
+            let xid = dict["wsId"] as? String ?? ""
+            lock.lock(); let cw = wsConns.removeValue(forKey: xid); lock.unlock()
+            cw?.shutdown()
+            return ["ok": true]
+        case "clog":
+            let line = dict["line"] as? String ?? ""
+            let logPath = (NSHomeDirectory() as NSString).appendingPathComponent("viaduct-cdp.log")
+            let bytes = (line + "\\n").data(using: .utf8) ?? Data()
+            lock.lock()
+            if let fh = FileHandle(forWritingAtPath: logPath) { fh.seekToEndOfFile(); fh.write(bytes); try? fh.close() }
+            else { try? bytes.write(to: URL(fileURLWithPath: logPath)) }
+            lock.unlock()
+            return ["ok": true]
+        default:
+            return ["error": "unknown native op '" + op + "'"]
+        }
+    }
+}
+`;
+  for (const d of delegates) writeFileSync(d, swift, "utf-8");
 }
 
 function pickScheme(xcodeproj: string, appName: string, platforms: Platforms): string | null {
