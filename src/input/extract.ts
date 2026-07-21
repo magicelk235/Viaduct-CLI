@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, readdirSync, statSync, lstatSync, writeFileSync, mkdirSync, openSync, readSync, closeSync, realpathSync, rmSync } from "node:fs";
 import { join, extname, resolve, sep } from "node:path";
+import { createHash } from "node:crypto";
 import { run } from "../util.js";
 
 /** Strip macOS extended attributes that break code signing. */
@@ -90,6 +91,57 @@ function crxToZip(crxPath: string): Buffer {
 }
 
 /**
+ * Pull the extension's public key (DER, base64) from a CRX header so a Chrome id
+ * can be derived — CWS manifests ship without `key`, but the CRX carries it. v2
+ * stores the key inline; v3 wraps a CrxFileHeader protobuf whose signed_header_data
+ * holds the authoritative 16-byte crx_id — we return the AsymmetricKeyProof key that
+ * hashes to it (there can be several proofs; only one matches). Returns undefined
+ * when the container is unparseable.
+ */
+function crxPublicKeyBase64(crxPath: string): string | undefined {
+  let buf: Buffer;
+  try { buf = readFileSync(crxPath); } catch { return undefined; }
+  if (buf.length < 12 || buf.subarray(0, 4).toString("ascii") !== "Cr24") return undefined;
+  const version = buf.readUInt32LE(4);
+  if (version === 2) {
+    const pubKeyLen = buf.readUInt32LE(8);
+    if (pubKeyLen <= 0 || buf.length < 16 + pubKeyLen) return undefined;
+    return buf.subarray(16, 16 + pubKeyLen).toString("base64");
+  }
+  if (version !== 3) return undefined;
+  const headerLen = buf.readUInt32LE(8);
+  if (headerLen <= 0 || buf.length < 12 + headerLen) return undefined;
+  const hdr = buf.subarray(12, 12 + headerLen);
+  // Minimal protobuf field walk: (tag as varint) then value by wire type.
+  const fields = (b: Buffer): Array<{ field: number; val: Buffer }> => {
+    const out: Array<{ field: number; val: Buffer }> = [];
+    let i = 0;
+    const vint = (): number => { let s = 0, r = 0, x = 0; do { x = b[i++]; r |= (x & 0x7f) << s; s += 7; } while (x & 0x80 && i < b.length); return r >>> 0; };
+    while (i < b.length) {
+      const tag = vint(); const field = tag >>> 3; const wt = tag & 7;
+      if (wt === 2) { const len = vint(); out.push({ field, val: b.subarray(i, i + len) }); i += len; }
+      else if (wt === 0) { vint(); }
+      else if (wt === 5) { i += 4; }
+      else if (wt === 1) { i += 8; }
+      else break;
+    }
+    return out;
+  };
+  const top = fields(hdr);
+  const signed = top.find((f) => f.field === 10000);
+  let crxId: Buffer | undefined;
+  if (signed) { const s = fields(signed.val).find((f) => f.field === 1); if (s) crxId = s.val; }
+  const proofs = top.filter((f) => f.field === 2 || f.field === 3);
+  for (const pr of proofs) {
+    const pub = fields(pr.val).find((f) => f.field === 1);
+    if (!pub) continue;
+    if (!crxId) return pub.val.toString("base64");
+    if (createHash("sha256").update(pub.val).digest().subarray(0, 16).equals(crxId)) return pub.val.toString("base64");
+  }
+  return undefined;
+}
+
+/**
  * Resolve the directory that actually contains manifest.json.
  * Many zips wrap the extension in a single top-level folder.
  */
@@ -175,6 +227,19 @@ export function extractExtension(inputPath: string, scratchDir: string): string 
   }
 
   const root = resolveExtensionRoot(destDir);
+  // CWS manifests ship without `key`, so the Chrome id can't be derived from the
+  // staged manifest alone. Recover it from the CRX header and inject it, so the
+  // rest of the pipeline (chrome-extension origin, runtime.id spoof) has a real id.
+  if (kind === "crx") {
+    const key = crxPublicKeyBase64(inputPath);
+    if (key) {
+      const mfPath = join(root, "manifest.json");
+      try {
+        const mf = JSON.parse(readFileSync(mfPath, "utf-8"));
+        if (!mf.key) { mf.key = key; writeFileSync(mfPath, JSON.stringify(mf, null, 2)); }
+      } catch { /* leave manifest as-is if unreadable */ }
+    }
+  }
   cleanExtendedAttributes(root);
   return root;
 }
