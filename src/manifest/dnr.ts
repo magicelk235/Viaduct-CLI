@@ -7,7 +7,7 @@ import { parseJsonc } from "./manifest.js";
 // "../../etc/x" would make join() resolve outside stageDir, and the modifyHeaders
 // strip below writeFileSync()s back to it: arbitrary file overwrite from a
 // malicious extension. Confirm the resolved path stays under stageDir.
-// ponytail: string-prefix check via path.relative; fine for a local single root.
+// String-prefix check via path.relative; fine for a local single root.
 function resolveInside(stageDir: string, p: string): string | null {
   const full = resolve(stageDir, p);
   const rel = relative(resolve(stageDir), full);

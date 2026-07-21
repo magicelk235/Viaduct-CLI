@@ -186,7 +186,7 @@ export function stripDanglingSourcemaps(stageDir: string): number {
 // values directly in the staged source. Covers chrome|browser, dot or ["bracket"] access
 // for the namespace step, and the two enums Safari omits. Returns files modified.
 //
-// ponytail: literal-substitution, not a JS parser. These enums are only ever read as
+// Literal-substitution, not a JS parser. These enums are only ever read as
 // `.ExecutionWorld.<MEMBER>` member chains in real bundles (verified across the corpus);
 // a regex is enough and can't mangle unrelated code. If a bundle ever aliased the enum
 // object itself (`const W = chrome.scripting.ExecutionWorld`) we'd need AST work — add
@@ -240,7 +240,7 @@ export function inlineImmutableEnums(stageDir: string): number {
 // Must run BEFORE the shim/polyfill are written — those templates carry
 // chrome-extension:// strings on purpose (origin spoofing) and must keep them.
 //
-// ponytail: token substitution, not a JS parser. Matches the scheme token
+// Token substitution, not a JS parser. Matches the scheme token
 // wherever it appears (comments too — harmless). A dual-browser bundle that
 // compares against BOTH schemes ends up with two equal branches; the first
 // wins, same outcome either way.
@@ -291,7 +291,7 @@ export function rewriteChromeSchemeLiterals(stageDir: string): number {
 // Safari's "?tabId=N" query — the path substring still matches). It stays path-specific, so
 // popup/sidePanel/devtools matchers remain distinct and content-script URLs don't match.
 //
-// ponytail: literal substitution, not a JS parser. Targets the exact, common shape
+// Literal substitution, not a JS parser. Targets the exact, common shape
 // `new RegExp(<chrome|browser>[.|["..."]]runtime.id + "<path>")`. A bundle that built the
 // pattern some other way (string concat into a var first) would need AST work — add then.
 const RUNTIME_ID_URL_RE =

@@ -20,7 +20,7 @@ export interface VerifyResult {
 // false-flagged any extension whose Path or name merely contained the word
 // "disabled"). Returns null when the id isn't found (caller already checks
 // registration separately).
-// ponytail: flag-column heuristic, upgrade to WebInspector relay if console errors are needed.
+// Flag-column heuristic, upgrade to WebInspector relay if console errors are needed.
 export function parseEnabled(pluginkitCompact: string, extBundleId: string): boolean | null {
   const id = `${extBundleId}.Extension`;
   for (const line of pluginkitCompact.split("\n")) {

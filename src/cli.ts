@@ -19,7 +19,7 @@ import type { Platforms } from "./types.js";
 // Option keys a config file may set. Mirrors the long-flag names in parseArgs so
 // a viaduct.config.json reads exactly like the CLI: { "bundle-id": "...", "team": "auto" }.
 // Excludes one-shot/meta flags (analyze, doctor, list, version, etc.) that make no
-// sense to persist. ponytail: hand-listed; add a key here when it's worth persisting.
+// sense to persist. Hand-listed; add a key here when it's worth persisting.
 const CONFIG_KEYS = [
   "output", "bundle-id", "app-name", "min-safari", "platforms", "ci",
   "zip", "no-build", "open-xcode", "install", "install-dir",
