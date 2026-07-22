@@ -224,6 +224,20 @@ const COMMAND_MODIFIERS = new Set(["Ctrl", "Command", "Alt", "Option", "MacCtrl"
 // chromeos/windows/linux are dead keys on Safari — warning about them is noise.
 const SAFARI_COMMAND_PLATFORMS = new Set(["default", "mac", "ios"]);
 
+// True when a command definition has a suggested_key chord Safari would honor — a
+// plain string (all platforms) or a per-platform map with a default/mac/ios entry.
+// These are the ones that count toward Safari's 4-shortcut limit.
+function hasSafariSuggestedKey(def: unknown): boolean {
+  const suggested = (def as { suggested_key?: unknown } | undefined)?.suggested_key;
+  if (typeof suggested === "string") return suggested.trim() !== "";
+  if (suggested && typeof suggested === "object") {
+    return Object.entries(suggested as Record<string, unknown>).some(
+      ([platform, v]) => SAFARI_COMMAND_PLATFORMS.has(platform) && typeof v === "string" && v.trim() !== ""
+    );
+  }
+  return false;
+}
+
 export function analyzeCommands(commands: Record<string, unknown>): Issue[] {
   const issues: Issue[] = [];
   for (const [name, def] of Object.entries(commands)) {
@@ -262,6 +276,22 @@ export function analyzeCommands(commands: Record<string, unknown>): Issue[] {
         });
       }
     }
+  }
+
+  // Safari allows at most 4 commands with a suggested_key; a 5th makes it reject the
+  // whole manifest at load. transformManifest strips the default chord from the extras,
+  // so flag which lost it (they're still bindable manually in Safari's settings).
+  const withKeys = Object.keys(commands).filter((name) => hasSafariSuggestedKey(commands[name]));
+  if (withKeys.length > 4) {
+    const dropped = withKeys.slice(4);
+    issues.push({
+      severity: "warning",
+      category: "ui",
+      message: `${withKeys.length} commands declare a keyboard shortcut, but Safari allows only 4; dropping the default chord from: ${dropped.join(", ")}.`,
+      file: "manifest.json",
+      fix: "Safari rejects the manifest with a 5th shortcut. The extra commands keep working and can be bound by the user in Safari → Settings → Extensions.",
+      autoFixed: true,
+    });
   }
   return issues;
 }
@@ -886,6 +916,22 @@ export function transformManifest(
   }
   if (mv === 3 && out.background?.type === "module" && !opts.keepModuleBackground) {
     delete out.background.type;
+  }
+
+  // Safari rejects the whole manifest ("Too many shortcuts specified for commands,
+  // only 4 shortcuts are allowed") when more than 4 commands carry a suggested_key
+  // Safari can read. Chrome has no such cap, so bundles like TWP declare 8+. Keep the
+  // first 4 (declaration order) and strip suggested_key from the rest — those commands
+  // still exist and stay bindable in Safari → Settings → Extensions, they just lose
+  // their default chord. Only Safari-platform chords count toward the limit; a command
+  // whose suggested_key is windows/linux-only is already a dead key here.
+  if (out.commands && typeof out.commands === "object") {
+    let kept = 0;
+    for (const def of Object.values(out.commands as Record<string, unknown>)) {
+      if (!hasSafariSuggestedKey(def)) continue;
+      kept++;
+      if (kept > 4) delete (def as { suggested_key?: unknown }).suggested_key;
+    }
   }
 
   // page_action has no Safari equivalent; fold it into the toolbar-button key that
