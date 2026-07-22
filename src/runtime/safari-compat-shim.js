@@ -3276,7 +3276,9 @@ var __C2S_DEBUG__ = false;
       if (__menuNs && typeof __menuNs.create === "function" && !__menuNs.__c2sCreate) {
         var __menuCreate = __menuNs.create.bind(__menuNs);
         var __okPattern = function (p) {
-          return typeof p === "string" && (p === "<all_urls>" || /^(\*|https?|file|ftp):\/\//i.test(p));
+          // Safari's menus.create ALSO rejects ftp:// patterns ("'ftp://*/*' is not a
+          // valid pattern" — TWP registers them), so ftp is NOT in the allowed set.
+          return typeof p === "string" && (p === "<all_urls>" || /^(\*|https?|file):\/\//i.test(p));
         };
         var __sanitizePatterns = function (arr) {
           if (!Array.isArray(arr)) return arr;
