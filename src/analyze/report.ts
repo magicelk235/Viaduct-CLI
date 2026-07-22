@@ -12,7 +12,7 @@ import { color } from "../util.js";
 export function summarizeManifestChanges(before: Manifest, after: Manifest): string[] {
   const out: string[] = [];
 
-  for (const key of ["update_url", "key", "minimum_chrome_version", "version_name"] as const) {
+  for (const key of ["update_url", "key", "minimum_chrome_version"] as const) {
     if (before[key] !== undefined && after[key] === undefined) out.push(`Dropped \`${key}\` (Chrome-only).`);
   }
 

@@ -457,15 +457,6 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
       });
     }
   }
-  if (m.version_name) {
-    issues.push({
-      severity: "info",
-      category: "manifest",
-      message: "version_name has no Safari/App Store meaning; removing.",
-      file: "manifest.json",
-      autoFixed: true,
-    });
-  }
 
   // Only the extension_pages policy governs the extension's own pages/SW; the
   // sandbox policy intentionally relaxes rules for sandboxed iframes, so scanning
@@ -555,9 +546,9 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
     issues.push({
       severity: "info",
       category: "ui",
-      message: "Action has no default_popup; the toolbar button would be inert in Safari.",
+      message: "Action has no default_popup; a toolbar button with no behavior is inert in Safari.",
       file: "manifest.json",
-      fix: "Auto-wiring a detected popup/sidepanel HTML as default_popup.",
+      fix: "Wiring a detected popup/sidepanel page, or (if the background handles action.onClicked) an onClicked bridge, so the button works.",
       autoFixed: true,
     });
   }
@@ -793,6 +784,26 @@ export function addSelfToConnectSrc<T extends string | Record<string, string> | 
   return out as T;
 }
 
+// True when a background script registers action.onClicked — i.e. the toolbar button's
+// behavior lives in code, not in a popup page. Same heuristic (and same signal) as the
+// shim's own detector in runtime/shim.ts; kept as a local copy here because shim.ts
+// already imports from this module, and reversing that edge to share one function would
+// create an import cycle. Both read the staged background source; neither owns the other.
+function backgroundRegistersActionOnClicked(manifest: Manifest, extPath: string): boolean {
+  const files: string[] = [];
+  const sw = manifest.background?.service_worker;
+  if (typeof sw === "string") files.push(sw);
+  for (const s of manifest.background?.scripts ?? []) if (typeof s === "string") files.push(s);
+  for (const rel of files) {
+    const p = join(extPath, rel.replace(/^\.?\//, ""));
+    if (!existsSync(p)) continue;
+    let src: string;
+    try { src = readFileSync(p, "utf-8"); } catch { continue; }
+    if (/onClicked/.test(src) && /\b(?:action|browserAction)\b/.test(src)) return true;
+  }
+  return false;
+}
+
 /** Produce the Safari-ready manifest. Pure: does not write to disk. */
 export function transformManifest(
   m: Manifest,
@@ -805,7 +816,10 @@ export function transformManifest(
   delete out.update_url;
   delete out.key;
   delete out.minimum_chrome_version;
-  delete out.version_name;
+  // Keep version_name: the App Store ignores it, but it's a real runtime field —
+  // extensions read chrome.runtime.getManifest().version_name for display (Salesforce
+  // Inspector renders it in its footer and crashes on undefined.replace if it's gone).
+  // Harmless to leave in the Safari bundle; removing it breaks that read.
 
   if (out.version) {
     // Safari/Xcode require dot-separated integers (max 3 components, each ≤ 65535).
@@ -988,7 +1002,14 @@ export function transformManifest(
     const panelPath = (out.side_panel?.default_path ?? "").split(/[#?]/)[0].replace(/^\/+/, "");
     if (panelPath && existsSync(join(extPath, panelPath))) {
       action.default_popup = panelPath;
-    } else {
+    } else if (!backgroundRegistersActionOnClicked(out, extPath)) {
+      // Only guess a popup page when the toolbar button has no other behavior. If the
+      // background registers action.onClicked, the button is code-driven (it toggles
+      // in-page UI, opens a tab, etc.), and the extension's own popup.html is usually a
+      // content-script-injected iframe (a web_accessible_resource), NOT a toolbar popup —
+      // wiring it here hijacks the click into an orphan popover that never initializes
+      // (Salesforce Inspector Reloaded: empty gray box). Leave default_popup unset so
+      // wireActionClickBridge replays the real onClicked instead.
       for (const candidate of ["popup.html", "sidepanel.html", "panel.html", "index.html"]) {
         if (existsSync(join(extPath, candidate))) {
           action.default_popup = candidate;
