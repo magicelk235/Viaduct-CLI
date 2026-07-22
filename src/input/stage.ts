@@ -321,3 +321,88 @@ export function rewriteRuntimeIdUrlMatchers(stageDir: string): number {
   }
   return modified;
 }
+
+// Chrome extension pages sit in a nested browsing context, so bundles read
+// `location.ancestorOrigins[0]` to learn who framed them (e.g. "am I the top-level
+// extension page?"). In Safari the extension popup/options page is TOP-LEVEL, so
+// ancestorOrigins is an EMPTY DOMStringList — present (the `?.` guard passes) but
+// [0] is undefined, and the trailing `.includes(...)` throws at module top level.
+// A module that throws before it renders leaves a blank white popup (Salesforce
+// Inspector Reloaded: popup.js line 1 → empty popover).
+//
+// Guard the index read so the method call sees an empty string instead of undefined:
+//   location.ancestorOrigins?.[0].includes(x)  ->  (location.ancestorOrigins?.[0] || "").includes(x)
+//   location.ancestorOrigins[0].includes(x)    ->  (location.ancestorOrigins[0] || "").includes(x)
+// "" is falsy and safely answers every string method (.includes/.indexOf/.startsWith
+// → false/-1), matching what the check wants when there's no ancestor: "not framed".
+//
+// Literal substitution, not a JS parser. Matches the `.ancestorOrigins` access with an
+// immediate `[0]` (optional-chained or plain) that is followed by a method call. Only that
+// followed-by-`.`method shape can throw here; a bare `ancestorOrigins[0]` assigned to a var
+// is left alone (already undefined-tolerant).
+const ANCESTOR_ORIGINS_RE =
+  /((?:[\w$.\])]|\?\.)+\.ancestorOrigins(\?\.\[0\]|\[0\]))(?=\s*\.)/g;
+
+export function guardAncestorOriginsAccess(stageDir: string): number {
+  let modified = 0;
+  for (const file of walkScripts(stageDir)) {
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    let changed = false;
+    const next = content.replace(ANCESTOR_ORIGINS_RE, (whole) => {
+      changed = true;
+      return "(" + whole + ' || "")';
+    });
+    if (changed) {
+      writeFileSync(file, next, "utf-8");
+      modified++;
+    }
+  }
+  return modified;
+}
+
+// A template literal whose ENTIRE value is `chrome-extension://${<ext-id>}/<path>` is a
+// self-page navigation (fed to tabs.create / window.open / location=), NOT an OAuth
+// redirect_uri. rewriteChromeSchemeLiterals deliberately skips `chrome-extension://${…}`
+// to preserve redirect_uris registered with the provider — but that also skips these real
+// navigations, which then point at a scheme+host that don't exist in Safari (the scheme is
+// safari-web-extension:// and the host is a per-install UUID, not @@extension_id). Result:
+// Salesforce Inspector's keyboard-command page opens (data-export, options, …) land on a
+// dead chrome-extension://<bundle-id>/foo.html tab.
+//
+// Rewrite them to chrome.runtime.getURL(`<path>`), which resolves to the correct Safari
+// scheme + UUID host at runtime. Safe because we ONLY match when the backtick immediately
+// precedes `chrome-extension://` (the literal IS the whole URL) and the host is an
+// extension-id expression — so an embedded redirect_uri like `…redirect_uri=${browser}-
+// extension://…` inside a larger authorize URL never matches (its scheme is interpolated,
+// and it isn't at the start of the literal).
+//
+// Host expr covered: chrome.i18n.getMessage("@@extension_id"), (chrome|browser).runtime.id.
+const SELF_PAGE_URL_RE =
+  /`chrome-extension:\/\/\$\{\s*(?:(?:chrome|browser)\s*\.\s*i18n\s*\.\s*getMessage\s*\(\s*(["'])@@extension_id\1\s*\)|(?:chrome|browser)\s*\.\s*runtime\s*\.\s*id)\s*\}\/([^`]*)`/g;
+
+export function rewriteSelfPageExtensionUrls(stageDir: string): number {
+  let modified = 0;
+  for (const file of walkScripts(stageDir)) {
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    let changed = false;
+    const next = content.replace(SELF_PAGE_URL_RE, (_whole, _q, path: string) => {
+      changed = true;
+      return "chrome.runtime.getURL(`" + path + "`)";
+    });
+    if (changed) {
+      writeFileSync(file, next, "utf-8");
+      modified++;
+    }
+  }
+  return modified;
+}
