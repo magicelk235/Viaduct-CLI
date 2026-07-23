@@ -2,7 +2,7 @@ import { mkdirSync, existsSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os";
 import { join, resolve, relative, isAbsolute, basename } from "node:path";
 import { run, info, ok, warn, fail, moveBundle } from "../util.js";
-import { pluginkitStatus, defaultBundleId, deriveAppName } from "./packager.js";
+import { pluginkitStatus, defaultBundleId, deriveAppName, plistValue } from "./packager.js";
 
 /** Full path to LaunchServices' lsregister (not on PATH). */
 export const LSREGISTER =
@@ -35,6 +35,19 @@ export function expandHome(p: string): string {
   if (p === "~") return homedir();
   if (p.startsWith("~/")) return join(homedir(), p.slice(2));
   return p;
+}
+
+/**
+ * Read an installed .app's real CFBundleIdentifier (what the broker LaunchAgent was
+ * keyed on at install time — a custom --bundle-id, not necessarily com.viaduct.<name>).
+ * Handles both bundle layouts: macOS nests Info.plist under Contents/, iOS is flat.
+ * Falls back to the derived default id when the plist can't be read (bundle already
+ * gone, unreadable) so uninstall still makes a best-effort broker cleanup.
+ */
+function installedBundleId(appDest: string, cleanName: string): string {
+  const contents = join(appDest, "Contents", "Info.plist");
+  const plist = existsSync(contents) ? contents : join(appDest, "Info.plist");
+  return plistValue(plist, "CFBundleIdentifier") ?? defaultBundleId(deriveAppName(cleanName));
 }
 
 /**
@@ -201,8 +214,12 @@ export function uninstallFromSafari(appName: string, installDir?: string): boole
     return false;
   }
 
-  // Remove the broker LaunchAgent (best-effort; keyed on the default bundle id).
-  uninstallBrokerAgent(defaultBundleId(deriveAppName(cleanName)));
+  // Remove the broker LaunchAgent (best-effort). It was keyed on the app's ACTUAL
+  // bundle id when installed, which may be a custom --bundle-id, not com.viaduct.<name>.
+  // Read it back off the still-present bundle (this runs before the rmSync below) so a
+  // custom-id install's plist is actually removed; fall back to the default id only if
+  // the plist read fails.
+  uninstallBrokerAgent(installedBundleId(dest, cleanName));
 
   // Unregister BEFORE deleting so LaunchServices drops the appex record cleanly.
   const unreg = run(LSREGISTER, ["-u", dest]);

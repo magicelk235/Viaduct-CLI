@@ -2,6 +2,7 @@ import { existsSync, readFileSync, readdirSync, statSync, lstatSync, writeFileSy
 import { join, extname, resolve, sep } from "node:path";
 import { createHash } from "node:crypto";
 import { run } from "../util.js";
+import { parseJsonc } from "../manifest/manifest.js";
 
 /** Strip macOS extended attributes that break code signing. */
 export function cleanExtendedAttributes(path: string): void {
@@ -235,7 +236,11 @@ export function extractExtension(inputPath: string, scratchDir: string): string 
     if (key) {
       const mfPath = join(root, "manifest.json");
       try {
-        const mf = JSON.parse(readFileSync(mfPath, "utf-8"));
+        // Lenient parse (same as loadManifest): a CRX'd Chrome manifest may carry a
+        // BOM/comments/trailing commas, on which strict JSON.parse throws — dropping
+        // the recovered key and losing the derived Chrome id downstream. Rewritten
+        // back as clean JSON, the shape the rest of the pipeline re-reads anyway.
+        const mf = parseJsonc<{ key?: string }>(readFileSync(mfPath, "utf-8"));
         if (!mf.key) { mf.key = key; writeFileSync(mfPath, JSON.stringify(mf, null, 2)); }
       } catch { /* leave manifest as-is if unreadable */ }
     }
