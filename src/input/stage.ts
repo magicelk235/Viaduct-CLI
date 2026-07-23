@@ -402,7 +402,9 @@ export function idempotentContentScriptGlobals(
     if (cs.world === "MAIN") continue; // page world; not re-injected into a shared isolated world
     if (!Array.isArray(cs.js)) continue;
     for (const j of cs.js) {
-      if (typeof j === "string") files.add(j.replace(/^\//, "")); // manifest paths may be "/lib/x.js"
+      // Normalize like collectReferencedPaths so we hit the same on-disk file the
+      // stager wrote: "/lib/x.js", "./lib/x.js", and backslash paths all resolve.
+      if (typeof j === "string" && j) files.add(j.replace(/^\.?\//, "").replace(/\\/g, "/"));
     }
   }
   let modified = 0;

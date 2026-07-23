@@ -117,16 +117,26 @@ test("only touches files referenced by content_scripts, not background/popup", (
   }
 });
 
-test("strips a leading slash on the js path (manifest uses /lib/x.js)", () => {
-  const dir = stage({ "lib/i18n.js": "const twpI18n = 1;\n" });
+test("normalizes /, ./ and backslash js paths to the on-disk file", () => {
+  const dir = stage({
+    "a/i18n.js": "const A = 1;\n",
+    "b/i18n.js": "const B = 1;\n",
+    "c/i18n.js": "const C = 1;\n",
+  });
   const manifest = {
     manifest_version: 2,
-    content_scripts: [{ matches: ["<all_urls>"], js: ["/lib/i18n.js"] }],
+    content_scripts: [
+      { matches: ["<all_urls>"], js: ["/a/i18n.js"] },
+      { matches: ["<all_urls>"], js: ["./b/i18n.js"] },
+      { matches: ["<all_urls>"], js: ["c\\i18n.js"] },
+    ],
   };
   try {
     const n = idempotentContentScriptGlobals(dir, manifest);
-    assert.equal(n, 1);
-    assert.match(read(dir, "lib/i18n.js"), /^var twpI18n = 1;/);
+    assert.equal(n, 3);
+    assert.match(read(dir, "a/i18n.js"), /^var A = 1;/);
+    assert.match(read(dir, "b/i18n.js"), /^var B = 1;/);
+    assert.match(read(dir, "c/i18n.js"), /^var C = 1;/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
