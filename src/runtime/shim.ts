@@ -553,18 +553,39 @@ function extractActionMessage(dir: string, manifest: Manifest): string | null {
 
 interface HotkeyCombo { meta: boolean; ctrl: boolean; shift: boolean; alt: boolean; key: string; }
 
-/** Parse a WebExtensions command key ("Command+Shift+S", "Ctrl+Shift+Y") into a combo. */
+// WebExtensions command key tokens whose DOM KeyboardEvent.key differs from the token
+// (all compared lowercased against `e.key` in the generated hotkey script). The arrow
+// keys are the trap: token "Up" → e.key "ArrowUp", so a bare lowercase "up" never
+// matches and the hotkey silently never fires. Anything not here and longer than one
+// char is a token we can't reliably map to an e.key, so parseCombo bails (→ the caller
+// uses its Ctrl+Shift+Y default rather than wiring a dead shortcut).
+const COMMAND_KEY_TO_DOM: Record<string, string> = {
+  up: "arrowup", down: "arrowdown", left: "arrowleft", right: "arrowright",
+  space: " ", comma: ",", period: ".",
+  pageup: "pageup", pagedown: "pagedown", home: "home", end: "end",
+  insert: "insert", delete: "delete", tab: "tab",
+};
+
+/** Parse a WebExtensions command key ("Command+Shift+S", "Ctrl+Shift+Y") into a combo.
+ *  Returns null when the key token can't be mapped to a DOM KeyboardEvent.key, so the
+ *  caller falls back to a working default instead of wiring a hotkey that never fires. */
 function parseCombo(key: unknown): HotkeyCombo | null {
   if (typeof key !== "string" || !key) return null;
   const combo: HotkeyCombo = { meta: false, ctrl: false, shift: false, alt: false, key: "" };
+  let unmappable = false;
   for (const part of key.split("+").map((s) => s.trim().toLowerCase())) {
     if (part === "command" || part === "cmd") combo.meta = true;
     else if (part === "ctrl" || part === "control" || part === "macctrl") combo.ctrl = true;
     else if (part === "shift") combo.shift = true;
     else if (part === "alt" || part === "option") combo.alt = true;
-    else if (part) combo.key = part.length === 1 ? part : part.replace(/^key/, "");
+    else if (part) {
+      const named = part.replace(/^key/, "");
+      if (named.length === 1) combo.key = named;
+      else if (COMMAND_KEY_TO_DOM[named]) combo.key = COMMAND_KEY_TO_DOM[named];
+      else unmappable = true; // a named key we can't match against e.key → bail
+    }
   }
-  return combo.key ? combo : null;
+  return combo.key && !unmappable ? combo : null;
 }
 
 /**
@@ -965,7 +986,13 @@ function neutralizeImportScripts(dir: string, rootRel: string, resolveDir: strin
     // runtime value would masquerade as a static string and go undetected — the
     // remaining `${…}` keeps the residue non-empty, correctly marking it dynamic.
     const stripStatics = /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`$\\]|\$(?!\{))*`/g;
-    if (argList.replace(stripStatics, "").replace(/[\s,]/g, "") !== "") dynamic = true;
+    // Strip comments too before the emptiness test: `importScripts("a.js" /*x*/, "b.js")`
+    // is fully static, but a leftover comment would read as residue and wrongly flip the
+    // call to dynamic (→ needless webpack-chunk collection + module-mode background).
+    // Statics first, then comments — a comment token inside a string literal is already
+    // gone, so this can't strip a `//`/`/*` that was actually part of a path literal.
+    const stripComments = /\/\*[\s\S]*?\*\/|\/\/[^\n]*/g;
+    if (argList.replace(stripStatics, "").replace(stripComments, "").replace(/[\s,]/g, "") !== "") dynamic = true;
     // Extract string OR interpolation-free template targets (`a.js`). A backtick
     // with `${}` stays dynamic above, so only static templates reach here as
     // hoistable literals (the `$(?!\{)` lets a literal `$` in a filename through).

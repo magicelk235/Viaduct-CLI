@@ -59,7 +59,15 @@ interface HttpResult {
   contentType: string;
 }
 
-function httpGet(url: string, redirectsLeft = MAX_REDIRECTS): Promise<HttpResult> {
+function httpGet(
+  url: string,
+  redirectsLeft = MAX_REDIRECTS,
+  // Absolute wall-clock deadline for the WHOLE fetch, redirect chain included.
+  // Threaded through the redirect recursion so it spans every hop, not re-armed
+  // per hop — otherwise a server redirecting MAX_REDIRECTS times could hold the
+  // request open for (hops+1)×TOTAL_TIMEOUT_MS, far past the advertised bound.
+  deadlineAt = Date.now() + TOTAL_TIMEOUT_MS,
+): Promise<HttpResult> {
   return new Promise((resolve, reject) => {
     // Guard against resolve/reject racing each other: a size-cap reject and a
     // buffered `end` (which would resolve with the truncated buffer) can both
@@ -109,7 +117,7 @@ function httpGet(url: string, redirectsLeft = MAX_REDIRECTS): Promise<HttpResult
           done(() => reject(new Error(`Refusing non-https redirect to ${next.protocol}// from ${url}`)));
           return;
         }
-        done(() => resolve(httpGet(next.toString(), redirectsLeft - 1)));
+        done(() => resolve(httpGet(next.toString(), redirectsLeft - 1, deadlineAt)));
         return;
       }
 
@@ -145,9 +153,11 @@ function httpGet(url: string, redirectsLeft = MAX_REDIRECTS): Promise<HttpResult
       req.destroy(new Error(`No data for ${TIMEOUT_MS}ms fetching ${url}`));
     });
     // Total wall-clock deadline (idle timeout above can't bound a slow-drip response).
+    // Fires at the SHARED deadline so the whole redirect chain stays within
+    // TOTAL_TIMEOUT_MS; a chain that already burned most of the budget gets what's left.
     deadline = setTimeout(() => {
       req.destroy(new Error(`Timed out after ${TOTAL_TIMEOUT_MS}ms fetching ${url}`));
-    }, TOTAL_TIMEOUT_MS);
+    }, Math.max(0, deadlineAt - Date.now()));
     req.on("error", (e) => done(() => reject(e)));
   });
 }

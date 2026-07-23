@@ -20,12 +20,10 @@ const EXT_ID_PLACEHOLDER = "__C2S_EXTENSION_ID__";
 export function deriveChromeId(manifest: Manifest): string | undefined {
   const key = manifest.key;
   if (typeof key !== "string" || key.length === 0) return undefined;
-  let der: Buffer;
-  try {
-    der = Buffer.from(key, "base64");
-  } catch {
-    return undefined;
-  }
+  // Buffer.from(str, "base64") never throws — it decodes what it can and ignores
+  // invalid chars — so a length check (not a try/catch) is the real malformed-key
+  // guard. An empty decode means the key had no valid base64 at all.
+  const der = Buffer.from(key, "base64");
   if (der.length === 0) return undefined;
   const digest = createHash("sha256").update(der).digest();
   let id = "";

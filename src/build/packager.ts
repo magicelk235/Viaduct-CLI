@@ -938,7 +938,7 @@ export function buildXcodeProject(
   return { builtApp: built, derivedDir: derived };
 }
 
-function plistValue(plistPath: string, key: string): string | null {
+export function plistValue(plistPath: string, key: string): string | null {
   if (!existsSync(plistPath)) return null;
   const res = run("plutil", ["-extract", key, "raw", "-o", "-", plistPath]);
   return res.code === 0 ? res.stdout.trim() : null;
@@ -1038,11 +1038,14 @@ export function defaultBundleId(appName: string): string {
   // segment that starts with a digit (e.g. "123App") is rejected by parts of
   // Apple's toolchain.
   const slug = appName.replace(/[^A-Za-z0-9]/g, "").replace(/^[0-9]+/, "");
-  // When nothing alphanumeric/Latin survives (all-symbol, all-digit, emoji-only,
-  // or non-Latin names), a constant fallback would give every such extension the
-  // SAME bundle id — LaunchServices then treats them as one app and the second
-  // install shadows the first. Derive a stable per-name suffix from the original
-  // name so distinct names stay distinct.
-  const suffix = slug || "ext" + createHash("sha1").update(appName).digest("hex").slice(0, 8);
+  // Two DISTINCT names can reduce to the same non-empty slug — "Foo" and "1Foo"
+  // both slug to "Foo"; "Café" and "Cafe" both to "Caf" — so using the slug alone
+  // would hand them the same bundle id and LaunchServices would let the second
+  // install shadow the first. Only trust the slug when it is a lossless rendering
+  // of the name (already reverse-DNS-safe: letters/digits, starting with a letter);
+  // anything the slug dropped or reordered falls back to a per-name SHA-1 suffix so
+  // distinct names stay distinct.
+  const lossless = /^[A-Za-z][A-Za-z0-9]*$/.test(appName);
+  const suffix = slug && lossless ? slug : (slug || "ext") + createHash("sha1").update(appName).digest("hex").slice(0, 8);
   return `com.viaduct.${suffix}`;
 }

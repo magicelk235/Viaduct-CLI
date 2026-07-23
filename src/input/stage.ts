@@ -340,8 +340,15 @@ export function rewriteRuntimeIdUrlMatchers(stageDir: string): number {
 // immediate `[0]` (optional-chained or plain) that is followed by a method call. Only that
 // followed-by-`.`method shape can throw here; a bare `ancestorOrigins[0]` assigned to a var
 // is left alone (already undefined-tolerant).
+// The receiver of `.ancestorOrigins` is always a dotted-identifier Location chain
+// (location, window.location, self.location, document.location, top.location), so the
+// walk-back class is plain identifier chars + `.`/`?.`. It must NOT include `)` or `]`:
+// a `)`/`]` in the class lets the match START mid-expression (e.g. at the `)` of
+// `foo().ancestorOrigins…`), and the `|| ""` wrap then emits unbalanced `foo((…))` —
+// a SyntaxError that kills the whole file. (Latent: real bundles never call-through to
+// ancestorOrigins, but a token class must not be able to produce invalid output.)
 const ANCESTOR_ORIGINS_RE =
-  /((?:[\w$.\])]|\?\.)+\.ancestorOrigins(\?\.\[0\]|\[0\]))(?=\s*\.)/g;
+  /((?:[\w$.]|\?\.)+\.ancestorOrigins(\?\.\[0\]|\[0\]))(?=\s*\.)/g;
 
 export function guardAncestorOriginsAccess(stageDir: string): number {
   let modified = 0;
