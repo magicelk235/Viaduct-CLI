@@ -5713,6 +5713,7 @@ var __C2S_DEBUG__ = false;
           try { if (type === "load" && typeof xhr.onload === "function") xhr.onload.call(xhr, mkEvt("load")); } catch (e) {}
           try { if (type === "loadend" && typeof xhr.onloadend === "function") xhr.onloadend.call(xhr, mkEvt("loadend")); } catch (e) {}
           try { if (type === "error" && typeof xhr.onerror === "function") xhr.onerror.call(xhr, mkEvt("error")); } catch (e) {}
+          try { if (type === "timeout" && typeof xhr.ontimeout === "function") xhr.ontimeout.call(xhr, mkEvt("timeout")); } catch (e) {}
           // Also honor addEventListener-registered handlers.
           try { if (typeof xhr.dispatchEvent === "function") xhr.dispatchEvent(mkEvt(type)); } catch (e) {}
         }
@@ -5724,19 +5725,24 @@ var __C2S_DEBUG__ = false;
           fire("readystatechange");
           if (dispatchLoad) { fire("load"); fire("loadend"); }
         }
-        function fail(err) {
+        // A timeout and a network error are distinct XHR terminal states: a timeout
+        // fires "timeout" then "loadend" (NOT "error"), while a fetch/network failure
+        // fires "error" then "loadend". Callers that branch on timeout-vs-failure (retry
+        // logic, error classification) mis-handle a timeout reported as an error, so keep
+        // the two paths separate — pass isTimeout for the timer path.
+        function fail(err, isTimeout) {
           if (settled) return; settled = true;
-          try { dbg("[c2s] xhr proxy failed", xhr.__c2sUrl, String((err && err.message) || err)); } catch (e) {}
+          try { dbg("[c2s] xhr proxy " + (isTimeout ? "timed out" : "failed"), xhr.__c2sUrl, String((err && err.message) || err)); } catch (e) {}
           state.readyState = 4;
           fire("readystatechange");
-          fire("error");
+          fire(isTimeout ? "timeout" : "error");
           fire("loadend");
         }
 
         var timedOut = false, timer = null;
         try {
           var to = 0; try { to = Number(xhr.timeout) || 0; } catch (e) {}
-          if (to > 0) timer = setTimeout(function () { timedOut = true; try { if (typeof xhr.ontimeout === "function") xhr.ontimeout.call(xhr, mkEvt("timeout")); } catch (e) {} fail(new Error("timeout")); }, to);
+          if (to > 0) timer = setTimeout(function () { timedOut = true; fail(new Error("timeout"), true); }, to);
         } catch (e) {}
 
         try {
