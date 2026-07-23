@@ -6,7 +6,7 @@ import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
 import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
-import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteChromeSchemeLiterals } from "./input/stage.js";
+import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteChromeSchemeLiterals, guardAncestorOriginsAccess, rewriteSelfPageExtensionUrls, idempotentContentScriptGlobals } from "./input/stage.js";
 import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireCdpKeepalive, deriveProxyHosts } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
@@ -157,6 +157,21 @@ export function convert(opts: ConvertOptions): ConvertResult {
     const reschemed = rewriteChromeSchemeLiterals(stageDir);
     if (reschemed > 0) ok(`Rewrote chrome-extension: scheme literals in ${reschemed} script(s)`);
 
+    // The scheme rewrite above skips `chrome-extension://${id}/…` (could be an OAuth
+    // redirect_uri). But when that literal is the WHOLE URL of a self-page navigation
+    // (tabs.create/window.open), it must become runtime.getURL — otherwise it opens a
+    // dead chrome-extension://<bundle-id>/page.html tab in Safari (SF Inspector's
+    // keyboard-command page opens).
+    const selfPaged = rewriteSelfPageExtensionUrls(stageDir);
+    if (selfPaged > 0) ok(`Rewrote self-page chrome-extension: URLs to runtime.getURL in ${selfPaged} script(s)`);
+
+    // Safari extension pages are top-level, so location.ancestorOrigins is an empty (but
+    // present) DOMStringList: ancestorOrigins?.[0] is undefined and the trailing string
+    // method throws at module load, leaving a blank popup. Guard the [0] read so the call
+    // sees "" (Salesforce Inspector Reloaded: blank action popup).
+    const guardedAncestors = guardAncestorOriginsAccess(stageDir);
+    if (guardedAncestors > 0) ok(`Guarded location.ancestorOrigins[0] reads in ${guardedAncestors} script(s)`);
+
     // Derived once and shared by the shim allowlist (below) and the Swift native
     // allowlist (later). transformManifest deep-clones its input, so the value is
     // identical at both points — no reason to recompute.
@@ -184,6 +199,13 @@ export function convert(opts: ConvertOptions): ConvertResult {
       minSafariVersion: opts.minSafariVersion,
       cdpShim: needsCdpShim,
     });
+
+    // Safari re-evaluates a document_end/idle content-script group a second time into the
+    // same isolated world (about:blank/srcdoc subframes on all_frames pages), which throws
+    // on any top-level const/let and kills the group. Demote those to var so the second
+    // eval is a no-op (TWP: twpI18n / startMark duplicate-variable crash).
+    const idempotent = idempotentContentScriptGlobals(stageDir, transformed);
+    if (idempotent > 0) ok(`Made top-level content-script globals re-injection-safe in ${idempotent} script(s)`);
 
     const dnrNotes = applyDnr(stageDir, transformed);
     for (const n of dnrNotes) warn(n);

@@ -321,3 +321,147 @@ export function rewriteRuntimeIdUrlMatchers(stageDir: string): number {
   }
   return modified;
 }
+
+// Chrome extension pages sit in a nested browsing context, so bundles read
+// `location.ancestorOrigins[0]` to learn who framed them (e.g. "am I the top-level
+// extension page?"). In Safari the extension popup/options page is TOP-LEVEL, so
+// ancestorOrigins is an EMPTY DOMStringList — present (the `?.` guard passes) but
+// [0] is undefined, and the trailing `.includes(...)` throws at module top level.
+// A module that throws before it renders leaves a blank white popup (Salesforce
+// Inspector Reloaded: popup.js line 1 → empty popover).
+//
+// Guard the index read so the method call sees an empty string instead of undefined:
+//   location.ancestorOrigins?.[0].includes(x)  ->  (location.ancestorOrigins?.[0] || "").includes(x)
+//   location.ancestorOrigins[0].includes(x)    ->  (location.ancestorOrigins[0] || "").includes(x)
+// "" is falsy and safely answers every string method (.includes/.indexOf/.startsWith
+// → false/-1), matching what the check wants when there's no ancestor: "not framed".
+//
+// Literal substitution, not a JS parser. Matches the `.ancestorOrigins` access with an
+// immediate `[0]` (optional-chained or plain) that is followed by a method call. Only that
+// followed-by-`.`method shape can throw here; a bare `ancestorOrigins[0]` assigned to a var
+// is left alone (already undefined-tolerant).
+const ANCESTOR_ORIGINS_RE =
+  /((?:[\w$.\])]|\?\.)+\.ancestorOrigins(\?\.\[0\]|\[0\]))(?=\s*\.)/g;
+
+export function guardAncestorOriginsAccess(stageDir: string): number {
+  let modified = 0;
+  for (const file of walkScripts(stageDir)) {
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    let changed = false;
+    const next = content.replace(ANCESTOR_ORIGINS_RE, (whole) => {
+      changed = true;
+      return "(" + whole + ' || "")';
+    });
+    if (changed) {
+      writeFileSync(file, next, "utf-8");
+      modified++;
+    }
+  }
+  return modified;
+}
+
+// Safari re-evaluates a content-script group a SECOND time into a world that already
+// ran it. It happens for the document_end / document_idle groups on all_frames pages:
+// an about:blank / about:srcdoc subframe (and some same-origin navigations) shares the
+// parent frame's isolated world, and Safari fires the injection for it again — so every
+// file in the group is evaluated twice in one world. Chrome gives each such frame its own
+// world and never does this.
+//
+// The second evaluation is fatal only where a file has a top-level `const`/`let`/`class`:
+// re-declaring a lexical binding throws "Can't create duplicate variable" and aborts the
+// rest of the group, so the extension's content side dies (TWP: `const twpI18n` in i18n.js
+// then `const startMark` in pageTranslator.js — the exact two errors reported). Viaduct's
+// own shim/polyfill survive the same double-eval purely because they declare with `var`,
+// whose re-declaration is a silent no-op.
+//
+// Do the same for the extension: demote each COLUMN-0 (top-level) `const`/`let` to `var`.
+// These are module-scoped singletons assigned once; `var` keeps them global — which they
+// MUST stay, since TWP's files share `twpI18n` / `startMark` across the group — and makes
+// the redeclaration harmless. Nothing changes on the normal single-eval path. Scoped to
+// files referenced by an isolated-world content_scripts entry (the only realm that
+// double-injects); background/popup/library files and world:"MAIN" scripts are untouched.
+//
+// Literal, line-anchored substitution, not a JS parser: only column-0 declarations match,
+// so block-scoped `const`/`let` inside functions/loops are left alone, and minified
+// bundles (everything on one line, already IIFE-wrapped) are naturally skipped. Top-level
+// `class` is left as-is — no real content-script bundle declares one bare at top level; if
+// one ever does, `var C = class {…}` needs AST work, add then.
+const TOPLEVEL_LEXICAL_RE = /^(const|let)([ \t]+[$A-Za-z_])/gm;
+
+export function idempotentContentScriptGlobals(
+  stageDir: string,
+  manifest: { content_scripts?: Array<{ js?: unknown; world?: string }> }
+): number {
+  const files = new Set<string>();
+  for (const cs of manifest.content_scripts ?? []) {
+    if (cs.world === "MAIN") continue; // page world; not re-injected into a shared isolated world
+    if (!Array.isArray(cs.js)) continue;
+    for (const j of cs.js) {
+      // Normalize like collectReferencedPaths so we hit the same on-disk file the
+      // stager wrote: "/lib/x.js", "./lib/x.js", and backslash paths all resolve.
+      if (typeof j === "string" && j) files.add(j.replace(/^\.?\//, "").replace(/\\/g, "/"));
+    }
+  }
+  let modified = 0;
+  for (const rel of files) {
+    const file = join(stageDir, rel);
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    if (!TOPLEVEL_LEXICAL_RE.test(content)) continue;
+    TOPLEVEL_LEXICAL_RE.lastIndex = 0;
+    writeFileSync(file, content.replace(TOPLEVEL_LEXICAL_RE, "var$2"), "utf-8");
+    modified++;
+  }
+  return modified;
+}
+
+// A template literal whose ENTIRE value is `chrome-extension://${<ext-id>}/<path>` is a
+// self-page navigation (fed to tabs.create / window.open / location=), NOT an OAuth
+// redirect_uri. rewriteChromeSchemeLiterals deliberately skips `chrome-extension://${…}`
+// to preserve redirect_uris registered with the provider — but that also skips these real
+// navigations, which then point at a scheme+host that don't exist in Safari (the scheme is
+// safari-web-extension:// and the host is a per-install UUID, not @@extension_id). Result:
+// Salesforce Inspector's keyboard-command page opens (data-export, options, …) land on a
+// dead chrome-extension://<bundle-id>/foo.html tab.
+//
+// Rewrite them to chrome.runtime.getURL(`<path>`), which resolves to the correct Safari
+// scheme + UUID host at runtime. Safe because we ONLY match when the backtick immediately
+// precedes `chrome-extension://` (the literal IS the whole URL) and the host is an
+// extension-id expression — so an embedded redirect_uri like `…redirect_uri=${browser}-
+// extension://…` inside a larger authorize URL never matches (its scheme is interpolated,
+// and it isn't at the start of the literal).
+//
+// Host expr covered: chrome.i18n.getMessage("@@extension_id"), (chrome|browser).runtime.id.
+const SELF_PAGE_URL_RE =
+  /`chrome-extension:\/\/\$\{\s*(?:(?:chrome|browser)\s*\.\s*i18n\s*\.\s*getMessage\s*\(\s*(["'])@@extension_id\1\s*\)|(?:chrome|browser)\s*\.\s*runtime\s*\.\s*id)\s*\}\/([^`]*)`/g;
+
+export function rewriteSelfPageExtensionUrls(stageDir: string): number {
+  let modified = 0;
+  for (const file of walkScripts(stageDir)) {
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    let changed = false;
+    const next = content.replace(SELF_PAGE_URL_RE, (_whole, _q, path: string) => {
+      changed = true;
+      return "chrome.runtime.getURL(`" + path + "`)";
+    });
+    if (changed) {
+      writeFileSync(file, next, "utf-8");
+      modified++;
+    }
+  }
+  return modified;
+}

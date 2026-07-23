@@ -3276,7 +3276,9 @@ var __C2S_DEBUG__ = false;
       if (__menuNs && typeof __menuNs.create === "function" && !__menuNs.__c2sCreate) {
         var __menuCreate = __menuNs.create.bind(__menuNs);
         var __okPattern = function (p) {
-          return typeof p === "string" && (p === "<all_urls>" || /^(\*|https?|file|ftp):\/\//i.test(p));
+          // Safari's menus.create ALSO rejects ftp:// patterns ("'ftp://*/*' is not a
+          // valid pattern" — TWP registers them), so ftp is NOT in the allowed set.
+          return typeof p === "string" && (p === "<all_urls>" || /^(\*|https?|file):\/\//i.test(p));
         };
         var __sanitizePatterns = function (arr) {
           if (!Array.isArray(arr)) return arr;
@@ -5139,6 +5141,19 @@ var __C2S_DEBUG__ = false;
       if (!probe || !probe.runtime || typeof probe.runtime.sendMessage !== "function") return;
       if (!probe.storage || !probe.storage.local || !probe.storage.onChanged) return;
       var store = probe.storage; // storage.local is shared across every context
+      // Only relay through storage on EXTENSION PAGES (popover/panel/options/bg),
+      // where Safari drops native runtime.sendMessage between the page and a
+      // non-persistent bg. Content scripts run on http(s) and Safari DOES deliver
+      // their sendMessage natively — with a real sender.tab. Routing them through
+      // the relay would replace that with selfSender() (no .tab), and any bg handler
+      // reading sender.tab.cookieStoreId (e.g. Salesforce Inspector's getSfHost)
+      // then throws, the throw is swallowed, and sendResponse never fires. So leave
+      // content scripts on the native transport; only override on extension pages.
+      var __relayExtPage = false;
+      try {
+        var __relayProto = (typeof location !== "undefined" && location.protocol) || "";
+        __relayExtPage = /^(safari-web-extension|chrome-extension|moz-extension):$/.test(__relayProto);
+      } catch (e) { __relayExtPage = false; }
       var SELF = uid("ctx-");
       var REQ = "__c2sMbxReq:", RSP = "__c2sMbxRsp:", BELL = "__c2sMbxBell";
       var listeners = [];
@@ -5298,8 +5313,10 @@ var __C2S_DEBUG__ = false;
         var facade = makeFacade(base);
         var rtP = new Proxy(base.runtime, {
           get: function (t, p) {
-            if (p === "sendMessage") return bridgeSend;
-            if (p === "onMessage") return facade;
+            // Storage relay only on extension pages; content scripts fall through to
+            // Safari's native sendMessage/onMessage (which carry a real sender.tab).
+            if (p === "sendMessage" && __relayExtPage) return bridgeSend;
+            if (p === "onMessage" && __relayExtPage) return facade;
             // Chrome extensions expect runtime.id === the Chrome extension id (32
             // a–p chars). Safari's slot is the app-extension bundle id, which breaks
             // code that sends runtime.id to a native host for install matching (e.g.
@@ -5617,13 +5634,160 @@ var __C2S_DEBUG__ = false;
     if (typeof XMLHttpRequest !== "undefined" && !XMLHttpRequest.prototype.__c2sPatched) {
       var _open = XMLHttpRequest.prototype.open;
       var _send = XMLHttpRequest.prototype.send;
+      var _setRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+      var _getResponseHeader = XMLHttpRequest.prototype.getResponseHeader;
+      var _getAllResponseHeaders = XMLHttpRequest.prototype.getAllResponseHeaders;
+      // XHR is stateful: open() names the target, setRequestHeader() accumulates
+      // headers, send() carries the body. Capture all three so a proxy host can be
+      // replayed out-of-process exactly like the fetch wrapper above — same reason
+      // (Safari sends the safari-web-extension:// Origin a backend may reject, and
+      // strips the site's cookies as third-party). Extensions that speak only XHR
+      // (e.g. Salesforce Inspector's sfConn.rest/soap) get the identical rescue.
       XMLHttpRequest.prototype.open = function (m, u) {
-        try { this.__c2sAnthropic = ANTH.test(String(u)); } catch (e) {}
+        try {
+          this.__c2sAnthropic = ANTH.test(String(u));
+          this.__c2sMethod = String(m || "GET");
+          this.__c2sUrl = String(u);
+          // Only fully-async proxy targets can be rescued: proxyFetch is Promise-based
+          // and can't drive a synchronous xhr.send(). arguments[2] === false → sync.
+          this.__c2sProxyTarget = (arguments.length < 3 || arguments[2] !== false) && shouldProxy(String(u));
+          this.__c2sHeaders = {};
+        } catch (e) {}
         return _open.apply(this, arguments);
       };
-      XMLHttpRequest.prototype.send = function () {
+      XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+        try { if (this.__c2sProxyTarget) this.__c2sHeaders[name] = value; } catch (e) {}
+        return _setRequestHeader.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype.send = function (body) {
         try { if (this.__c2sAnthropic) this.setRequestHeader(HDR, "true"); } catch (e) {}
-        return _send.apply(this, arguments);
+        var xhr = this;
+        var proxyTarget = false;
+        try { proxyTarget = !!xhr.__c2sProxyTarget && !!g && typeof g.fetch === "function"; } catch (e) {}
+        if (!proxyTarget) return _send.apply(this, arguments);
+
+        // Route the whole request through the (already-patched) global fetch: it
+        // owns the "try direct, retry via native host on CORS-block/401/403" logic,
+        // so we don't reimplement that state machine here — we only marshal its
+        // Response back into XHR's property/event model. On any unexpected failure
+        // fall through to a native send so a proxy hiccup never breaks a request
+        // that could have worked directly.
+        var settled = false;
+        var init = { method: xhr.__c2sMethod || "GET", headers: xhr.__c2sHeaders || {}, credentials: "include" };
+        if (body != null) { try { init.body = body; } catch (e) {} }
+        var rtype = "";
+        try { rtype = String(xhr.responseType || ""); } catch (e) {}
+
+        // Define instance getters that shadow the read-only prototype accessors,
+        // so the caller observes the proxied result. Populated once the Response
+        // is decoded; before that they mirror the pre-send state.
+        var state = { readyState: 1, status: 0, statusText: "", responseText: "", response: rtype === "json" ? null : (rtype === "text" || rtype === "" ? "" : null), headers: {} };
+        function def(name, get) { try { Object.defineProperty(xhr, name, { configurable: true, get: get }); } catch (e) {} }
+        def("readyState", function () { return state.readyState; });
+        def("status", function () { return state.status; });
+        def("statusText", function () { return state.statusText; });
+        def("responseText", function () {
+          // responseText is only valid for "" / "text"; the platform throws otherwise.
+          if (rtype !== "" && rtype !== "text") { throw new Error("responseText is only available when responseType is '' or 'text'"); }
+          return state.responseText;
+        });
+        def("response", function () { return state.response; });
+        def("responseURL", function () { return xhr.__c2sUrl || ""; });
+        try {
+          xhr.getResponseHeader = function (name) {
+            if (state.readyState < 2) return _getResponseHeader ? _getResponseHeader.apply(xhr, arguments) : null;
+            var want = String(name).toLowerCase(), src = state.headers || {};
+            for (var k in src) { if (Object.prototype.hasOwnProperty.call(src, k) && k.toLowerCase() === want) return src[k]; }
+            return null;
+          };
+          xhr.getAllResponseHeaders = function () {
+            if (state.readyState < 2) return _getAllResponseHeaders ? _getAllResponseHeaders.apply(xhr, arguments) : "";
+            var out = "", src = state.headers || {};
+            for (var k in src) { if (Object.prototype.hasOwnProperty.call(src, k)) out += k.toLowerCase() + ": " + src[k] + "\r\n"; }
+            return out;
+          };
+        } catch (e) {}
+
+        function fire(type) {
+          try { if (type === "readystatechange" && typeof xhr.onreadystatechange === "function") xhr.onreadystatechange.call(xhr, mkEvt("readystatechange")); } catch (e) {}
+          try { if (type === "load" && typeof xhr.onload === "function") xhr.onload.call(xhr, mkEvt("load")); } catch (e) {}
+          try { if (type === "loadend" && typeof xhr.onloadend === "function") xhr.onloadend.call(xhr, mkEvt("loadend")); } catch (e) {}
+          try { if (type === "error" && typeof xhr.onerror === "function") xhr.onerror.call(xhr, mkEvt("error")); } catch (e) {}
+          // Also honor addEventListener-registered handlers.
+          try { if (typeof xhr.dispatchEvent === "function") xhr.dispatchEvent(mkEvt(type)); } catch (e) {}
+        }
+        function mkEvt(type) {
+          try { return new Event(type); } catch (e) { return { type: type, target: xhr, currentTarget: xhr }; }
+        }
+        function advance(rs, dispatchLoad) {
+          state.readyState = rs;
+          fire("readystatechange");
+          if (dispatchLoad) { fire("load"); fire("loadend"); }
+        }
+        function fail(err) {
+          if (settled) return; settled = true;
+          try { dbg("[c2s] xhr proxy failed", xhr.__c2sUrl, String((err && err.message) || err)); } catch (e) {}
+          state.readyState = 4;
+          fire("readystatechange");
+          fire("error");
+          fire("loadend");
+        }
+
+        var timedOut = false, timer = null;
+        try {
+          var to = 0; try { to = Number(xhr.timeout) || 0; } catch (e) {}
+          if (to > 0) timer = setTimeout(function () { timedOut = true; try { if (typeof xhr.ontimeout === "function") xhr.ontimeout.call(xhr, mkEvt("timeout")); } catch (e) {} fail(new Error("timeout")); }, to);
+        } catch (e) {}
+
+        try {
+          g.fetch(xhr.__c2sUrl, init).then(function (resp) {
+            if (settled || timedOut) return;
+            state.status = resp.status;
+            state.statusText = resp.statusText || "";
+            try { resp.headers.forEach(function (v, k) { state.headers[k] = v; }); } catch (e) {}
+            // Decode the body per responseType, mirroring what the platform would
+            // expose. "document" needs DOMParser (present in page/popup contexts,
+            // absent in a SW — guarded); everything else derives from text/bytes.
+            var decode;
+            if (rtype === "arraybuffer") decode = resp.arrayBuffer().then(function (b) { state.response = b; });
+            else if (rtype === "blob") decode = resp.blob().then(function (b) { state.response = b; });
+            else decode = resp.text().then(function (t) {
+              state.responseText = t;
+              if (rtype === "json") { try { state.response = t === "" ? null : JSON.parse(t); } catch (e) { state.response = null; } }
+              else if (rtype === "document") {
+                state.response = null;
+                try {
+                  if (typeof DOMParser !== "undefined") {
+                    var ct = state.headers["content-type"] || state.headers["Content-Type"] || "";
+                    var mime = /xml/i.test(ct) ? "application/xml" : (/html/i.test(ct) ? "text/html" : "application/xml");
+                    state.response = new DOMParser().parseFromString(t, mime);
+                  }
+                } catch (e) { state.response = null; }
+              }
+              else state.response = t; // "" or "text"
+            });
+            decode.then(function () {
+              if (settled || timedOut) return; settled = true;
+              if (timer) { try { clearTimeout(timer); } catch (e) {} }
+              // Walk readyState the way callers expect: HEADERS_RECEIVED(2),
+              // LOADING(3), then DONE(4)+load. SF Inspector only checks ===4.
+              advance(2, false);
+              advance(3, false);
+              advance(4, true);
+            }, function (err) { if (timer) { try { clearTimeout(timer); } catch (e) {} } fail(err); });
+          }, function (err) {
+            // Both the direct attempt AND the native-host retry failed. Surface a
+            // real XHR error (status 0) — the same failure the caller would have
+            // seen unproxied, not a hang.
+            if (timer) { try { clearTimeout(timer); } catch (e) {} }
+            fail(err);
+          });
+        } catch (e) {
+          // Synchronous throw building/dispatching the fetch: don't hang, don't
+          // swallow — fall back to a native send (best effort for a direct hit).
+          if (timer) { try { clearTimeout(timer); } catch (e2) {} }
+          try { return _send.apply(xhr, arguments); } catch (e2) { fail(e); }
+        }
       };
       XMLHttpRequest.prototype.__c2sPatched = true;
     }

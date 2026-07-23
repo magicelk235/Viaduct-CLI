@@ -224,6 +224,20 @@ const COMMAND_MODIFIERS = new Set(["Ctrl", "Command", "Alt", "Option", "MacCtrl"
 // chromeos/windows/linux are dead keys on Safari — warning about them is noise.
 const SAFARI_COMMAND_PLATFORMS = new Set(["default", "mac", "ios"]);
 
+// True when a command definition has a suggested_key chord Safari would honor — a
+// plain string (all platforms) or a per-platform map with a default/mac/ios entry.
+// These are the ones that count toward Safari's 4-shortcut limit.
+function hasSafariSuggestedKey(def: unknown): boolean {
+  const suggested = (def as { suggested_key?: unknown } | undefined)?.suggested_key;
+  if (typeof suggested === "string") return suggested.trim() !== "";
+  if (suggested && typeof suggested === "object") {
+    return Object.entries(suggested as Record<string, unknown>).some(
+      ([platform, v]) => SAFARI_COMMAND_PLATFORMS.has(platform) && typeof v === "string" && v.trim() !== ""
+    );
+  }
+  return false;
+}
+
 export function analyzeCommands(commands: Record<string, unknown>): Issue[] {
   const issues: Issue[] = [];
   for (const [name, def] of Object.entries(commands)) {
@@ -262,6 +276,22 @@ export function analyzeCommands(commands: Record<string, unknown>): Issue[] {
         });
       }
     }
+  }
+
+  // Safari allows at most 4 commands with a suggested_key; a 5th makes it reject the
+  // whole manifest at load. transformManifest strips the default chord from the extras,
+  // so flag which lost it (they're still bindable manually in Safari's settings).
+  const withKeys = Object.keys(commands).filter((name) => hasSafariSuggestedKey(commands[name]));
+  if (withKeys.length > 4) {
+    const dropped = withKeys.slice(4);
+    issues.push({
+      severity: "warning",
+      category: "ui",
+      message: `${withKeys.length} commands declare a keyboard shortcut, but Safari allows only 4; dropping the default chord from: ${dropped.join(", ")}.`,
+      file: "manifest.json",
+      fix: "Safari rejects the manifest with a 5th shortcut. The extra commands keep working and can be bound by the user in Safari → Settings → Extensions.",
+      autoFixed: true,
+    });
   }
   return issues;
 }
@@ -457,15 +487,6 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
       });
     }
   }
-  if (m.version_name) {
-    issues.push({
-      severity: "info",
-      category: "manifest",
-      message: "version_name has no Safari/App Store meaning; removing.",
-      file: "manifest.json",
-      autoFixed: true,
-    });
-  }
 
   // Only the extension_pages policy governs the extension's own pages/SW; the
   // sandbox policy intentionally relaxes rules for sandboxed iframes, so scanning
@@ -555,9 +576,9 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
     issues.push({
       severity: "info",
       category: "ui",
-      message: "Action has no default_popup; the toolbar button would be inert in Safari.",
+      message: "Action has no default_popup; a toolbar button with no behavior is inert in Safari.",
       file: "manifest.json",
-      fix: "Auto-wiring a detected popup/sidepanel HTML as default_popup.",
+      fix: "Wiring a detected popup/sidepanel page, or (if the background handles action.onClicked) an onClicked bridge, so the button works.",
       autoFixed: true,
     });
   }
@@ -793,6 +814,26 @@ export function addSelfToConnectSrc<T extends string | Record<string, string> | 
   return out as T;
 }
 
+// True when a background script registers action.onClicked — i.e. the toolbar button's
+// behavior lives in code, not in a popup page. Same heuristic (and same signal) as the
+// shim's own detector in runtime/shim.ts; kept as a local copy here because shim.ts
+// already imports from this module, and reversing that edge to share one function would
+// create an import cycle. Both read the staged background source; neither owns the other.
+function backgroundRegistersActionOnClicked(manifest: Manifest, extPath: string): boolean {
+  const files: string[] = [];
+  const sw = manifest.background?.service_worker;
+  if (typeof sw === "string") files.push(sw);
+  for (const s of manifest.background?.scripts ?? []) if (typeof s === "string") files.push(s);
+  for (const rel of files) {
+    const p = join(extPath, rel.replace(/^\.?\//, ""));
+    if (!existsSync(p)) continue;
+    let src: string;
+    try { src = readFileSync(p, "utf-8"); } catch { continue; }
+    if (/onClicked/.test(src) && /\b(?:action|browserAction)\b/.test(src)) return true;
+  }
+  return false;
+}
+
 /** Produce the Safari-ready manifest. Pure: does not write to disk. */
 export function transformManifest(
   m: Manifest,
@@ -805,7 +846,10 @@ export function transformManifest(
   delete out.update_url;
   delete out.key;
   delete out.minimum_chrome_version;
-  delete out.version_name;
+  // Keep version_name: the App Store ignores it, but it's a real runtime field —
+  // extensions read chrome.runtime.getManifest().version_name for display (Salesforce
+  // Inspector renders it in its footer and crashes on undefined.replace if it's gone).
+  // Harmless to leave in the Safari bundle; removing it breaks that read.
 
   if (out.version) {
     // Safari/Xcode require dot-separated integers (max 3 components, each ≤ 65535).
@@ -872,6 +916,22 @@ export function transformManifest(
   }
   if (mv === 3 && out.background?.type === "module" && !opts.keepModuleBackground) {
     delete out.background.type;
+  }
+
+  // Safari rejects the whole manifest ("Too many shortcuts specified for commands,
+  // only 4 shortcuts are allowed") when more than 4 commands carry a suggested_key
+  // Safari can read. Chrome has no such cap, so bundles like TWP declare 8+. Keep the
+  // first 4 (declaration order) and strip suggested_key from the rest — those commands
+  // still exist and stay bindable in Safari → Settings → Extensions, they just lose
+  // their default chord. Only Safari-platform chords count toward the limit; a command
+  // whose suggested_key is windows/linux-only is already a dead key here.
+  if (out.commands && typeof out.commands === "object") {
+    let kept = 0;
+    for (const def of Object.values(out.commands as Record<string, unknown>)) {
+      if (!hasSafariSuggestedKey(def)) continue;
+      kept++;
+      if (kept > 4) delete (def as { suggested_key?: unknown }).suggested_key;
+    }
   }
 
   // page_action has no Safari equivalent; fold it into the toolbar-button key that
@@ -988,7 +1048,14 @@ export function transformManifest(
     const panelPath = (out.side_panel?.default_path ?? "").split(/[#?]/)[0].replace(/^\/+/, "");
     if (panelPath && existsSync(join(extPath, panelPath))) {
       action.default_popup = panelPath;
-    } else {
+    } else if (!backgroundRegistersActionOnClicked(out, extPath)) {
+      // Only guess a popup page when the toolbar button has no other behavior. If the
+      // background registers action.onClicked, the button is code-driven (it toggles
+      // in-page UI, opens a tab, etc.), and the extension's own popup.html is usually a
+      // content-script-injected iframe (a web_accessible_resource), NOT a toolbar popup —
+      // wiring it here hijacks the click into an orphan popover that never initializes
+      // (Salesforce Inspector Reloaded: empty gray box). Leave default_popup unset so
+      // wireActionClickBridge replays the real onClicked instead.
       for (const candidate of ["popup.html", "sidepanel.html", "panel.html", "index.html"]) {
         if (existsSync(join(extPath, candidate))) {
           action.default_popup = candidate;
@@ -1012,6 +1079,20 @@ export function transformManifest(
       if (opts.shimFile && !cs.js.includes(opts.shimFile)) cs.js.unshift(opts.shimFile);
       if (opts.polyfillFile && !cs.js.includes(opts.polyfillFile)) cs.js.unshift(opts.polyfillFile);
     }
+  }
+
+  // Same for the MV2 background page: Safari builds it from background.scripts in
+  // array order, so the extension's own scripts run FIRST on raw Safari APIs. Reading
+  // any Chrome-only surface at load (e.g. chrome.runtime.onUpdateAvailable.addListener)
+  // then throws and aborts the whole background before its listeners register — the
+  // extension is dead (TWP: onUpdateAvailable crash → no translation). Prepend the shim
+  // + polyfill so they run before background.js, exactly as content scripts get them.
+  // (MV3 service workers are handled separately by convertServiceWorkerToBackgroundPage,
+  // which builds background.html with the shim as the first script tag.)
+  if ((opts.shimFile || opts.polyfillFile) && mv === 2 && Array.isArray(out.background?.scripts)) {
+    const scripts = out.background!.scripts as string[];
+    if (opts.shimFile && !scripts.includes(opts.shimFile)) scripts.unshift(opts.shimFile);
+    if (opts.polyfillFile && !scripts.includes(opts.polyfillFile)) scripts.unshift(opts.polyfillFile);
   }
 
   return out;
