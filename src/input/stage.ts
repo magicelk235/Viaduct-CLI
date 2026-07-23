@@ -365,6 +365,63 @@ export function guardAncestorOriginsAccess(stageDir: string): number {
   return modified;
 }
 
+// Safari re-evaluates a content-script group a SECOND time into a world that already
+// ran it. It happens for the document_end / document_idle groups on all_frames pages:
+// an about:blank / about:srcdoc subframe (and some same-origin navigations) shares the
+// parent frame's isolated world, and Safari fires the injection for it again — so every
+// file in the group is evaluated twice in one world. Chrome gives each such frame its own
+// world and never does this.
+//
+// The second evaluation is fatal only where a file has a top-level `const`/`let`/`class`:
+// re-declaring a lexical binding throws "Can't create duplicate variable" and aborts the
+// rest of the group, so the extension's content side dies (TWP: `const twpI18n` in i18n.js
+// then `const startMark` in pageTranslator.js — the exact two errors reported). Viaduct's
+// own shim/polyfill survive the same double-eval purely because they declare with `var`,
+// whose re-declaration is a silent no-op.
+//
+// Do the same for the extension: demote each COLUMN-0 (top-level) `const`/`let` to `var`.
+// These are module-scoped singletons assigned once; `var` keeps them global — which they
+// MUST stay, since TWP's files share `twpI18n` / `startMark` across the group — and makes
+// the redeclaration harmless. Nothing changes on the normal single-eval path. Scoped to
+// files referenced by an isolated-world content_scripts entry (the only realm that
+// double-injects); background/popup/library files and world:"MAIN" scripts are untouched.
+//
+// Literal, line-anchored substitution, not a JS parser: only column-0 declarations match,
+// so block-scoped `const`/`let` inside functions/loops are left alone, and minified
+// bundles (everything on one line, already IIFE-wrapped) are naturally skipped. Top-level
+// `class` is left as-is — no real content-script bundle declares one bare at top level; if
+// one ever does, `var C = class {…}` needs AST work, add then.
+const TOPLEVEL_LEXICAL_RE = /^(const|let)([ \t]+[$A-Za-z_])/gm;
+
+export function idempotentContentScriptGlobals(
+  stageDir: string,
+  manifest: { content_scripts?: Array<{ js?: unknown; world?: string }> }
+): number {
+  const files = new Set<string>();
+  for (const cs of manifest.content_scripts ?? []) {
+    if (cs.world === "MAIN") continue; // page world; not re-injected into a shared isolated world
+    if (!Array.isArray(cs.js)) continue;
+    for (const j of cs.js) {
+      if (typeof j === "string") files.add(j.replace(/^\//, "")); // manifest paths may be "/lib/x.js"
+    }
+  }
+  let modified = 0;
+  for (const rel of files) {
+    const file = join(stageDir, rel);
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    if (!TOPLEVEL_LEXICAL_RE.test(content)) continue;
+    TOPLEVEL_LEXICAL_RE.lastIndex = 0;
+    writeFileSync(file, content.replace(TOPLEVEL_LEXICAL_RE, "var$2"), "utf-8");
+    modified++;
+  }
+  return modified;
+}
+
 // A template literal whose ENTIRE value is `chrome-extension://${<ext-id>}/<path>` is a
 // self-page navigation (fed to tabs.create / window.open / location=), NOT an OAuth
 // redirect_uri. rewriteChromeSchemeLiterals deliberately skips `chrome-extension://${…}`
