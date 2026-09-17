@@ -1508,6 +1508,75 @@ var __C2S_DEBUG__ = false;
     var c2sGroups = Object.create(null); // groupId -> { id,title,color,collapsed,windowId }
     var c2sTabGroup = Object.create(null); // tabId -> groupId
     var c2sNextGid = 1;
+    // One registry for the whole extension. Chrome keeps tab groups in the browser;
+    // this emulation kept them per shim instance, so a group made in the side
+    // panel (Claude in Chrome's tool engine runs there) was unknown to the
+    // background and the new tab it created was "not in the same group as the
+    // current" one. Mirrored through storage.local: every mutation writes, every
+    // context reloads on change, and reads wait for the first load. Stale tab ids
+    // from an earlier browser session are pruned against the live tab list.
+    var GROUPS_KEY = "__c2sTabGroups";
+    var c2sGroupsWrite = function () {
+      try {
+        if (!(chrome.storage && chrome.storage.local)) return;
+        var o = {}; o[GROUPS_KEY] = { groups: c2sGroups, map: c2sTabGroup, next: c2sNextGid };
+        var p = chrome.storage.local.set(o, function () { try { void chrome.runtime.lastError; } catch (e) {} });
+        if (p && typeof p.catch === "function") p.catch(function () {});
+      } catch (e) {}
+    };
+    var c2sGroupsLoad = function (v) {
+      for (var k in c2sGroups) delete c2sGroups[k];
+      for (var t in c2sTabGroup) delete c2sTabGroup[t];
+      if (!v || typeof v !== "object") return;
+      for (var g in (v.groups || {})) c2sGroups[g] = v.groups[g];
+      for (var m in (v.map || {})) c2sTabGroup[m] = v.map[m];
+      if (typeof v.next === "number" && v.next > c2sNextGid) c2sNextGid = v.next;
+    };
+    var c2sGroupsReady = Promise.resolve();
+    // The prune must call the NATIVE query: the stamping wrapper installed below
+    // waits on c2sGroupsReady, which the prune is what resolves.
+    var c2sNativeTabsQuery = null;
+    try { if (chrome.tabs && typeof chrome.tabs.query === "function") c2sNativeTabsQuery = chrome.tabs.query.bind(chrome.tabs); } catch (e) {}
+    try {
+      if (chrome.storage && chrome.storage.local) {
+        c2sGroupsReady = new Promise(function (resolve) {
+          var done = function (res) {
+            c2sGroupsLoad(res && res[GROUPS_KEY]);
+            // Prune mappings for tabs that no longer exist (a fresh browser session).
+            // The native query answers a callback in some contexts and only a promise
+            // in others; take whichever comes first, and never let a read hang on it.
+            var settled = false;
+            var finish = function (tabs) {
+              if (settled) return;
+              settled = true;
+              if (Array.isArray(tabs)) {
+                var live = Object.create(null); tabs.forEach(function (t) { live[t.id] = true; });
+                var changed = false;
+                for (var t in c2sTabGroup) if (!live[t]) { delete c2sTabGroup[t]; changed = true; }
+                for (var g in c2sGroups) { var any = false; for (var t2 in c2sTabGroup) if (c2sTabGroup[t2] === +g) { any = true; break; } if (!any) { delete c2sGroups[g]; changed = true; } }
+                if (changed) c2sGroupsWrite();
+              }
+              resolve();
+            };
+            setTimeout(function () { finish(null); }, 2000);
+            try {
+              if (!c2sNativeTabsQuery) { finish(null); return; }
+              var qp = c2sNativeTabsQuery({}, function (tabs) { try { void chrome.runtime.lastError; } catch (e) {} finish(tabs); });
+              if (qp && typeof qp.then === "function") qp.then(finish, function () { finish(null); });
+            } catch (e) { finish(null); }
+          };
+          try {
+            var p = chrome.storage.local.get(GROUPS_KEY, function (res) { try { void chrome.runtime.lastError; } catch (e) {} done(res); });
+            if (p && typeof p.then === "function") p.then(done, function () { done(null); });
+          } catch (e) { done(null); }
+        });
+        if (chrome.storage.onChanged && chrome.storage.onChanged.addListener) {
+          chrome.storage.onChanged.addListener(function (changes, area) {
+            if (area === "local" && changes && changes[GROUPS_KEY]) c2sGroupsLoad(changes[GROUPS_KEY].newValue);
+          });
+        }
+      }
+    } catch (e) {}
 
     // A real dispatchable event (the shared event() helper is inert).
     var liveEvent = function () {
@@ -1532,27 +1601,37 @@ var __C2S_DEBUG__ = false;
         Color: { GREY: "grey", BLUE: "blue", RED: "red", YELLOW: "yellow", GREEN: "green", PINK: "pink", PURPLE: "purple", CYAN: "cyan", ORANGE: "orange" },
         query: function (qi) {
           qi = qi || {};
-          var out = [];
-          for (var id in c2sGroups) {
-            var g = c2sGroups[id];
-            if (qi.title != null && g.title !== qi.title) continue;
-            if (qi.color != null && g.color !== qi.color) continue;
-            if (qi.collapsed != null && !!g.collapsed !== !!qi.collapsed) continue;
-            if (qi.windowId != null && qi.windowId >= 0 && g.windowId !== qi.windowId) continue;
-            out.push(Object.assign({}, g));
-          }
-          return Promise.resolve(out);
+          return c2sGroupsReady.then(function () {
+            var out = [];
+            for (var id in c2sGroups) {
+              var g = c2sGroups[id];
+              if (qi.title != null && g.title !== qi.title) continue;
+              if (qi.color != null && g.color !== qi.color) continue;
+              if (qi.collapsed != null && !!g.collapsed !== !!qi.collapsed) continue;
+              if (qi.windowId != null && qi.windowId >= 0 && g.windowId !== qi.windowId) continue;
+              out.push(Object.assign({}, g));
+            }
+            return out;
+          });
         },
         get: function (gid) {
-          var g = c2sGroups[gid];
-          return g ? Promise.resolve(Object.assign({}, g)) : Promise.reject(new Error("No group with id: " + gid));
+          return c2sGroupsReady.then(function () {
+            var g = c2sGroups[gid];
+            dbg("[c2s] tabGroups.get", gid, "->", g ? "found" : "missing");
+            if (!g) throw new Error("No group with id: " + gid);
+            return Object.assign({}, g);
+          });
         },
         update: function (gid, props) {
-          var g = c2sGroups[gid];
-          if (!g) return Promise.reject(new Error("No group with id: " + gid));
-          if (props) for (var k in props) if (k === "title" || k === "color" || k === "collapsed") g[k] = props[k];
-          evUpdated.__emit(Object.assign({}, g));
-          return Promise.resolve(Object.assign({}, g));
+          return c2sGroupsReady.then(function () {
+            var g = c2sGroups[gid];
+            dbg("[c2s] tabGroups.update", gid, JSON.stringify(props), "->", g ? "ok" : "missing");
+            if (!g) throw new Error("No group with id: " + gid);
+            if (props) for (var k in props) if (k === "title" || k === "color" || k === "collapsed") g[k] = props[k];
+            c2sGroupsWrite();
+            evUpdated.__emit(Object.assign({}, g));
+            return Object.assign({}, g);
+          });
         },
         // Reordering groups within the tab bar isn't expressible in Safari; accept
         // and fire onMoved so callers chaining off it proceed.
@@ -1571,33 +1650,41 @@ var __C2S_DEBUG__ = false;
       if (chrome.tabs && typeof chrome.tabs.group !== "function") {
         chrome.tabs.group = function (opts, cb) {
           opts = opts || {};
-          var ids = opts.tabIds == null ? [] : (Array.isArray(opts.tabIds) ? opts.tabIds.slice() : [opts.tabIds]);
-          var gid = opts.groupId;
-          var created = false;
-          if (gid == null || gid === NONE || !c2sGroups[gid]) {
-            gid = c2sNextGid++;
-            c2sGroups[gid] = { id: gid, title: "", color: "grey", collapsed: false, windowId: opts.createProperties && opts.createProperties.windowId != null ? opts.createProperties.windowId : NONE };
-            created = true;
-          }
-          for (var i = 0; i < ids.length; i++) c2sTabGroup[ids[i]] = gid;
-          // Best-effort: pull grouped tabs adjacent. Safari may reject; ignore.
-          try { if (ids.length && chrome.tabs.move) chrome.tabs.move(ids, { index: -1 }, function () { void chrome.runtime.lastError; }); } catch (e) {}
-          if (created) evCreated.__emit(Object.assign({}, c2sGroups[gid]));
-          if (typeof cb === "function") { try { cb(gid); } catch (e) {} return; }
-          return Promise.resolve(gid);
+          var p = c2sGroupsReady.then(function () {
+            var ids = opts.tabIds == null ? [] : (Array.isArray(opts.tabIds) ? opts.tabIds.slice() : [opts.tabIds]);
+            var gid = opts.groupId;
+            var created = false;
+            if (gid == null || gid === NONE || !c2sGroups[gid]) {
+              gid = c2sNextGid++;
+              c2sGroups[gid] = { id: gid, title: "", color: "grey", collapsed: false, windowId: opts.createProperties && opts.createProperties.windowId != null ? opts.createProperties.windowId : NONE };
+              created = true;
+            }
+            for (var i = 0; i < ids.length; i++) c2sTabGroup[ids[i]] = gid;
+            c2sGroupsWrite();
+            dbg("[c2s] tabs.group", JSON.stringify(opts), "->", gid, created ? "(new)" : "(join)");
+            // Best-effort: pull grouped tabs adjacent. Safari may reject; ignore.
+            try { if (ids.length && chrome.tabs.move) chrome.tabs.move(ids, { index: -1 }, function () { void chrome.runtime.lastError; }); } catch (e) {}
+            if (created) evCreated.__emit(Object.assign({}, c2sGroups[gid]));
+            return gid;
+          });
+          if (typeof cb === "function") { p.then(function (gid) { try { cb(gid); } catch (e) {} }); return; }
+          return p;
         };
         chrome.tabs.ungroup = function (tabIds, cb) {
-          var ids = Array.isArray(tabIds) ? tabIds : [tabIds];
-          var touched = Object.create(null);
-          for (var i = 0; i < ids.length; i++) {
-            var g = c2sTabGroup[ids[i]];
-            if (g != null) { touched[g] = true; delete c2sTabGroup[ids[i]]; }
-          }
-          for (var gid in touched) {
-            if (tabsOf(+gid).length === 0) { var gone = c2sGroups[gid]; delete c2sGroups[gid]; if (gone) evRemoved.__emit(Object.assign({}, gone)); }
-          }
-          if (typeof cb === "function") { try { cb(); } catch (e) {} return; }
-          return Promise.resolve();
+          var p = c2sGroupsReady.then(function () {
+            var ids = Array.isArray(tabIds) ? tabIds : [tabIds];
+            var touched = Object.create(null);
+            for (var i = 0; i < ids.length; i++) {
+              var g = c2sTabGroup[ids[i]];
+              if (g != null) { touched[g] = true; delete c2sTabGroup[ids[i]]; }
+            }
+            for (var gid in touched) {
+              if (tabsOf(+gid).length === 0) { var gone = c2sGroups[gid]; delete c2sGroups[gid]; if (gone) evRemoved.__emit(Object.assign({}, gone)); }
+            }
+            c2sGroupsWrite();
+          });
+          if (typeof cb === "function") { p.then(function () { try { cb(); } catch (e) {} }); return; }
+          return p;
         };
       }
 
@@ -1741,7 +1828,13 @@ var __C2S_DEBUG__ = false;
         if (typeof chrome.tabs.removeCSS !== "function") chrome.tabs.removeCSS = __cssDelegate(false);
       }
 
-      // Expose tab.groupId on tabs.get/query results so reading code sees membership.
+      // Expose tab.groupId on tabs.get/query results so reading code sees membership,
+      // and honor a `groupId` in the query: Safari ignores the unknown filter and
+      // answers with every tab, so a manager asking "which tabs are in my group"
+      // (Claude in Chrome's isolated agent group) was handed the panel and the
+      // user's tabs too, concluded its new tab never existed, and drove the
+      // user's current tab instead. The filter is stripped before the native call
+      // (a strict validator could reject it) and applied to the stamped result.
       var stampGroup = function (tab) { if (tab && tab.id != null) tab.groupId = c2sTabGroup[tab.id] != null ? c2sTabGroup[tab.id] : NONE; return tab; };
       if (chrome.tabs) {
         ["get", "query"].forEach(function (fn) {
@@ -1751,10 +1844,19 @@ var __C2S_DEBUG__ = false;
             var args = [].slice.call(arguments);
             var cbIdx = args.length - 1;
             var hasCb = typeof args[cbIdx] === "function";
-            var wrap = function (res) { Array.isArray(res) ? res.forEach(stampGroup) : stampGroup(res); return res; };
-            if (hasCb) { var cb = args[cbIdx]; args[cbIdx] = function (r) { cb(wrap(r)); }; return orig.apply(chrome.tabs, args); }
+            var wantGroup;
+            if (fn === "query" && args[0] && typeof args[0] === "object" && "groupId" in args[0]) {
+              wantGroup = args[0].groupId;
+              var q = Object.assign({}, args[0]); delete q.groupId; args[0] = q;
+            }
+            var wrap = function (res) {
+              if (Array.isArray(res)) { res.forEach(stampGroup); if (wantGroup !== undefined) res = res.filter(function (t) { return t.groupId === wantGroup; }); }
+              else stampGroup(res);
+              return res;
+            };
+            if (hasCb) { var cb = args[cbIdx]; args[cbIdx] = function (r) { c2sGroupsReady.then(function () { cb(wrap(r)); }); }; return orig.apply(chrome.tabs, args); }
             var ret = orig.apply(chrome.tabs, args);
-            return ret && typeof ret.then === "function" ? ret.then(wrap) : ret;
+            return ret && typeof ret.then === "function" ? ret.then(function (r) { return c2sGroupsReady.then(function () { return wrap(r); }); }) : ret;
           };
           chrome.tabs[fn].__c2sGroupStamp = true;
         });
@@ -1765,6 +1867,7 @@ var __C2S_DEBUG__ = false;
             if (gid == null) return;
             delete c2sTabGroup[tabId];
             if (tabsOf(gid).length === 0) { var gone = c2sGroups[gid]; delete c2sGroups[gid]; if (gone) evRemoved.__emit(Object.assign({}, gone)); }
+            c2sGroupsWrite();
           });
         }
       }
