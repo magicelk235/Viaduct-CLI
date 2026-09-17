@@ -501,6 +501,78 @@ export function guardGeckoSettingsAccess(stageDir: string): number {
   return modified;
 }
 
+// A bundle recognizes its OWN pages by rebuilding their origin out of runtime.id and
+// comparing it to a port's sender:
+//   new URL(port.sender.url).origin === `chrome-extension://${chrome.runtime.id}`
+// On Chrome that holds, because runtime.id is the host of every extension URL. On
+// Safari it cannot: runtime.id is the App-Extension BUNDLE id
+// ("com.viaduct.MetaMask.Extension (V8K8L3ZSD5)") while the page's host is the
+// per-install UUID, and runtime.id is a frozen slot the shim can't rewrite (see
+// rewriteRuntimeIdUrlMatchers for the RegExp form of the same idiom).
+//
+// Measured live on MetaMask (Safari 26), where this decided everything:
+//   sender.url                  safari-web-extension://297CD490-…/home.html
+//   new URL(sender.url).origin  safari-web-extension://297cd490-…      (lowercased)
+//   getURL("/")                 safari-web-extension://297CD490-…/
+//   new URL(getURL("/")).origin safari-web-extension://297cd490-…      (equal)
+//   runtime.id                  com.viaduct.MetaMask.Extension (V8K8L3ZSD5)
+// Its background answers a port's liveness ping unconditionally but only sends
+// BACKGROUND_INITIALIZED to a port it believes is its own UI, so with the comparison
+// false the popup got the ping, waited 16 s for the init message that was never sent,
+// and showed "MetaMask had trouble starting — Background initialization timeout".
+//
+// So derive the origin from getURL instead of from runtime.id. `new URL()` lowercases
+// the host on both sides, which also settles the UUID-case mismatch (see Safari Quirks
+// B4), and the rewritten expression means exactly the same thing on Chrome.
+//
+// Only an origin-ONLY literal is rewritten: nothing may follow the interpolation
+// inside the template. A concrete-host URL WITH a path is usually a server-bound
+// token — above all an OAuth redirect_uri registered verbatim with the provider —
+// and rewriting one breaks the login (the reason CHROME_SCHEME_RE skips these too).
+// The namespace chain allows empty calls (`C().runtime.id`, minifier-emitted) and
+// dotted steps, but no call arguments: a quote or paren inside the class could let a
+// match start mid-expression and emit unbalanced output.
+//
+// `.runtime.id` itself must be plain-dotted. An optional-chained `browser?.runtime?.id`
+// evaluates to undefined instead of throwing when the namespace is missing, and the
+// replacement — which has to call getURL and hand the result to new URL() — cannot
+// reproduce that, so those are left alone rather than given new throw behavior.
+const NS_CHAIN = "[A-Za-z_$][\\w$]*(?:\\s*\\(\\s*\\)|\\s*\\??\\.\\s*[\\w$]+)*";
+const EXT_ORIGIN_TEMPLATE_RE = new RegExp(
+  "`chrome-extension://\\$\\{\\s*(" + NS_CHAIN + ")\\s*\\.\\s*runtime\\s*\\.\\s*id\\s*\\}`",
+  "g",
+);
+const EXT_ORIGIN_CONCAT_RE = new RegExp(
+  "([\"'])chrome-extension://\\1\\s*\\+\\s*(" + NS_CHAIN + ")\\s*\\.\\s*runtime\\s*\\.\\s*id\\b",
+  "g",
+);
+
+export function rewriteExtensionOriginFromRuntimeId(stageDir: string): number {
+  let modified = 0;
+  for (const file of walkScripts(stageDir)) {
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    if (!content.includes("chrome-extension://")) continue;
+    let changed = false;
+    const origin = (ns: string): string => {
+      changed = true;
+      return 'new URL(' + ns + '.runtime.getURL("/")).origin';
+    };
+    const next = content
+      .replace(EXT_ORIGIN_TEMPLATE_RE, (_whole, ns: string) => origin(ns))
+      .replace(EXT_ORIGIN_CONCAT_RE, (_whole, _q: string, ns: string) => origin(ns));
+    if (changed) {
+      writeFileSync(file, next, "utf-8");
+      modified++;
+    }
+  }
+  return modified;
+}
+
 // Safari re-evaluates a content-script group a SECOND time into a world that already
 // ran it. It happens for the document_end / document_idle groups on all_frames pages:
 // an about:blank / about:srcdoc subframe (and some same-origin navigations) shares the

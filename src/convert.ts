@@ -6,7 +6,7 @@ import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
 import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths, raiseMinVersionForMainWorld, MAIN_WORLD_MIN_SAFARI_VERSION } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
-import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteChromeSchemeLiterals, rewriteExtensionIdPlaceholderUrls, guardAncestorOriginsAccess, guardGeckoSettingsAccess, rewriteSelfPageExtensionUrls, rewriteBackgroundContextChecks, idempotentContentScriptGlobals, guardLocaleTailMessage } from "./input/stage.js";
+import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteExtensionOriginFromRuntimeId, rewriteChromeSchemeLiterals, rewriteExtensionIdPlaceholderUrls, guardAncestorOriginsAccess, guardGeckoSettingsAccess, rewriteSelfPageExtensionUrls, rewriteBackgroundContextChecks, idempotentContentScriptGlobals, guardLocaleTailMessage } from "./input/stage.js";
 import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireUserScriptsContentScript, wireCdpKeepalive, deriveProxyHosts } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
@@ -147,6 +147,14 @@ export function convert(opts: ConvertOptions): ConvertResult {
     // `runtime.id +` prefix here, making the matcher host-agnostic + query-tolerant.
     const rerouted = rewriteRuntimeIdUrlMatchers(stageDir);
     if (rerouted > 0) ok(`Rewrote runtime.id-based port matchers in ${rerouted} script(s)`);
+
+    // The origin-equality form of the same idiom: a bundle rebuilds its own origin as
+    // `chrome-extension://${runtime.id}` and compares it to new URL(sender.url).origin
+    // to decide whether a port is its own UI. Derive the origin from getURL instead —
+    // MetaMask's background otherwise never sends BACKGROUND_INITIALIZED to its popup
+    // and the UI dies on "Background initialization timeout".
+    const reorigined = rewriteExtensionOriginFromRuntimeId(stageDir);
+    if (reorigined > 0) ok(`Rewrote runtime.id-based extension-origin checks in ${reorigined} script(s)`);
 
     // Compiled bundles hardcode "chrome-extension:" when classifying their own pages
     // (sender.url prefix checks, internal-protocol tables). Safari pages are
