@@ -1797,6 +1797,25 @@ var __C2S_DEBUG__ = false;
     // (the proven __viaduct-keepalive trick), so while a debugger session is attached we
     // hold such a port FROM the debugged tab, refresh it on navigation, drop it on detach.
     var dbgKaPorts = [];
+    // JS dialogs. Chrome pauses the page on alert/confirm/prompt while a debugger is
+    // attached, reports Page.javascriptDialogOpening, and the agent answers with
+    // Page.handleJavaScriptDialog. Safari has no such hook: a native dialog in a
+    // driven tab blocks it until a human clicks, and no extension API can dismiss
+    // it, so the agent hangs. A MAIN-world hook (pageDialogHook, injected on attach
+    // and after each navigation) answers the dialog itself instead: alert returns,
+    // confirm returns true, prompt returns its default text. It reports the call
+    // through the keepalive content script's port, and this side emits the CDP
+    // events the agent expects, with Closed following the agent's handle command.
+    var dbgDialogs = Object.create(null); // tabId -> last reported dialog
+    var onDialogReport = function (tabId, d) {
+      if (tabId == null || !dbgAttached[tabId] || !d) return;
+      dbgDialogs[tabId] = d;
+      try { cdpLog("dialog " + d.type + " tab=" + tabId + " " + String(d.message || "").slice(0, 80)); } catch (e) {}
+      emitCdp(tabId, "Page.javascriptDialogOpening", {
+        url: d.url || "", message: d.message || "", type: d.type || "alert",
+        hasBrowserHandler: false, defaultPrompt: d.defaultPrompt || "",
+      });
+    };
     try {
       if (chrome.runtime && chrome.runtime.onConnect && chrome.runtime.onConnect.addListener) {
         chrome.runtime.onConnect.addListener(function (port) {
@@ -1804,6 +1823,14 @@ var __C2S_DEBUG__ = false;
           dbgKaPorts.push(port);
           try { cdpLog("KA-PORT+ " + port.name); } catch (e) {}
           try { port.onDisconnect.addListener(function () { var i = dbgKaPorts.indexOf(port); if (i >= 0) dbgKaPorts.splice(i, 1); void (chrome.runtime && chrome.runtime.lastError); }); } catch (e) {}
+          try {
+            port.onMessage.addListener(function (m) {
+              if (!m) return;
+              var tid = port.sender && port.sender.tab && port.sender.tab.id;
+              if (m.__c2sCdpDialog) onDialogReport(tid, m.__c2sCdpDialog);
+              if (m.__c2sCdpNetwork) onNetworkReport(tid, m.__c2sCdpNetwork);
+            });
+          } catch (e) {}
         });
       }
     } catch (e) {}
@@ -1899,6 +1926,8 @@ var __C2S_DEBUG__ = false;
             var fid = String(details.tabId);
             emitCdp(details.tabId, "Page.frameStartedLoading", { frameId: fid });
             emitCdp(details.tabId, "Page.frameNavigated", { frame: { id: fid, loaderId: fid, url: details.url } });
+            hookDialogs(details.tabId); // new document, new page world
+            hookNetwork(details.tabId);
           });
           if (chrome.webNavigation.onDOMContentLoaded && chrome.webNavigation.onDOMContentLoaded.addListener) {
             chrome.webNavigation.onDOMContentLoaded.addListener(function (details) {
@@ -1927,6 +1956,8 @@ var __C2S_DEBUG__ = false;
           if (info.status === "loading") {
             emitCdp(tabId, "Page.frameStartedLoading", { frameId: fid });
             emitCdp(tabId, "Page.frameNavigated", { frame: { id: fid, loaderId: fid, url: url } });
+            hookDialogs(tabId);
+            hookNetwork(tabId);
           } else if (info.status === "complete") {
             emitCdp(tabId, "Page.loadEventFired", { timestamp: Date.now() / 1000 });
             emitCdp(tabId, "Page.frameStoppedLoading", { frameId: fid });
@@ -2135,6 +2166,28 @@ var __C2S_DEBUG__ = false;
       return false;
     };
 
+    // Page-world dialog hook (see dbgDialogs above). Self-contained; installed once
+    // per document. The originals are not called: a native Safari dialog in a driven
+    // tab can only be dismissed by a human, so it is answered here and reported.
+    var pageDialogHook = function () {
+      if (window.__c2sDialogHooked) return;
+      window.__c2sDialogHooked = true;
+      var report = function (type, message, def) {
+        try {
+          document.dispatchEvent(new CustomEvent("__viaduct-cdp-dialog", {
+            detail: JSON.stringify({ type: type, message: String(message == null ? "" : message), defaultPrompt: def == null ? "" : String(def), url: location.href }),
+          }));
+        } catch (e) {}
+      };
+      try { window.alert = function (m) { report("alert", m); }; } catch (e) {}
+      try { window.confirm = function (m) { report("confirm", m); return true; }; } catch (e) {}
+      try { window.prompt = function (m, d) { report("prompt", m, d); return d == null ? "" : String(d); }; } catch (e) {}
+    };
+    var hookDialogs = function (tabId) {
+      if (tabId == null || !dbgAttached[tabId]) return;
+      inject(tabId, pageDialogHook, [], "MAIN").then(function () {}, function () {});
+    };
+
     // --- Unified page-context CDP executor. Serialized + injected via
     // chrome.scripting into the MAIN world so (a) Runtime.evaluate sees the page's
     // real globals and (b) DOM node handles and Runtime object handles share ONE
@@ -2149,6 +2202,74 @@ var __C2S_DEBUG__ = false;
         function (r) { return (r && r[0]) ? r[0].result : undefined; },
         function () { return undefined; }
       );
+    };
+
+    // Network observation. Chrome's Network domain streams every request while
+    // enabled; Safari exposes nothing to an extension without webRequest. The page's
+    // Resource Timing buffer is the passive view that is always there: URL, initiator
+    // type, status (responseStatus, Safari 17+), sizes and timing, no headers or
+    // bodies. Installed in the isolated world (the page's CSP does not apply and the
+    // DOM event channel is shared with the keepalive script), buffered so requests
+    // made before Network.enable are reported too, and re-installed after each
+    // navigation. The document's own load is a "navigation" entry and is reported
+    // as a Document request. Method is unknown to Resource Timing; GET is reported.
+    var pageNetworkHook = function () {
+      if (window.__c2sNetHooked) return;
+      window.__c2sNetHooked = true;
+      var seq = 0;
+      var report = function (entries) {
+        var out = [];
+        for (var i = 0; i < entries.length; i++) {
+          var e = entries[i];
+          if (!e || !e.name) continue;
+          out.push({
+            id: "rt-" + (++seq), url: String(e.name), initiator: String(e.initiatorType || ""),
+            status: typeof e.responseStatus === "number" ? e.responseStatus : -1,
+            mime: String(e.contentType || ""),
+            encoded: e.encodedBodySize || 0, transfer: e.transferSize || 0,
+            start: e.startTime || 0, end: e.responseEnd || 0, docUrl: String(location.href),
+          });
+        }
+        if (!out.length) return;
+        try { document.dispatchEvent(new CustomEvent("__viaduct-cdp-network", { detail: JSON.stringify(out) })); } catch (e) {}
+      };
+      // The document itself is a "navigation" entry, not a "resource" one.
+      try {
+        var po = new PerformanceObserver(function (list) { report(list.getEntries()); });
+        po.observe({ type: "navigation", buffered: true });
+        po.observe({ type: "resource", buffered: true });
+      } catch (e) {
+        try { report(performance.getEntriesByType("navigation").concat(performance.getEntriesByType("resource"))); } catch (e2) {}
+      }
+    };
+    var dbgNetwork = Object.create(null); // tabId -> true while Network.enable is on
+    var hookNetwork = function (tabId) {
+      if (tabId == null || !dbgAttached[tabId] || !dbgNetwork[tabId]) return;
+      inject(tabId, pageNetworkHook, []).then(function () {}, function () {});
+    };
+    var TYPE_BY_INITIATOR = { fetch: "Fetch", xmlhttprequest: "XHR", img: "Image", image: "Image", script: "Script", css: "Stylesheet", link: "Stylesheet", font: "Font", video: "Media", audio: "Media", iframe: "Document", navigation: "Document", beacon: "Ping" };
+    var onNetworkReport = function (tabId, list) {
+      if (tabId == null || !dbgAttached[tabId] || !dbgNetwork[tabId] || !Array.isArray(list)) return;
+      try { cdpLog("network " + list.length + " entr" + (list.length === 1 ? "y" : "ies") + " tab=" + tabId + " lis=" + dbgEvtList.length); } catch (e) {}
+      var now = Date.now() / 1000;
+      for (var i = 0; i < list.length; i++) {
+        var e = list[i], type = TYPE_BY_INITIATOR[e.initiator] || "Other";
+        var reqId = String(tabId) + ":" + e.id;
+        emitCdp(tabId, "Network.requestWillBeSent", {
+          requestId: reqId, loaderId: String(tabId), documentURL: e.docUrl || "",
+          request: { url: e.url, method: "GET", headers: {}, initialPriority: "Medium", referrerPolicy: "strict-origin-when-cross-origin" },
+          timestamp: now, wallTime: now, initiator: { type: "other" }, type: type,
+        });
+        if (e.status === 0) {
+          emitCdp(tabId, "Network.loadingFailed", { requestId: reqId, timestamp: now, type: type, errorText: "net::ERR_FAILED", canceled: false });
+          continue;
+        }
+        emitCdp(tabId, "Network.responseReceived", {
+          requestId: reqId, loaderId: String(tabId), timestamp: now, type: type,
+          response: { url: e.url, status: e.status > 0 ? e.status : 200, statusText: "", headers: {}, mimeType: e.mime || "", connectionReused: false, connectionId: 0, encodedDataLength: e.transfer || 0, fromDiskCache: e.transfer === 0 && e.encoded > 0, fromServiceWorker: false, securityState: "unknown" },
+        });
+        emitCdp(tabId, "Network.loadingFinished", { requestId: reqId, timestamp: now, encodedDataLength: e.transfer || 0 });
+      }
     };
 
     // ArrayBuffer -> base64 (SW/background-safe: no FileReader). Chunked so
@@ -2465,6 +2586,23 @@ var __C2S_DEBUG__ = false;
             if (chrome.tabs && chrome.tabs.get && tabId != null) { try { chrome.tabs.get(tabId, function (tab) { done((tab && tab.url) || ""); }); return; } catch (e) {} }
             done("");
           });
+        case "Network.enable":
+          if (tabId != null) { dbgNetwork[tabId] = true; hookNetwork(tabId); }
+          return Promise.resolve({});
+        case "Network.disable":
+          if (tabId != null) delete dbgNetwork[tabId];
+          return Promise.resolve({});
+        case "Page.handleJavaScriptDialog": {
+          // The page-world hook already answered; this closes the loop the agent
+          // is waiting on. accept:false is honored in the event only, since the
+          // synchronous call has long returned.
+          var dlg = tabId != null ? dbgDialogs[tabId] : null;
+          if (dlg) {
+            delete dbgDialogs[tabId];
+            emitCdp(tabId, "Page.javascriptDialogClosed", { result: params.accept !== false, userInput: params.promptText != null ? String(params.promptText) : (dlg.defaultPrompt || "") });
+          }
+          return Promise.resolve({});
+        }
         case "Emulation.setDeviceMetricsOverride":
           if (tabId != null) dbgMetrics[tabId] = { dsf: params.deviceScaleFactor };
           return Promise.resolve({});
@@ -2608,14 +2746,14 @@ var __C2S_DEBUG__ = false;
         try { cdpLog("attach tab=" + id); } catch (e) {}
         if (id != null) dbgAttached[id] = true;
         hookLifecycle();
-        if (id != null) startKeepAlive(id);
+        if (id != null) { startKeepAlive(id); hookDialogs(id); }
         startNativeKA();
         return withCb(Promise.resolve(), cb);
       },
       detach: function (target, cb) {
         var id = tabIdOf(target);
         try { cdpLog("detach tab=" + id); } catch (e) {}
-        if (id != null) { delete dbgAttached[id]; delete dbgMetrics[id]; }
+        if (id != null) { delete dbgAttached[id]; delete dbgMetrics[id]; delete dbgNetwork[id]; delete dbgDialogs[id]; }
         if (id != null) try { stopKeepAlive(id); } catch (e) {}
         stopNativeKA();
         return withCb(Promise.resolve(), cb);

@@ -8,11 +8,15 @@
 // completes. Safari keeps a non-persistent background LOADED while a
 // runtime.connect port is open to it (Apple dev-forum 738567). An injected
 // executeScript(func) port does NOT persist in Safari, but a DECLARED content
-// script's port does — and content->background PORTS are delivered on Safari even
-// though content->background sendMessage/storage.onChanged are not. So this file
-// (declared on <all_urls>) simply holds that port whenever it runs, keeping the
-// background loaded so the CDP poll loop never stalls. Re-created automatically on
-// every navigation.
+// script's port does. So this file (declared on <all_urls>) simply holds that
+// port whenever it runs, keeping the background loaded so the CDP poll loop never
+// stalls. Re-created automatically on every navigation.
+//
+// The same port carries the page's CDP reports: the MAIN-world dialog hook and
+// the isolated-world network observer (pageDialogHook / pageNetworkHook in the
+// shim) dispatch DOM events with a JSON detail, this script forwards them, and
+// the background turns them into Page.javascriptDialogOpening and Network.*
+// events for the attached agent.
 (function () {
   "use strict";
   // DIAGNOSTIC: a DOM marker (visible to page JS via do-JavaScript) proves Safari ran this
@@ -41,4 +45,20 @@
     }
   }
   hold();
+  // The MAIN-world dialog hook and the isolated-world network observer (see
+  // pageDialogHook / pageNetworkHook in the shim) report through DOM events with a
+  // JSON detail; forward them to the background over the same port.
+  var forward = function (eventName, key) {
+    try {
+      document.addEventListener(eventName, function (ev) {
+        var d = null;
+        try { d = JSON.parse(String(ev.detail)); } catch (e) { return; }
+        if (!d || !port) return;
+        var m = {}; m[key] = d;
+        try { port.postMessage(m); } catch (e) {}
+      });
+    } catch (e) {}
+  };
+  forward("__viaduct-cdp-dialog", "__c2sCdpDialog");
+  forward("__viaduct-cdp-network", "__c2sCdpNetwork");
 })();
