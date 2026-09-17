@@ -5776,6 +5776,117 @@ var __C2S_DEBUG__ = false;
     }
   } catch (__namespaceBackfillErr) {}
 
+  // ── DNR header rules, applied to the extension's OWN requests ──────────────
+  // Safari never applies a modifyHeaders rule (measured, see below), so the wrap
+  // under this strips them before they can take a whole batch down. The rules are
+  // not thrown away, though: an extension commonly uses them to stamp headers on
+  // its own API calls (Claude in Chrome sets User-Agent, anthropic-client-platform
+  // and anthropic-client-version on every api.anthropic.com request), and those
+  // requests all pass through the shim's fetch/XHR patches, which can honor the
+  // rule themselves. Settable headers are applied in the browser; forbidden ones
+  // (User-Agent, Origin, Referer, ...) ride along to the native-host proxy retry,
+  // which sets anything. Page subresources and WebSockets are out of reach and
+  // stay unmodified. The registry is mirrored into storage.local because the
+  // background registers the rules and a panel makes the calls.
+  var dnrHeaderRules = Object.create(null); // id -> rule
+  var DNR_HDR_KEY = "__c2sDnrHeaderRules";
+  var FORBIDDEN_HDR = /^(accept-charset|accept-encoding|access-control-request-headers|access-control-request-method|connection|content-length|cookie|cookie2|date|dnt|expect|host|keep-alive|origin|referer|set-cookie|te|trailer|transfer-encoding|upgrade|via|user-agent|proxy-.*|sec-.*)$/i;
+  function dnrUrlFilterToRegExp(filter, caseSensitive) {
+    var src = "";
+    var i = 0, s = String(filter || "");
+    if (s.indexOf("||") === 0) { src += "^[a-z][a-z0-9+.-]*://([^/?#]*\\.)?"; i = 2; }
+    else if (s.charAt(0) === "|") { src += "^"; i = 1; }
+    var endAnchor = s.length > i && s.charAt(s.length - 1) === "|";
+    var end = endAnchor ? s.length - 1 : s.length;
+    for (; i < end; i++) {
+      var c = s.charAt(i);
+      if (c === "*") src += ".*";
+      else if (c === "^") src += "(?:[^a-zA-Z0-9_\\-.%]|$)";
+      else src += c.replace(/[.+?${}()|[\]\\\/]/g, "\\$&");
+    }
+    if (endAnchor) src += "$";
+    return new RegExp(src, caseSensitive ? "" : "i");
+  }
+  function dnrRuleMatchesOwnRequest(rule, url, method) {
+    var c = rule && rule.condition;
+    if (!c) return false;
+    // An extension page's own fetch is an xmlhttprequest with the extension as
+    // initiator: a rule keyed on a page's domain or tab can never mean it.
+    if (c.domains || c.initiatorDomains || c.excludedInitiatorDomains || c.tabIds) return false;
+    if (c.resourceTypes && c.resourceTypes.indexOf("xmlhttprequest") < 0) return false;
+    if (c.excludedResourceTypes && c.excludedResourceTypes.indexOf("xmlhttprequest") >= 0) return false;
+    var m = String(method || "GET").toLowerCase();
+    if (c.requestMethods && c.requestMethods.indexOf(m) < 0) return false;
+    if (c.excludedRequestMethods && c.excludedRequestMethods.indexOf(m) >= 0) return false;
+    try {
+      if (c.regexFilter) return new RegExp(c.regexFilter, c.isUrlFilterCaseSensitive ? "" : "i").test(url);
+      if (c.urlFilter) return dnrUrlFilterToRegExp(c.urlFilter, c.isUrlFilterCaseSensitive).test(url);
+    } catch (e) { return false; }
+    return true;
+  }
+  // Request-header operations for one of the extension's own requests, lowest
+  // priority first so a higher-priority `set` applied later wins, as in Chrome.
+  function dnrHeaderOpsFor(url, method) {
+    var rules = [];
+    for (var id in dnrHeaderRules) { if (dnrRuleMatchesOwnRequest(dnrHeaderRules[id], url, method)) rules.push(dnrHeaderRules[id]); }
+    if (!rules.length) return null;
+    rules.sort(function (a, b) { return (a.priority || 1) - (b.priority || 1); });
+    var ops = [];
+    for (var i = 0; i < rules.length; i++) {
+      var rh = rules[i].action && rules[i].action.requestHeaders;
+      if (Array.isArray(rh)) for (var j = 0; j < rh.length; j++) if (rh[j] && rh[j].header) ops.push(rh[j]);
+    }
+    return ops.length ? ops : null;
+  }
+  // Apply ops to a plain header map (lower-cased names); forbidden headers are
+  // returned separately for the proxy. Returns { applied, forwarded }.
+  function dnrApplyHeaderOps(ops, headers) {
+    var forwarded = {}, applied = 0;
+    for (var i = 0; i < ops.length; i++) {
+      var op = ops[i], name = String(op.header).toLowerCase(), kind = op.operation || "set";
+      var target = FORBIDDEN_HDR.test(name) ? forwarded : headers;
+      if (kind === "remove") { delete target[name]; }
+      else if (kind === "append") { target[name] = target[name] ? target[name] + ", " + op.value : String(op.value); }
+      else { target[name] = String(op.value); }
+      if (target === headers) applied++;
+    }
+    return { applied: applied, forwarded: forwarded };
+  }
+  function dnrNoteHeaderRules(opts) {
+    if (!opts) return;
+    var changed = false;
+    if (Array.isArray(opts.removeRuleIds)) for (var r = 0; r < opts.removeRuleIds.length; r++) { if (dnrHeaderRules[opts.removeRuleIds[r]]) { delete dnrHeaderRules[opts.removeRuleIds[r]]; changed = true; } }
+    if (Array.isArray(opts.addRules)) for (var a = 0; a < opts.addRules.length; a++) {
+      var rule = opts.addRules[a];
+      if (rule && rule.action && rule.action.type === "modifyHeaders" && rule.id != null) { dnrHeaderRules[rule.id] = rule; changed = true; }
+    }
+    if (!changed) return;
+    try {
+      if (api.storage && api.storage.local) {
+        var obj = {}; obj[DNR_HDR_KEY] = dnrHeaderRules;
+        var p = api.storage.local.set(obj, function () { try { void (api.runtime && api.runtime.lastError); } catch (e) {} });
+        if (p && typeof p.catch === "function") p.catch(function () {});
+      }
+    } catch (e) {}
+  }
+  try {
+    if (api.storage && api.storage.local) {
+      var loadHdr = function (res) {
+        var stored = res && res[DNR_HDR_KEY];
+        if (stored && typeof stored === "object") for (var id in stored) dnrHeaderRules[id] = stored[id];
+      };
+      var hp = api.storage.local.get(DNR_HDR_KEY, function (res) { try { void (api.runtime && api.runtime.lastError); } catch (e) {} loadHdr(res); });
+      if (hp && typeof hp.then === "function") hp.then(loadHdr, function () {});
+      if (api.storage.onChanged && api.storage.onChanged.addListener) {
+        api.storage.onChanged.addListener(function (changes, area) {
+          if (area !== "local" || !changes || !changes[DNR_HDR_KEY]) return;
+          dnrHeaderRules = Object.create(null);
+          var nv = {}; nv[DNR_HDR_KEY] = changes[DNR_HDR_KEY].newValue; loadHdr(nv);
+        });
+      }
+    }
+  } catch (e) {}
+
   // Safari ACCEPTS a declarativeNetRequest modifyHeaders rule and then never acts on
   // it. Measured on Safari 26.6.2 with a converted extension holding all-website
   // access: update{Session,Dynamic}Rules resolves, get{Session,Dynamic}Rules lists the
@@ -5870,6 +5981,7 @@ var __C2S_DEBUG__ = false;
         });
       };
       var wrapped = function (opts, cb) {
+        try { dnrNoteHeaderRules(opts); } catch (e) {}
         try { opts = stripModifyHeaders(opts); } catch (e) {}
         var addCount = (opts && opts.addRules && opts.addRules.length) || 0;
         var removeCount = (opts && opts.removeRuleIds && opts.removeRuleIds.length) || 0;
@@ -6956,6 +7068,26 @@ var __C2S_DEBUG__ = false;
             init = Object.assign({}, base, { headers: h });
           }
         } catch (e) { /* fall through with original args */ }
+        // The extension's own DNR header rules (see dnrHeaderRules): settable ones
+        // go on the request now, forbidden ones only through the proxy retry.
+        var fwdHeaders = null;
+        try {
+          var m0 = (init && init.method) || (typeof input !== "string" && input && input.method) || "GET";
+          var ops = dnrHeaderOpsFor(url, m0);
+          if (ops) {
+            var hb = init || {};
+            var hh = new Headers(hb.headers || (typeof input !== "string" && input && input.headers) || {});
+            var plain = headersToObj(hh);
+            var res0 = dnrApplyHeaderOps(ops, plain);
+            if (res0.applied) {
+              var nh = new Headers();
+              for (var hk in plain) nh.set(hk, plain[hk]);
+              init = Object.assign({}, hb, { headers: nh });
+            }
+            for (var fk in res0.forwarded) { fwdHeaders = fwdHeaders || {}; fwdHeaders[fk] = res0.forwarded[fk]; }
+            dbg("[c2s] DNR header rule applied to own request", url, "applied=" + res0.applied, "forwarded=" + Object.keys(res0.forwarded).join(","));
+          }
+        } catch (e) {}
         var willProxy = shouldProxy(url);
         // A Request's body is disturbed synchronously by the first fetch, so clone it
         // BEFORE calling _fetch — a clone taken afterward throws "body already used".
@@ -6979,6 +7111,7 @@ var __C2S_DEBUG__ = false;
             : (typeof input !== "string" && input && input.headers) ? new Headers(input.headers)
             : null
         );
+        if (fwdHeaders) for (var fh in fwdHeaders) reqHeaders[fh] = fwdHeaders[fh];
         var reqBodyP = (function () {
           try {
             if (init && typeof init.body === "string") return Promise.resolve(init.body);
@@ -7043,7 +7176,19 @@ var __C2S_DEBUG__ = false;
         var xhr = this;
         var proxyTarget = false;
         try { proxyTarget = !!xhr.__c2sProxyTarget && !!g && typeof g.fetch === "function"; } catch (e) {}
-        if (!proxyTarget) return _send.apply(this, arguments);
+        if (!proxyTarget) {
+          // Own DNR header rules on a direct XHR: settable headers only (XHR has no
+          // remove, and forbidden ones need the proxy, which this request skips).
+          try {
+            var xops = dnrHeaderOpsFor(xhr.__c2sUrl, xhr.__c2sMethod);
+            if (xops) {
+              var xh = {};
+              dnrApplyHeaderOps(xops, xh);
+              for (var xk in xh) { try { _setRequestHeader.call(xhr, xk, xh[xk]); } catch (e) {} }
+            }
+          } catch (e) {}
+          return _send.apply(this, arguments);
+        }
 
         // Route the whole request through the (already-patched) global fetch: it
         // owns the "try direct, retry via native host on CORS-block/401/403" logic,
