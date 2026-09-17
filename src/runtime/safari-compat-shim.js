@@ -3903,6 +3903,58 @@ var __C2S_DEBUG__ = false;
       }
     }
 
+    // Safari REJECTS a null-prototype object as the items/keys argument:
+    //   storage.local.set(Object.create(null) with keys) throws
+    //   "Invalid call to storageArea.set(). The 'items' value is invalid, because an
+    //    object is expected."
+    // Chrome accepts one, and bundles pass them — MetaMask's state store hands set()
+    // a prototype-less object, so EVERY persist threw and its background never
+    // finished initializing: the popup sat on the spinner and then showed "MetaMask
+    // had trouble starting — Background initialization timeout" (measured live,
+    // Safari 26; the same 168 KB payload copied into a plain object was accepted, and
+    // so was each key written on its own, so it is the receiving object's prototype
+    // and not the contents).
+    // Only the TOP level is Safari's problem — the single-key retries carried the
+    // same nested values through — so the copy stays shallow: one small object per
+    // call, never a deep clone of a megabyte of state.
+    if (stg) {
+      var c2sPlainItems = function (v) {
+        if (v === null || typeof v !== "object") return v; // string/array/null/function keys
+        if (Object.getPrototypeOf(v) !== null) return v;
+        var out = {};
+        var ks = Object.keys(v);
+        for (var pi = 0; pi < ks.length; pi++) out[ks[pi]] = v[ks[pi]];
+        return out;
+      };
+      var c2sPlainArg0 = function (area, name) {
+        if (!area) return;
+        var orig;
+        try { orig = area[name]; } catch (e) { return; }
+        if (typeof orig !== "function" || orig.__c2sPlainArg0) return;
+        var wrapped = function () {
+          var args = [].slice.call(arguments);
+          if (args.length) args[0] = c2sPlainItems(args[0]);
+          return orig.apply(this === wrapped || this === undefined ? area : this, args);
+        };
+        wrapped.__c2sPlainArg0 = true;
+        installOverride(area, name, wrapped);
+      };
+      // get takes the same shape (a defaults object), and the same validator reads it.
+      var c2sPlainAreas = function (root) {
+        if (!root) return;
+        var names = ["local", "sync", "session"];
+        for (var ai = 0; ai < names.length; ai++) {
+          var area = null;
+          try { area = mutableNamespace(root, names[ai]); } catch (e) {}
+          if (!area) continue;
+          c2sPlainArg0(area, "set");
+          c2sPlainArg0(area, "get");
+        }
+      };
+      c2sPlainAreas(stg);
+      try { if (api.storage && api.storage !== stg) c2sPlainAreas(mutableNamespace(api, "storage")); } catch (e) {}
+    }
+
     // chrome.idle — in a document context, derive REAL idle from user activity (the
     // way Chrome does): reset an activity clock on input events, and report "idle" when
     // no input for `detectionInterval` seconds OR the page is hidden, else "active".
