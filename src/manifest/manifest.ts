@@ -874,11 +874,12 @@ export function collectReferencedPaths(m: Manifest): Set<string> {
 }
 
 /**
- * Add `'self'` to a CSP's connect-src so Safari allows same-origin fetch/XHR of
- * bundled resources (Chrome implies this; Safari enforces connect-src strictly).
- * Only touches a connect-src that EXISTS but lacks 'self' — a policy with no
- * connect-src already falls back to default-src/'self'. Leaves every other
- * directive untouched. Accepts the MV3 object form, the bare MV2 string, or
+ * Add `'self'` (and `blob:`) to a CSP's connect-src so Safari allows same-origin
+ * fetch/XHR of bundled resources and of the page's own blob URLs (Chrome implies
+ * both; Safari enforces connect-src strictly, and per spec 'self' never matches a
+ * blob: URL). Only touches a connect-src that EXISTS but lacks 'self' — a policy
+ * with no connect-src already falls back to default-src/'self'. Leaves every
+ * other directive untouched. Accepts the MV3 object form, the bare MV2 string, or
  * undefined, and returns the same shape.
  */
 export function addSelfToConnectSrc<T extends string | Record<string, string> | undefined>(csp: T): T {
@@ -886,9 +887,11 @@ export function addSelfToConnectSrc<T extends string | Record<string, string> | 
     if (/(?:^|;)\s*connect-src(?:\s|;|$)/i.test(policy)) {
       return policy.replace(/(^|;)\s*connect-src\s+([^;]*)/i, (full, sep: string, sources: string) => {
         const tokens = sources.trim().split(/\s+/).filter(Boolean);
-        // 'none' means "block everything" — don't loosen it; 'self' already present → no-op.
-        if (tokens.includes("'none'") || tokens.includes("'self'")) return full;
-        return `${sep} connect-src 'self' ${tokens.join(" ")}`;
+        // 'none' means "block everything" — don't loosen it.
+        if (tokens.includes("'none'")) return full;
+        const add = ["'self'", "blob:"].filter((t) => !tokens.includes(t));
+        if (add.length === 0) return full;
+        return `${sep} connect-src ${add.join(" ")} ${tokens.join(" ")}`;
       });
     }
     // No connect-src: fetches fall back to default-src. Chrome still implies
@@ -900,7 +903,7 @@ export function addSelfToConnectSrc<T extends string | Record<string, string> | 
     const tokens = dm[1].trim().split(/\s+/).filter(Boolean);
     if (tokens.includes("'self'")) return policy;
     const scope = tokens.filter((t) => t !== "'none'");
-    return `${policy.replace(/;?\s*$/, "")}; connect-src 'self'${scope.length ? " " + scope.join(" ") : ""}`;
+    return `${policy.replace(/;?\s*$/, "")}; connect-src 'self' blob:${scope.length ? " " + scope.join(" ") : ""}`;
   };
   if (csp == null) return csp;
   if (typeof csp === "string") return fixOne(csp) as T;

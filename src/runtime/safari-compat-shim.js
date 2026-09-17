@@ -4265,26 +4265,61 @@ var __C2S_DEBUG__ = false;
         if (q.filename != null && it.filename !== q.filename) return false;
         return true;
       };
+      // Real file, real name: the containing app's handler writes the bytes into
+      // ~/Downloads (it holds the sandbox's Downloads entitlement; see
+      // grantDownloadsFolder / handleDownload in build/packager.ts). Everything the
+      // navigation fallbacks below cannot do — a filename, a renderable type saved
+      // rather than displayed (Safari shows a GIF or a text file instead of saving
+      // it), no tab opened — this does. Resolves true when the file is on disk;
+      // false when the bytes could not be read (a cross-origin URL without CORS) or
+      // the handler is absent or old, in which case the caller takes the old path.
+      // A data: URL is decoded here: the extension's own CSP rarely lists data: in
+      // connect-src, so fetch() would refuse it. blob: is fetchable because the
+      // manifest transform adds blob: to connect-src (addSelfToConnectSrc).
+      var readDataUrl = function (url) {
+        var m = /^data:([^,;]*)((?:;[^,]*)*),([\s\S]*)$/i.exec(url);
+        if (!m) return null;
+        var mime = m[1] || "text/plain", b64 = /;base64/i.test(m[2]), body = m[3];
+        try {
+          if (b64) { var bin = atob(body); return { b64: body, size: bin.length, mime: mime }; }
+          var text = decodeURIComponent(body);
+          var bytes = new TextEncoder().encode(text), s = "";
+          for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+          return { b64: btoa(s), size: bytes.length, mime: mime };
+        } catch (e) { return null; }
+      };
+      var hostDownload = function (url, filename, conflictAction) {
+        var rt = chrome.runtime;
+        if (!rt || typeof rt.sendNativeMessage !== "function" || typeof fetch !== "function") return Promise.resolve(null);
+        var bytesP = /^data:/i.test(url)
+          ? Promise.resolve(readDataUrl(url)).then(function (d) { if (!d) throw new Error("undecodable data: URL"); return d; })
+          : fetch(url).then(function (r) {
+              if (!r.ok && !/^blob:/i.test(url)) throw new Error("status " + r.status);
+              return r.blob();
+            }).then(function (b) {
+              return new Promise(function (resolve, reject) {
+                var fr = new FileReader();
+                fr.onloadend = function () { resolve({ b64: String(fr.result || "").split(",")[1] || "", size: b.size, mime: b.type || "" }); };
+                fr.onerror = function () { reject(fr.error); };
+                fr.readAsDataURL(b);
+              });
+            });
+        return bytesP.then(function (payload) {
+          var env = { __c2sDownload: 1, filename: filename, base64: payload.b64, conflictAction: conflictAction || "uniquify" };
+          var p;
+          try { p = rt.sendNativeMessage("application.id", env); } catch (e) { return null; }
+          return Promise.resolve(p).then(function (reply) {
+            if (!reply || reply.ok !== true) { dbg("[c2s] downloads: host declined", reply && (reply.error || "no handler")); return null; }
+            return { path: reply.path, filename: reply.filename, size: payload.size, mime: payload.mime };
+          }, function (e) { dbg("[c2s] downloads: host unavailable", String((e && e.message) || e)); return null; });
+        }).catch(function (e) { dbg("[c2s] downloads: bytes unreadable", url, String((e && e.message) || e)); return null; });
+      };
       fill(chrome.downloads, {
         download: function (opts, cb) {
           opts = opts || {};
           var url = opts.url || "";
           var id = seq++;
           var fname = opts.filename || (function () { try { return decodeURIComponent(url.split("/").pop().split("?")[0]) || "download"; } catch (e) { return "download"; } })();
-          var wentViaBlob = false;
-          try {
-            // blob:/data: → route through forceBlobDownload (WebKit navigates on a
-            // bare <a download> for these; window.open makes it save).
-            if (/^(blob:|data:)/i.test(url) && forceBlobDownload(url, opts.filename)) {
-              wentViaBlob = true;
-            } else if (typeof document !== "undefined" && document.body) {
-              var a = document.createElement("a");
-              a.href = url; if (opts.filename) a.download = opts.filename;
-              document.body.appendChild(a); a.click(); a.remove();
-            } else if (chrome.tabs && chrome.tabs.create) {
-              chrome.tabs.create({ url: url, active: false });
-            }
-          } catch (e) {}
           var item = {
             id: id, url: url, finalUrl: url, filename: fname, state: "in_progress",
             paused: false, canResume: false, error: undefined, bytesReceived: 0,
@@ -4293,29 +4328,50 @@ var __C2S_DEBUG__ = false;
           };
           items.push(item);
           dlCreated._emit(shallow(item));
-          // No progress signal from WebKit → resolve to complete on the next tick.
-          // Bail if the caller already canceled/paused this download synchronously —
-          // otherwise we'd resurrect an interrupted item and emit a bogus
-          // in_progress→complete transition from a now-stale `previous` state.
-          var complete = function () {
+          var complete = function (saved) {
+            // Bail if the caller already canceled/paused this download — otherwise
+            // we'd resurrect an interrupted item and emit a bogus transition.
             if (item.state !== "in_progress") return;
+            if (saved) {
+              item.filename = saved.path || saved.filename || item.filename;
+              item.fileSize = item.totalBytes = item.bytesReceived = saved.size || 0;
+              item.mime = saved.mime || "";
+            }
             item.state = "complete"; item.endTime = nowIso();
             dlChanged._emit({ id: id, state: { previous: "in_progress", current: "complete" } });
           };
-          setTimeout(complete, 0); // macrotask: let the caller await the id and register onChanged first
-          // A blob download via window.open needs the page to STAY ALIVE until WebKit
-          // has committed the download. The common popover pattern —
-          // `downloads.download(..., () => window.close())` — closes the page in the
-          // callback and aborts the in-flight download (live: CRX "Download as zip").
-          // Delay the id callback so window.close() runs only after the download has
-          // started. ~350ms is enough for WebKit to take over the blob; the popover
-          // just stays open a beat longer. Non-blob downloads keep the fast path.
-          if (wentViaBlob && typeof cb === "function") {
-            setTimeout(function () { try { cb(id); } catch (e) {} }, 350);
-            // Return the id for promise callers; the cb-delay covers the close race.
-            return typeof Promise !== "undefined" ? new Promise(function (res) { setTimeout(function () { res(id); }, 350); }) : id;
-          }
-          return dual(id, cb);
+          var legacy = function () {
+            // No handler: navigate so WebKit's downloader takes over. blob:/data: go
+            // through forceBlobDownload (WebKit navigates on a bare <a download> for
+            // these; window.open makes it save). No progress signal from WebKit →
+            // complete on the next tick.
+            var wentViaBlob = false;
+            try {
+              if (/^(blob:|data:)/i.test(url) && forceBlobDownload(url, opts.filename)) {
+                wentViaBlob = true;
+              } else if (typeof document !== "undefined" && document.body) {
+                var a = document.createElement("a");
+                a.href = url; if (opts.filename) a.download = opts.filename;
+                document.body.appendChild(a); a.click(); a.remove();
+              } else if (chrome.tabs && chrome.tabs.create) {
+                chrome.tabs.create({ url: url, active: false });
+              }
+            } catch (e) {}
+            setTimeout(function () { complete(null); }, 0);
+            // A blob download via window.open needs the page to STAY ALIVE until
+            // WebKit has committed it; the common popover pattern closes the page in
+            // the callback. ~350ms is enough for WebKit to take over the blob.
+            return wentViaBlob ? 350 : 0;
+          };
+          var settled = hostDownload(url, fname, opts.conflictAction).then(function (saved) {
+            if (saved) { complete(saved); return 0; }
+            return legacy();
+          });
+          var finish = settled.then(function (delay) {
+            return new Promise(function (res) { setTimeout(function () { res(id); }, delay); });
+          });
+          if (typeof cb === "function") { finish.then(function () { try { cb(id); } catch (e) {} }); return; }
+          return finish;
         },
         search: function (q, cb) {
           var out = items.filter(function (it) { return matchItem(it, q); }).map(shallow);

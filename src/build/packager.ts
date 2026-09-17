@@ -157,10 +157,10 @@ export function patchProjectBundleIds(xcodeproj: string, bundleId: string): void
  */
 export function writeNativeHandler(
   xcodeproj: string,
-  opts: { chromeOrigin: string; allowHosts: string[]; nativeMessaging: boolean; brokerPort?: number; brokerToken?: string }
+  opts: { chromeOrigin: string; allowHosts: string[]; nativeMessaging: boolean; downloads?: boolean; brokerPort?: number; brokerToken?: string }
 ): void {
   const { chromeOrigin, allowHosts, nativeMessaging } = opts;
-  if (allowHosts.length === 0 && !nativeMessaging) return;
+  if (allowHosts.length === 0 && !nativeMessaging && !opts.downloads) return;
   const root = xcodeproj.replace(/[^/]+\.xcodeproj$/, "");
   const handlers = findFiles(root, (n) => n === "SafariWebExtensionHandler.swift", 4);
   if (handlers.length === 0) return;
@@ -260,6 +260,54 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling, URLSessio
         }
     }
 
+    // chrome.downloads.download: the shim reads the bytes and hands them here, since
+    // Safari has no downloads API and a navigation displays anything renderable
+    // instead of saving it. The appex holds the sandbox's Downloads entitlement
+    // (ENABLE_FILE_ACCESS_DOWNLOADS_FOLDER), so this writes straight into
+    // ~/Downloads under the requested relative name, uniquified unless the caller
+    // asked to overwrite.
+    func handleDownload(_ context: NSExtensionContext, _ dict: [String: Any]) {
+        guard let b64 = dict["base64"] as? String, let data = Data(base64Encoded: b64) else {
+            self.reply(context, ["error": "download: bad payload"]); return
+        }
+        guard let dir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else {
+            self.reply(context, ["error": "download: no Downloads folder"]); return
+        }
+        let raw = (dict["filename"] as? String) ?? "download"
+        var parts: [String] = []
+        for comp in raw.split(separator: "/") {
+            var c = String(comp).trimmingCharacters(in: .whitespacesAndNewlines)
+            c = c.replacingOccurrences(of: ":", with: "-")
+            if c.isEmpty || c == "." || c == ".." { continue }
+            parts.append(c)
+        }
+        if parts.isEmpty { parts = ["download"] }
+        let name = parts.removeLast()
+        var folder = dir
+        for p in parts { folder = folder.appendingPathComponent(p) }
+        do { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) } catch {
+            self.reply(context, ["error": "download: " + error.localizedDescription]); return
+        }
+        var url = folder.appendingPathComponent(name)
+        if (dict["conflictAction"] as? String) != "overwrite" {
+            let ext = (name as NSString).pathExtension
+            let stem = (name as NSString).deletingPathExtension
+            var n = 1
+            while FileManager.default.fileExists(atPath: url.path) {
+                let candidate = ext.isEmpty ? stem + "-" + String(n) : stem + "-" + String(n) + "." + ext
+                url = folder.appendingPathComponent(candidate)
+                n += 1
+            }
+        }
+        do {
+            try data.write(to: url, options: .atomic)
+            let real = url.resolvingSymlinksInPath() // the sandbox container's Downloads is a symlink to ~/Downloads
+            self.reply(context, ["ok": true, "path": real.path, "filename": real.lastPathComponent, "size": data.count])
+        } catch {
+            self.reply(context, ["error": "download: " + error.localizedDescription])
+        }
+    }
+
     func beginRequest(with context: NSExtensionContext) {
         let item = context.inputItems.first as? NSExtensionItem
         let message: Any?
@@ -271,6 +319,11 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling, URLSessio
 
         guard let dict = message as? [String: Any] else {
             self.reply(context, ["echo": message as Any])
+            return
+        }
+
+        if dict["__c2sDownload"] != nil {
+            self.handleDownload(context, dict)
             return
         }
 
@@ -370,6 +423,26 @@ export function unsandboxAppTarget(xcodeproj: string): void {
   const next = content.replace(
     /ENABLE_APP_SANDBOX = YES;([\s\S]*?PRODUCT_BUNDLE_IDENTIFIER = "?)([\w.\-$()]+)("?;)/g,
     (m, mid, bid, tail) => (bid.endsWith(".Extension") ? m : "ENABLE_APP_SANDBOX = NO;" + mid + bid + tail),
+  );
+  if (next !== content) writeFileSync(pbxproj, next, "utf-8");
+}
+
+/**
+ * Give the APPEX read-write access to ~/Downloads under its sandbox
+ * (com.apple.security.files.downloads.read-write, which Xcode emits for
+ * ENABLE_FILE_ACCESS_DOWNLOADS_FOLDER = readwrite). That is what lets the native
+ * handler save a chrome.downloads.download() as a real file with its filename;
+ * the sandbox stays on, so Safari still registers the extension. Same pairing
+ * trick as unsandboxAppTarget, applied to the ".Extension" blocks only.
+ */
+export function grantDownloadsFolder(xcodeproj: string): void {
+  const pbxproj = join(xcodeproj, "project.pbxproj");
+  if (!existsSync(pbxproj)) return;
+  const content = readFileSync(pbxproj, "utf-8");
+  if (content.includes("ENABLE_FILE_ACCESS_DOWNLOADS_FOLDER")) return;
+  const next = content.replace(
+    /ENABLE_APP_SANDBOX = YES;([\s\S]*?PRODUCT_BUNDLE_IDENTIFIER = "?)([\w.\-$()]+)("?;)/g,
+    (m, mid, bid, tail) => (bid.endsWith(".Extension") ? "ENABLE_APP_SANDBOX = YES;\n\t\t\t\tENABLE_FILE_ACCESS_DOWNLOADS_FOLDER = readwrite;" + mid + bid + tail : m),
   );
   if (next !== content) writeFileSync(pbxproj, next, "utf-8");
 }

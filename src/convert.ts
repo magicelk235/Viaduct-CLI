@@ -20,6 +20,7 @@ import {
   writeNativeHandler,
   writeAppBroker,
   unsandboxAppTarget,
+  grantDownloadsFolder,
   buildXcodeProject,
   verifyBuiltBundleId,
   pluginkitStatus,
@@ -407,10 +408,12 @@ export function convert(opts: ConvertOptions): ConvertResult {
     setBuildVersion(xcodeproj, { short: `1.0.${buildStamp % 10000000}`, build: String(buildStamp) });
 
     // Native handler in the (sandboxed) appex: an out-of-process HTTP proxy (send the
-    // extension's backends the Chrome origin the shim can't set) AND, for native
-    // messaging, a client that forwards to the broker in the container app.
+    // extension's backends the Chrome origin the shim can't set), for native
+    // messaging a client that forwards to the broker in the container app, and for
+    // chrome.downloads the writer that saves a real file into ~/Downloads.
     const usesNativeMessaging = (manifest.permissions ?? []).includes("nativeMessaging");
-    if (proxyHosts.length > 0 || usesNativeMessaging) {
+    const usesDownloads = (manifest.permissions ?? []).includes("downloads") || (manifest.optional_permissions ?? []).includes("downloads");
+    if (proxyHosts.length > 0 || usesNativeMessaging || usesDownloads) {
       // Loopback broker coordinates, baked into BOTH the appex client and the app
       // broker. Derived deterministically from the bundle id (not random) so they
       // always agree even if a stale broker instance from a prior install lingers —
@@ -422,12 +425,15 @@ export function convert(opts: ConvertOptions): ConvertResult {
         chromeOrigin: chromeId ? `chrome-extension://${chromeId}` : "",
         allowHosts: proxyHosts,
         nativeMessaging: usesNativeMessaging,
+        downloads: usesDownloads,
         brokerPort,
         brokerToken,
       });
+      if (usesDownloads) grantDownloadsFolder(xcodeproj);
       const roles = [
         proxyHosts.length > 0 ? `${proxyHosts.length} backend host(s)` : "",
         usesNativeMessaging ? "native-messaging broker client" : "",
+        usesDownloads ? "downloads writer (appex granted ~/Downloads)" : "",
       ].filter(Boolean).join(" + ");
       ok(`Native handler wired: ${roles}`);
       if (usesNativeMessaging) {
