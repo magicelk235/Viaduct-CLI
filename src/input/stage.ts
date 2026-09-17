@@ -326,6 +326,34 @@ export function rewriteChromeSchemeLiterals(stageDir: string): number {
   return modified;
 }
 
+// Safari's runtime.sendNativeMessage/connectNative cannot be overridden in JS:
+// they are custom-value slots (assignment, defineProperty and delete all report
+// success and the native reads back), runtime itself is the same kind of slot on
+// the root, and the one binding that IS reassignable, the global chrome/browser,
+// must stay native or WebKit skips the frame at message dispatch (Safari Quirks
+// E15). So the shim publishes its native-messaging bridge under two NEW members
+// the extensible native runtime accepts, and the bundle's call sites are pointed
+// at them here. Token substitution on the `.method(` form; a destructured or
+// bracket-accessed call is left alone and reaches Safari's native slot.
+const NATIVE_MESSAGING_CALL_RE = /\.(connectNative|sendNativeMessage)\s*\(/g;
+
+export function rewriteNativeMessagingCalls(stageDir: string): number {
+  let modified = 0;
+  for (const file of walkScripts(stageDir)) {
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    if (!NATIVE_MESSAGING_CALL_RE.test(content)) continue;
+    NATIVE_MESSAGING_CALL_RE.lastIndex = 0;
+    writeFileSync(file, content.replace(NATIVE_MESSAGING_CALL_RE, (_m, name: string) => `.__viaduct${name[0].toUpperCase()}${name.slice(1)}(`), "utf-8");
+    modified++;
+  }
+  return modified;
+}
+
 // `chrome-extension://__MSG_@@extension_id__/…` is how a bundle points at its own
 // files from CSS (and from markup), because the browser resolves @@extension_id at
 // load time. Safari DOES substitute the placeholder — with the per-install UUID —

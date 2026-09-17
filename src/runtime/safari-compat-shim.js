@@ -5792,21 +5792,24 @@ var __C2S_DEBUG__ = false;
   // (live: ChatGPT/Codex, whose side panel is dead until its local app server —
   // reached via connectNative("com.openai.codexextension") — connects).
   //
-  // Only a context that already has runtime.sendNativeMessage (the background page)
-  // can talk to the handler; every bundle we've seen holds the native port there and
-  // relays to other contexts itself, so patching the background is sufficient.
+  // Safari's runtime.sendNativeMessage/connectNative are custom-value slots: they
+  // read back the native no matter what assignment, defineProperty or delete
+  // report, and runtime itself is the same kind of slot on the root. The only
+  // reassignable binding is the global chrome/browser, and republishing that as a
+  // Proxy is what this block used to do, which detached every converted
+  // background from message dispatch (Safari Quirks E15: WebKit resolves delivery
+  // through the frame's global at dispatch time and skips a non-native one).
+  // So the bridge is exposed under two NEW members the extensible native object
+  // accepts, runtime.__viaductSendNativeMessage / __viaductConnectNative, and
+  // rewriteNativeMessagingCalls (stage.ts) points the bundle's `.connectNative(` /
+  // `.sendNativeMessage(` call sites at them at conversion time. Installed in
+  // every extension context that has sendNativeMessage (all Safari extension
+  // pages do), so a rewritten call in a popup or panel resolves too.
   (function () {
     function installNM(root) {
       if (!root || root.__c2sNMWrapped) return;
-      if (typeof Proxy === "undefined") return;
       var rt = root.runtime;
       if (!rt || typeof rt.sendNativeMessage !== "function") return; // not an extension context
-      // Only the background page needs the native-messaging bridge, and republishing
-      // chrome/browser as a Proxy in a popover/panel clobbers the webextension-polyfill's
-      // messaging (breaking popover→bg sendMessage). sendNativeMessage exists on all
-      // Safari extension pages, so gate on the actual background document.
-      var __p = (typeof location !== "undefined" && location.pathname) || "";
-      if (__p && !/background\.html$/.test(__p)) return;
       var realSend = rt.sendNativeMessage.bind(rt);
       // Round-trip an envelope to the containing-app handler → Promise<reply>.
       function callHost(env) {
@@ -5905,25 +5908,10 @@ var __C2S_DEBUG__ = false;
           function (e) { shut((e && e.message) || e); });
         return port;
       };
-      // Safari's runtime.sendNativeMessage/connectNative are non-replaceable exotic
-      // slots — assignment throws under "use strict" and defineProperty silently
-      // no-ops (both proven live). So wrap runtime + root in a Proxy and republish the
-      // globals: the bundle's chrome.runtime.* now reads our overrides while every
-      // other member passes through (bound) to the real object.
-      var rtProxy = new Proxy(rt, {
-        get: function (t, p) {
-          if (p === "sendNativeMessage") return __c2sSend;
-          if (p === "connectNative") return __c2sConnect;
-          var v = t[p];
-          return (typeof v === "function") ? v.bind(t) : v;
-        },
-      });
-      var rootProxy = new Proxy(root, {
-        get: function (t, p) { return p === "runtime" ? rtProxy : t[p]; },
-      });
-      __publishGlobal("chrome", rootProxy);
-      __publishGlobal("browser", rootProxy);
-      try { root.__c2sNMWrapped = true; } catch (e) {}
+      var tookSend = installOverride(rt, "__viaductSendNativeMessage", __c2sSend);
+      var tookConnect = installOverride(rt, "__viaductConnectNative", __c2sConnect);
+      dbg("[c2s] native-messaging bridge installed send=" + tookSend + " connect=" + tookConnect);
+      if (tookSend || tookConnect) { try { root.__c2sNMWrapped = true; } catch (e) {} }
     }
     try { installNM(typeof chrome !== "undefined" ? chrome : (typeof browser !== "undefined" ? browser : null)); } catch (e) {}
   })();

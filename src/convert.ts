@@ -6,7 +6,7 @@ import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
 import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths, raiseMinVersionForMainWorld, MAIN_WORLD_MIN_SAFARI_VERSION } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
-import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteExtensionOriginFromRuntimeId, rewriteChromeSchemeLiterals, rewriteExtensionIdPlaceholderUrls, guardAncestorOriginsAccess, guardGeckoSettingsAccess, rewriteSelfPageExtensionUrls, rewriteBackgroundContextChecks, idempotentContentScriptGlobals, guardLocaleTailMessage } from "./input/stage.js";
+import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteExtensionOriginFromRuntimeId, rewriteChromeSchemeLiterals, rewriteNativeMessagingCalls, rewriteExtensionIdPlaceholderUrls, guardAncestorOriginsAccess, guardGeckoSettingsAccess, rewriteSelfPageExtensionUrls, rewriteBackgroundContextChecks, idempotentContentScriptGlobals, guardLocaleTailMessage } from "./input/stage.js";
 import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireUserScriptsContentScript, wireCdpKeepalive, deriveProxyHosts } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
@@ -164,6 +164,13 @@ export function convert(opts: ConvertOptions): ConvertResult {
     // whose templates carry chrome-extension:// on purpose.
     const reschemed = rewriteChromeSchemeLiterals(stageDir);
     if (reschemed > 0) ok(`Rewrote chrome-extension: scheme literals in ${reschemed} script(s)`);
+
+    // Safari's runtime.connectNative/sendNativeMessage slots cannot be overridden
+    // in JS and the global root must stay native for message dispatch, so the
+    // shim's native-messaging bridge lives under runtime.__viaductConnectNative /
+    // __viaductSendNativeMessage and the bundle's call sites are pointed at it.
+    const renatived = rewriteNativeMessagingCalls(stageDir);
+    if (renatived > 0) ok(`Routed native-messaging calls through the shim bridge in ${renatived} script(s)`);
 
     // The scheme rewrite above skips `chrome-extension://${id}/…` (could be an OAuth
     // redirect_uri). But when that literal is the WHOLE URL of a self-page navigation
