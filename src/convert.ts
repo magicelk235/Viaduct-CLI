@@ -1,5 +1,5 @@
-import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve, basename, sep } from "node:path";
 import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
@@ -7,7 +7,7 @@ import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths, raiseMinVersionForMainWorld, MAIN_WORLD_MIN_SAFARI_VERSION } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
 import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteExtensionOriginFromRuntimeId, rewriteChromeSchemeLiterals, rewriteNativeMessagingCalls, rewriteExtensionIdPlaceholderUrls, guardAncestorOriginsAccess, guardGeckoSettingsAccess, rewriteSelfPageExtensionUrls, rewriteBackgroundContextChecks, idempotentContentScriptGlobals, guardLocaleTailMessage } from "./input/stage.js";
-import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireUserScriptsContentScript, wireCdpKeepalive, deriveProxyHosts } from "./runtime/shim.js";
+import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireUserScriptsContentScript, wireCdpKeepalive, deriveProxyHosts, DEBUG_RPC_TOKEN_FILENAME } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
 import { synthesizePlaceholderIcons } from "./input/icons.js";
@@ -228,13 +228,21 @@ export function convert(opts: ConvertOptions): ConvertResult {
     if (opts.generateShim) {
       polyfillFile = writePolyfill(stageDir);
       if (polyfillFile) ok("Bundled webextension-polyfill (browser.* promises on all browsers)");
+      // A --debug build also carries the RPC bridge (debug-rpc.js). Its token is
+      // minted per conversion and written next to the report, so only a page
+      // that reads it off this machine can drive the extension.
+      const debugRpcToken = opts.debug ? randomBytes(16).toString("hex") : undefined;
       shimFile = writeShim(stageDir, {
         chromeOrigin: chromeId ? `chrome-extension://${chromeId}` : "",
         proxyHosts,
         cdp: needsCdpShim,
         debug: opts.debug === true,
+        debugRpcToken,
       });
-      if (opts.debug) ok("Debug build: shim tracing on, persisted to storage.local __viaduct_debug_log__ (read with viaduct --logs) — don't ship this build");
+      if (debugRpcToken) {
+        writeFileSync(join(outputDir, DEBUG_RPC_TOKEN_FILENAME), debugRpcToken + "\n", "utf-8");
+        ok(`Debug build: shim tracing on, persisted to storage.local __viaduct_debug_log__ (read with viaduct --logs); RPC bridge token in ${DEBUG_RPC_TOKEN_FILENAME} — don't ship this build`);
+      }
       const n = injectShimIntoHtmlPages(stageDir, polyfillFile);
       if (n > 0) ok(`Shim${polyfillFile ? " + polyfill" : ""} injected into ${n} HTML page(s)`);
       if (needsCdpShim) ok("chrome.debugger detected \u2192 enabled CDP emulation shim (kept scripting + <all_urls>)");

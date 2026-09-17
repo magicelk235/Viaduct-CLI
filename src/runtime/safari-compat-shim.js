@@ -7486,6 +7486,8 @@ var __C2S_DEBUG__ = false;
     } catch (e) { /* never let this cost the page */ }
   }
 
+  // __C2S_DEBUG_RPC__
+
   } catch (__shimErr) {
     // A block threw despite its own guards (almost always a write to a frozen
     // Safari native). Swallow so the prepended host script still runs; surface in

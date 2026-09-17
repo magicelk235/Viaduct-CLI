@@ -19,10 +19,14 @@ export const SW_LIFECYCLE_FILENAME = "viaduct-sw-lifecycle.js";
 export const ACTION_HOTKEY_FILENAME = "__viaduct-hotkey.js";
 export const USERSCRIPTS_CS_FILENAME = "__viaduct-userscripts.js";
 export const CDP_KEEPALIVE_FILENAME = "viaduct-cdp-keepalive.js";
-// Spliced into the shim by shimSource() for --debug conversions only (it never
-// stages as its own file): the persistent ring-buffer logger behind the
-// __C2S_DEBUG__ gate.
+// Spliced into the shim by shimSource() for --debug conversions only (they never
+// stage as their own files): the persistent ring-buffer logger behind the
+// __C2S_DEBUG__ gate, and the token-gated RPC bridge that lets a page drive the
+// extension headlessly (see debug-rpc.js).
 export const DEBUG_RING_FILENAME = "debug-ring.js";
+export const DEBUG_RPC_FILENAME = "debug-rpc.js";
+/** Where convert() leaves a --debug build's RPC token: next to CONVERSION_REPORT.md. */
+export const DEBUG_RPC_TOKEN_FILENAME = "debug-rpc.token";
 
 /**
  * Copy the bundled webextension-polyfill into the staged extension so Chrome code
@@ -84,6 +88,9 @@ export interface ShimConfig {
    *  flipped on and the persistent ring-buffer logger spliced in (viaduct --debug).
    *  Default off — the release shim carries no ring-buffer write path at all. */
   debug?: boolean;
+  /** Token gating the --debug RPC bridge (debug-rpc.js). Only spliced in when
+   *  `debug` is on AND a token is given; a debug build without one has no bridge. */
+  debugRpcToken?: string;
 }
 
 export function shimSource(config: ShimConfig = {}): string {
@@ -110,6 +117,11 @@ export function shimSource(config: ShimConfig = {}): string {
     runtime = runtime
       .split("var __C2S_DEBUG__ = false;").join("var __C2S_DEBUG__ = true;")
       .split("// __C2S_DEBUG_RING__").join(readFileSync(join(RUNTIME_DIR, DEBUG_RING_FILENAME), "utf-8"));
+    if (config.debugRpcToken) {
+      const rpc = readFileSync(join(RUNTIME_DIR, DEBUG_RPC_FILENAME), "utf-8")
+        .split("__C2S_DEBUG_RPC_TOKEN_JSON__").join(JSON.stringify(config.debugRpcToken));
+      runtime = runtime.split("// __C2S_DEBUG_RPC__").join(rpc);
+    }
   }
   // split/join = global replace; the placeholder appears once today, but a stray
   // second occurrence must not survive as invalid JS (matches oauth-bridge.ts).

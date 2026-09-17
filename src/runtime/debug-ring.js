@@ -122,6 +122,23 @@ var __C2S_DEBUG_WRITE__ = (function () {
         });
       }
     } catch (e) {}
+    // The extension's own caught failures usually end in console.error/warn, and
+    // those are just as unreachable in a popover or a suspended background. Tee
+    // them too (the shim's own dbg() goes to console.log, which stays untouched).
+    try {
+      if (typeof console !== "undefined") {
+        ["error", "warn"].forEach(function (level) {
+          var orig = console[level];
+          if (typeof orig !== "function" || orig.__c2sRingTee) return;
+          var teed = function () {
+            try { write(["[console." + level + "]"].concat(Array.prototype.slice.call(arguments))); } catch (e) {}
+            return orig.apply(console, arguments);
+          };
+          teed.__c2sRingTee = true;
+          console[level] = teed;
+        });
+      }
+    } catch (e) {}
     return write;
   } catch (e) {
     return function () {};
