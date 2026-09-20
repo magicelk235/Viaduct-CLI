@@ -7,16 +7,20 @@ import type { Manifest } from "../types.js";
 
 /**
  * Apple's packager bakes the extension icon onto an opaque white squircle in
- * AppIcon.appiconset, so the Dock/Finder icon stays white in Dark Mode. Icon
- * Composer bundles (`AppIcon.icon`, Xcode 26+) carry per-appearance fills that
- * the system picks at render time, and Xcode still renders a flat fallback
- * from the same bundle for macOS < 26. This module writes one next to every
- * asset catalog the project has and wires it into the pbxproj; the appiconset
- * stays as-is since Xcode prefers the .icon when both share the AppIcon name.
+ * AppIcon.appiconset, so the Dock/Finder icon stays white whatever icon style
+ * the user picked. An Icon Composer bundle (`AppIcon.icon`, Xcode 26+) is a
+ * fill plus layers, and the system renders every icon style from it at draw
+ * time: Default uses the fill as authored, Dark swaps in the system dark plate,
+ * Clear and Tinted go mono. Authoring only the light fill is what makes the
+ * derived variants match Apple's own icons pixel for pixel (an explicit `dark`
+ * fill specialization renders lighter than the system plate on macOS 27).
+ * Xcode still renders a flat fallback from the same bundle for macOS < 26.
+ * This module writes one next to every asset catalog the project has and
+ * wires it into the pbxproj; the appiconset stays as-is since Xcode prefers
+ * the .icon when both share the AppIcon name.
  */
 
-const LIGHT_FILL = "extended-srgb:1.00000,1.00000,1.00000,1.00000";
-const DARK_FILL = "extended-srgb:0.14000,0.14000,0.15000,1.00000";
+const WHITE = "extended-srgb:1.00000,1.00000,1.00000,1.00000";
 // Icon Composer's canvas is 1024pt and a layer image renders at its native pixel
 // size, so the glyph's scale must be derived from the source dimensions.
 const CANVAS = 1024;
@@ -172,14 +176,11 @@ export function iconComposerJson(imageName: string, size: { width: number; heigh
   if (invertInDark) {
     layer["fill-specializations"] = [
       { value: "automatic" },
-      { appearance: "dark", value: { solid: LIGHT_FILL } },
+      { appearance: "dark", value: { solid: WHITE } },
     ];
   }
   const doc = {
-    "fill-specializations": [
-      { value: { "automatic-gradient": LIGHT_FILL } },
-      { appearance: "dark", value: { "automatic-gradient": DARK_FILL } },
-    ],
+    fill: { "automatic-gradient": WHITE },
     groups: [
       {
         layers: [layer],

@@ -181,12 +181,10 @@ test("icon.json scales the layer from its pixel size and only adds a dark glyph 
   const unknown = JSON.parse(iconComposerJson("icon.svg", null, false));
   assert.equal(unknown.groups[0].layers[0].position.scale, 0.8);
 
-  // Plate: light by default, dark under the dark appearance.
-  const fills = small["fill-specializations"];
-  assert.equal(fills.length, 2);
-  assert.equal(fills[0].appearance, undefined);
-  assert.equal(fills[1].appearance, "dark");
-  assert.notEqual(fills[0].value["automatic-gradient"], fills[1].value["automatic-gradient"]);
+  // Plate: one light fill only. The system derives Dark/Clear/Tinted from it;
+  // an authored `dark` fill renders lighter than the system plate on macOS 27.
+  assert.ok(small.fill["automatic-gradient"].startsWith("extended-srgb:1.00000,1.00000,1.00000"));
+  assert.equal(small["fill-specializations"], undefined);
 
   // Glyph keeps its own colors unless inversion was requested.
   assert.equal(small.groups[0].layers[0]["fill-specializations"], undefined);
