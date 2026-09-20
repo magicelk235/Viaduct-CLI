@@ -28,6 +28,7 @@ import {
   defaultBundleId,
   deriveAppName,
 } from "./build/packager.js";
+import { xcodeMajorVersion, sourceIconFor, glyphStats, invertsInDark, writeAppearanceAwareIcon } from "./build/appicon.js";
 import { printIssues, countBlocking, writeReportFile } from "./analyze/report.js";
 import { info, ok, warn, fail, moveBundle, run } from "./util.js";
 
@@ -406,6 +407,16 @@ export function convert(opts: ConvertOptions): ConvertResult {
     // VERSION), which the packager hardcodes to 1.0 → stale JS survives reinstalls.
     const buildStamp = Math.floor(Date.now() / 1000);
     setBuildVersion(xcodeproj, { short: `1.0.${buildStamp % 10000000}`, build: String(buildStamp) });
+
+    // The packager bakes the icon onto a white plate, so the Dock icon stays white in
+    // Dark Mode. Xcode 26+ compiles an Icon Composer bundle with per-appearance fills
+    // (and renders the legacy fallback from it), so hand it the extension's own glyph.
+    const iconSource = sourceIconFor(transformed, stageDir);
+    if (iconSource && (xcodeMajorVersion() ?? 0) >= 26) {
+      const invert = iconSource.toLowerCase().endsWith(".png") && invertsInDark(glyphStats(iconSource));
+      const bundles = writeAppearanceAwareIcon(xcodeproj, iconSource, invert);
+      if (bundles.length > 0) ok(`App icon follows the system appearance (AppIcon.icon${invert ? ", dark glyph repainted white in Dark Mode" : ""})`);
+    }
 
     // Native handler in the (sandboxed) appex: an out-of-process HTTP proxy (send the
     // extension's backends the Chrome origin the shim can't set), for native
