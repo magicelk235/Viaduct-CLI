@@ -173,13 +173,13 @@ test("imageSize reads PNG IHDR and SVG viewBox or width/height", () => {
 
 test("icon.json scales the layer from its pixel size and only adds a dark glyph fill when asked", () => {
   // Layers render at native pixel size on a 1024pt canvas: a 128px glyph needs
-  // scale ×8 to fill the canvas, times the 0.72 plate fraction.
+  // scale ×8 to fill the canvas, times the 0.8 plate fraction.
   const small = JSON.parse(iconComposerJson("icon.png", { width: 128, height: 128 }, false));
-  assert.equal(small.groups[0].layers[0].position.scale, 5.76);
+  assert.equal(small.groups[0].layers[0].position.scale, 6.4);
   const wide = JSON.parse(iconComposerJson("icon.png", { width: 1024, height: 512 }, false));
-  assert.equal(wide.groups[0].layers[0].position.scale, 0.72);
+  assert.equal(wide.groups[0].layers[0].position.scale, 0.8);
   const unknown = JSON.parse(iconComposerJson("icon.svg", null, false));
-  assert.equal(unknown.groups[0].layers[0].position.scale, 0.72);
+  assert.equal(unknown.groups[0].layers[0].position.scale, 0.8);
 
   // Plate: light by default, dark under the dark appearance.
   const fills = small["fill-specializations"];

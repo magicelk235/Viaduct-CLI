@@ -20,9 +20,10 @@ const DARK_FILL = "extended-srgb:0.14000,0.14000,0.15000,1.00000";
 // Icon Composer's canvas is 1024pt and a layer image renders at its native pixel
 // size, so the glyph's scale must be derived from the source dimensions.
 const CANVAS = 1024;
-// Glyph footprint inside the squircle. Matches the packager's composite, where
-// the icon spans ~75% of the visible plate.
-const GLYPH_FRACTION = 0.72;
+// Glyph footprint inside the squircle. macOS 27 icons run the artwork out to
+// ~80% of the plate (Apple's own Calculator: 636px layer at scale 1.3 on 1024);
+// the packager's legacy composite used ~75%.
+const GLYPH_FRACTION = 0.8;
 
 /**
  * Pixel size of a PNG (IHDR) or SVG (viewBox, else width/height). Null when the
@@ -183,8 +184,9 @@ export function iconComposerJson(imageName: string, size: { width: number; heigh
       {
         layers: [layer],
         shadow: { kind: "neutral", opacity: 0.5 },
-        // Off: the glass tint washes brand colors toward the plate color.
-        translucency: { enabled: false, value: 0.5 },
+        // Light glass tint, the value current macOS 27 icons ship with. 0.5 (Icon
+        // Composer's default) visibly washes brand colors toward the plate.
+        translucency: { enabled: true, value: 0.3 },
       },
     ],
     "supported-platforms": { circles: ["watchOS"], squares: "shared" },
