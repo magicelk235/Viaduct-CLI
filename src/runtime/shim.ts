@@ -91,6 +91,10 @@ export interface ShimConfig {
   /** Token gating the --debug RPC bridge (debug-rpc.js). Only spliced in when
    *  `debug` is on AND a token is given; a debug build without one has no bridge. */
   debugRpcToken?: string;
+  /** Query parameters the side-panel document writes into its own URL at boot when
+   *  they are absent (`mode=window`). Same slot the shim uses for `?tabId=`, applied
+   *  synchronously before the page's scripts run. Empty/omitted → nothing written. */
+  panelQuery?: string;
 }
 
 export function shimSource(config: ShimConfig = {}): string {
@@ -107,6 +111,7 @@ export function shimSource(config: ShimConfig = {}): string {
     origin: config.chromeOrigin || "",
     hosts: config.proxyHosts || [],
     cdp: config.cdp !== false,
+    panelQuery: config.panelQuery || "",
   }).replace(/[\u2028\u2029]/g, (c) => c === "\u2028" ? "\\u2028" : "\\u2029");
   let runtime = readFileSync(join(RUNTIME_DIR, SHIM_FILENAME), "utf-8");
   // --debug emit: flip the compiled-in trace gate and splice the ring-buffer

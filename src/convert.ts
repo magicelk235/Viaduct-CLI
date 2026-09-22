@@ -240,7 +240,9 @@ export function convert(opts: ConvertOptions): ConvertResult {
         cdp: needsCdpShim,
         debug: opts.debug === true,
         debugRpcToken,
+        panelQuery: opts.panelQuery,
       });
+      if (opts.panelQuery) ok(`Side-panel page opens with ?${opts.panelQuery.replace(/^\?/, "")} (--panel-query)`);
       if (debugRpcToken) {
         writeFileSync(join(outputDir, DEBUG_RPC_TOKEN_FILENAME), debugRpcToken + "\n", "utf-8");
         ok(`Debug build: shim tracing on, persisted to storage.local __viaduct_debug_log__ (read with viaduct --logs); RPC bridge token in ${DEBUG_RPC_TOKEN_FILENAME} — don't ship this build`);

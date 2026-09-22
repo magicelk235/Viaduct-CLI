@@ -94,6 +94,11 @@ export interface ConvertOptions {
   /** Emit the shim with debug tracing enabled and the persistent ring-buffer
    *  logger installed (viaduct --debug). Dev builds only. */
   debug?: boolean;
+  /** Query string written into the side-panel page's URL when Safari opens it
+   *  (`mode=window`). Chrome opens a side panel with no query; an extension that
+   *  branches on one its own code adds (a detached "window" mode of the panel) can
+   *  be pointed at that branch when the default one cannot work in Safari. */
+  panelQuery?: string;
   /** Copy the built app into ~/Applications and register it with Safari. */
   install: boolean;
   /** Override the install target dir (default ~/Applications). */

@@ -25,7 +25,7 @@ const CONFIG_KEYS = [
   "output", "bundle-id", "app-name", "min-safari", "platforms", "ci",
   "zip", "no-build", "open-xcode", "install", "install-dir",
   "no-safari-restart", "background-launch", "team", "no-shim", "no-oauth-bridge", "keep-module",
-  "force", "strict", "verify", "clean", "debug",
+  "panel-query", "force", "strict", "verify", "clean", "debug",
 ] as const;
 
 // Boolean-typed config keys (mirror the `type: "boolean"` entries in parseArgs). A
@@ -171,6 +171,11 @@ OPTIONS
       --no-shim             Do not generate/inject the compatibility shim
       --no-oauth-bridge     Do not wire the Safari OAuth/externally_connectable bridge
       --keep-module         Keep background.type:"module" (default strips it)
+      --panel-query <q>     Query string the side-panel page gets when Safari opens it
+                            (e.g. mode=window). Chrome opens a side panel with none; use
+                            this to select a branch the panel's own code keys on, such as
+                            its detached-window mode, when the default one cannot work in
+                            Safari. Keys the URL already carries are left alone.
       --debug               Emit the shim with debug tracing enabled. Traces persist to a
                             bounded ring buffer (last 2000 entries, batched writes) in
                             storage.local under __viaduct_debug_log__ — read it live from
@@ -354,6 +359,7 @@ async function main(): Promise<void> {
         "no-shim": { type: "boolean", default: false },
         "no-oauth-bridge": { type: "boolean", default: false },
         "keep-module": { type: "boolean", default: false },
+        "panel-query": { type: "string" },
         debug: { type: "boolean", default: false },
         logs: { type: "string" },
         force: { type: "boolean", default: false },
@@ -639,6 +645,7 @@ async function main(): Promise<void> {
         openXcode: values["open-xcode"],
         keepModuleBackground: values["keep-module"],
         debug: values.debug,
+        panelQuery: values["panel-query"],
       });
     } catch (e) {
       fail((e as Error).message);

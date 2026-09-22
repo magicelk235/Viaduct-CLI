@@ -7531,6 +7531,26 @@ var __C2S_DEBUG__ = false;
     } catch (e) { return false; }
   };
   if (typeof window !== "undefined" && typeof location !== "undefined" && c2sIsPanelDoc()) {
+    // Build-configured query for the side-panel page (viaduct --panel-query), written
+    // before the page's own scripts run so a value read at first render sees it.
+    // Chrome opens a side panel with no query, but an extension can open the same
+    // page itself with one — a detached "window" mode, `sidepanel.html?mode=window`
+    // — and branch on it. When the branch a bare URL selects cannot work in Safari
+    // (Claude in Chrome 1.0.94: an embed of claude.ai that the site's
+    // frame-ancestors refuses, see the blocked-frame explainer below), the other
+    // branch is the panel that works, and this is the only way to select it since
+    // the popover URL is the manifest's default_popup verbatim. Only keys the URL
+    // does not already carry are written; a query the extension put there wins.
+    try {
+      var c2sPanelQuery = (__C2S_PROXY_CONFIG__ && typeof __C2S_PROXY_CONFIG__.panelQuery === "string") ? __C2S_PROXY_CONFIG__.panelQuery : "";
+      if (c2sPanelQuery && c2sIsSidePanelDoc()) {
+        var c2sPqUrl = new URL(location.href), c2sPqAdded = 0;
+        new URLSearchParams(c2sPanelQuery).forEach(function (v, k) {
+          if (!c2sPqUrl.searchParams.has(k)) { c2sPqUrl.searchParams.set(k, v); c2sPqAdded++; }
+        });
+        if (c2sPqAdded) { history.replaceState(history.state, "", c2sPqUrl.toString()); dbg("[c2s] panel query applied: " + c2sPanelQuery); }
+      }
+    } catch (e) {}
     try {
       var hasParam = !!new URLSearchParams(location.search).get("tabId");
       if (!hasParam && c2sIsSidePanelDoc()) {
