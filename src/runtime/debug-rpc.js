@@ -228,6 +228,18 @@
               return out;
             }
             case "eval": return (0, eval)(String(req.code || ""));
+            case "fetch": {
+              // A request issued from THIS context, with its origin, cookies and CSP,
+              // unwrapped to what crosses the bridge as JSON: `eval` is refused by the
+              // extension CSP and a Response serialises to `{}`. Answers "does a fetch
+              // from the extension origin carry the site's cookies / pass its CSRF gate".
+              return fetch(String(req.url), req.init || {}).then(function (resp) {
+                var h = {}; try { resp.headers.forEach(function (v, k) { h[k] = v; }); } catch (e) {}
+                return resp.text().then(function (body) {
+                  return { status: resp.status, type: resp.type, redirected: resp.redirected, url: resp.url, headers: h, length: body.length, body: body.slice(0, Number(req.limit) > 0 ? Number(req.limit) : 400) };
+                });
+              });
+            }
             case "describe": {
               // Where a property lives and whether it can be overridden: own vs
               // inherited, data vs accessor, writable/configurable, the parent's
