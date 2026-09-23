@@ -173,6 +173,61 @@ export function deriveProxyHosts(manifest: Manifest): string[] {
   return [...hosts];
 }
 
+/** The query the extension itself puts on its side-panel page when it opens that
+ *  page as a standalone window, read off the bundle. Chrome opens a docked side panel
+ *  with no query, and an extension that also has a detached form opens the same page
+ *  through `windows.create({url: "<panel>?mode=window…"})` and branches on the
+ *  query at first render. Safari has no docked panel: viaduct shows the page as a
+ *  popover, which is a standalone window, so the window form is the one that
+ *  matches, and for a panel whose docked form embeds something Safari cannot frame
+ *  (Claude in Chrome 1.0.94, see the blocked-frame explainer) it is the form that works.
+ *
+ *  Only the literal head of the URL, up to the first interpolation, counts, and only
+ *  complete `key=value` pairs in it: `sidepanel.html?mode=window&sessionId=${id}`
+ *  yields `mode=window`, while a permission popup opened as
+ *  `sidepanel.html?tabId=${t}&mcpPermissionOnly=true` yields nothing, since its head
+ *  ends in a dynamic value and the constant after it is not the page's mode. Several
+ *  sites with different heads make the choice ambiguous and nothing is derived.
+ *  Generic: driven by the manifest's `side_panel.default_path` and the bundle's own
+ *  calls, no extension named. */
+export function derivePanelWindowQuery(dir: string, manifest: Manifest): string {
+  // The page is identified the way the shim's panel-doc block identifies it at
+  // runtime: the manifest's side_panel path when declared, else a `sidepanel` file
+  // name (Claude in Chrome declares none and sets its path through setOptions).
+  // A query derived here is only ever applied to a document that test recognises.
+  const sp: unknown = "side_panel" in manifest ? manifest.side_panel : undefined;
+  const declared = sp && typeof sp === "object" && "default_path" in sp && typeof sp.default_path === "string"
+    ? sp.default_path.split(/[#?]/)[0].replace(/^\/+/, "").split("/").pop() ?? ""
+    : "";
+  const page = declared
+    ? declared.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    : "[A-Za-z0-9_-]*[sS]ide[_-]?[pP]anel[A-Za-z0-9_-]*\\.html";
+  // The URL literal is usually built just before `windows.create(` (a getURL call
+  // assigned to a variable) or inline in its argument; look on both sides.
+  const head = new RegExp("(?:^|[^A-Za-z0-9_.-])" + page + "\\?([A-Za-z0-9_\\-=&%.]*)");
+  const counts = new Map<string, number>();
+  for (const f of walkScripts(dir)) {
+    let src: string;
+    try { src = readFileSync(f, "utf-8"); } catch { continue; }
+    let at = 0;
+    for (;;) {
+      const i = src.indexOf("windows.create(", at);
+      if (i < 0) break;
+      at = i + 15;
+      const m = head.exec(src.slice(Math.max(0, i - 600), i + 600));
+      if (!m) continue;
+      const pairs = m[1].split("&").filter((kv) => /^[A-Za-z0-9_-]+=[A-Za-z0-9_%.-]+$/.test(kv));
+      if (pairs.length === 0) continue;
+      const q = pairs.join("&");
+      counts.set(q, (counts.get(q) ?? 0) + 1);
+    }
+  }
+  if (counts.size === 0) return "";
+  const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  if (ranked.length > 1 && ranked[0][1] === ranked[1][1]) return "";
+  return ranked[0][0];
+}
+
 /**
  * Index just past the first REAL `<head ...>` tag, skipping any `<head>` that
  * sits inside an HTML comment (`<!-- <head> -->`). Injecting a <script> after a

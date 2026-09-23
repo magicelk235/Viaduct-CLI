@@ -310,12 +310,11 @@ single-extension flags and are rejected here.
     --no-shim            Do not generate/inject the compatibility shim
     --no-oauth-bridge    Do not wire the Safari OAuth/externally_connectable bridge
     --keep-module        Keep background.type:"module" (default strips it)
-    --panel-query <q>    Query string the side-panel page gets when Safari opens
-                         it (e.g. mode=window). Chrome opens a side panel with
-                         none; use this to select a branch the panel's own code
-                         keys on, such as its detached-window mode, when the
-                         default one cannot work in Safari (Claude in Chrome
-                         1.0.94: --panel-query mode=window)
+    --panel-query <q>    Override the query the side-panel page gets when Safari
+                         opens it as a popover. By default it is derived from the
+                         bundle: the query the extension itself uses to open that
+                         page as a standalone window (e.g. mode=window), since a
+                         popover is one. Pass "" to open the page bare.
     --debug              Emit the shim with debug tracing enabled. Traces persist
                          to a bounded ring buffer (last 2000 entries) in
                          storage.local under __viaduct_debug_log__; read it with

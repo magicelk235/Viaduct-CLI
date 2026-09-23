@@ -7,7 +7,7 @@ import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths, raiseMinVersionForMainWorld, MAIN_WORLD_MIN_SAFARI_VERSION } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
 import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteExtensionOriginFromRuntimeId, rewriteChromeSchemeLiterals, rewriteNativeMessagingCalls, rewriteExtensionIdPlaceholderUrls, guardAncestorOriginsAccess, guardGeckoSettingsAccess, rewriteSelfPageExtensionUrls, rewriteBackgroundContextChecks, idempotentContentScriptGlobals, guardLocaleTailMessage } from "./input/stage.js";
-import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireUserScriptsContentScript, wireCdpKeepalive, deriveProxyHosts, DEBUG_RPC_TOKEN_FILENAME } from "./runtime/shim.js";
+import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireUserScriptsContentScript, wireCdpKeepalive, deriveProxyHosts, derivePanelWindowQuery, DEBUG_RPC_TOKEN_FILENAME } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
 import { synthesizePlaceholderIcons } from "./input/icons.js";
@@ -234,15 +234,21 @@ export function convert(opts: ConvertOptions): ConvertResult {
       // minted per conversion and written next to the report, so only a page
       // that reads it off this machine can drive the extension.
       const debugRpcToken = opts.debug ? randomBytes(16).toString("hex") : undefined;
+      // The query the panel page gets when Safari opens it as a popover: the one the
+      // extension itself uses for the page's standalone-window form, read off the
+      // bundle, unless --panel-query says otherwise.
+      const derivedPanelQuery = opts.panelQuery === undefined ? derivePanelWindowQuery(stageDir, manifest) : "";
+      const panelQuery = opts.panelQuery ?? derivedPanelQuery;
       shimFile = writeShim(stageDir, {
         chromeOrigin: chromeId ? `chrome-extension://${chromeId}` : "",
         proxyHosts,
         cdp: needsCdpShim,
         debug: opts.debug === true,
         debugRpcToken,
-        panelQuery: opts.panelQuery,
+        panelQuery,
       });
       if (opts.panelQuery) ok(`Side-panel page opens with ?${opts.panelQuery.replace(/^\?/, "")} (--panel-query)`);
+      else if (derivedPanelQuery) ok(`Side-panel page opens with ?${derivedPanelQuery}, the query the extension uses for the page's own window mode (Safari shows a side panel as a standalone popover)`);
       if (debugRpcToken) {
         writeFileSync(join(outputDir, DEBUG_RPC_TOKEN_FILENAME), debugRpcToken + "\n", "utf-8");
         ok(`Debug build: shim tracing on, persisted to storage.local __viaduct_debug_log__ (read with viaduct --logs); RPC bridge token in ${DEBUG_RPC_TOKEN_FILENAME} — don't ship this build`);
