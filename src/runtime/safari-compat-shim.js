@@ -7651,24 +7651,24 @@ var __C2S_DEBUG__ = false;
     } catch (e) { return false; }
   };
   if (typeof window !== "undefined" && typeof location !== "undefined" && c2sIsPanelDoc()) {
-    // Build-configured query for the side-panel page (viaduct --panel-query), written
-    // before the page's own scripts run so a value read at first render sees it.
-    // Chrome opens a side panel with no query, but an extension can open the same
-    // page itself with one — a detached "window" mode, `sidepanel.html?mode=window`
-    // — and branch on it. When the branch a bare URL selects cannot work in Safari
-    // (Claude in Chrome 1.0.94: an embed of claude.ai that the site's
-    // frame-ancestors refuses, see the blocked-frame explainer below), the other
-    // branch is the panel that works, and this is the only way to select it since
-    // the popover URL is the manifest's default_popup verbatim. Only keys the URL
-    // does not already carry are written; a query the extension put there wins.
+    // The side panel's window-mode query, derived at conversion from how the
+    // extension opens the page as a standalone window (or set by --panel-query), and
+    // written before the page's own scripts run so a value read at first render sees
+    // it. Chrome docks a side panel and opens it bare; Safari shows it as a popover,
+    // which is a standalone window, so the form the extension built for a window is
+    // the one that matches — and when the bare form embeds something Safari cannot
+    // frame (Claude in Chrome 1.0.94, see the blocked-frame explainer below) it is
+    // the form that works. The popover URL is the manifest's default_popup verbatim,
+    // so the document is the only place this can land. Only a BARE url gets it: a
+    // page opened by the extension itself with any query (its window mode with a
+    // session id, a permission-only popup) was opened on purpose and stays untouched.
     try {
       var c2sPanelQuery = (__C2S_PROXY_CONFIG__ && typeof __C2S_PROXY_CONFIG__.panelQuery === "string") ? __C2S_PROXY_CONFIG__.panelQuery : "";
-      if (c2sPanelQuery && c2sIsSidePanelDoc()) {
-        var c2sPqUrl = new URL(location.href), c2sPqAdded = 0;
-        new URLSearchParams(c2sPanelQuery).forEach(function (v, k) {
-          if (!c2sPqUrl.searchParams.has(k)) { c2sPqUrl.searchParams.set(k, v); c2sPqAdded++; }
-        });
-        if (c2sPqAdded) { history.replaceState(history.state, "", c2sPqUrl.toString()); dbg("[c2s] panel query applied: " + c2sPanelQuery); }
+      if (c2sPanelQuery && !location.search.replace(/^\?/, "") && c2sIsSidePanelDoc()) {
+        var c2sPqUrl = new URL(location.href);
+        new URLSearchParams(c2sPanelQuery).forEach(function (v, k) { c2sPqUrl.searchParams.set(k, v); });
+        history.replaceState(history.state, "", c2sPqUrl.toString());
+        dbg("[c2s] panel opened bare; its window-mode query applied: " + c2sPanelQuery);
       }
     } catch (e) {}
     try {

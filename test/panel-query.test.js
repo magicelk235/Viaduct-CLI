@@ -89,14 +89,16 @@ test("the configured query is on the side panel's URL before its own scripts run
   assert.equal(q.get("tabId"), "42", "the tabId injection must still land on top of the configured query");
 });
 
-test("a key the extension already put on the URL wins over the configured one", async (t) => {
-  const { location, dispose } = runShimOnPage("safari-web-extension://abc/sidepanel.html?mode=tab&sessionId=s1", sidePanelManifest, { panelQuery: "mode=window&skipPermissions=true" });
+test("a page the extension opened with a query of its own is left exactly as it was", async (t) => {
+  // Claude's permission-only popup: sidepanel.html?tabId=…&mcpPermissionOnly=true.
+  // Adding the window-mode query to it would hand a deliberate variant a mode it
+  // never asked for; a bare URL is the only one Safari opened on its own.
+  const { location, replaceStateCalls, dispose } = runShimOnPage("safari-web-extension://abc/sidepanel.html?tabId=7&mcpPermissionOnly=true", sidePanelManifest, { panelQuery: "mode=window" });
   t.after(dispose);
 
-  const q = new URLSearchParams(location.search);
-  assert.equal(q.get("mode"), "tab", "an extension-supplied value is not overwritten");
-  assert.equal(q.get("sessionId"), "s1");
-  assert.equal(q.get("skipPermissions"), "true", "missing keys are still added");
+  await settle();
+  assert.deepEqual(replaceStateCalls, []);
+  assert.equal(location.search, "?tabId=7&mcpPermissionOnly=true");
 });
 
 test("a plain action popup is left alone even when a query is configured", async (t) => {

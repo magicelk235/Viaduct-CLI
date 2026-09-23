@@ -186,26 +186,30 @@ export function deriveProxyHosts(manifest: Manifest): string[] {
  *  complete `key=value` pairs in it: `sidepanel.html?mode=window&sessionId=${id}`
  *  yields `mode=window`, while a permission popup opened as
  *  `sidepanel.html?tabId=${t}&mcpPermissionOnly=true` yields nothing, since its head
- *  ends in a dynamic value and the constant after it is not the page's mode. Several
- *  sites with different heads make the choice ambiguous and nothing is derived.
- *  Generic: driven by the manifest's `side_panel.default_path` and the bundle's own
- *  calls, no extension named. */
+ *  ends in a dynamic value and the constant after it is not the page's mode. A bundle
+ *  that opens the page with two different heads disagrees with itself and nothing is
+ *  derived: a wrong query can break a panel, no query is the status quo. Generic:
+ *  driven by the manifest and the bundle's own calls, no extension named. */
 export function derivePanelWindowQuery(dir: string, manifest: Manifest): string {
-  // The page is identified the way the shim's panel-doc block identifies it at
-  // runtime: the manifest's side_panel path when declared, else a `sidepanel` file
-  // name (Claude in Chrome declares none and sets its path through setOptions).
-  // A query derived here is only ever applied to a document that test recognises.
+  // The page is identified exactly the way the shim's panel-doc block identifies it
+  // at runtime (c2sIsSidePanelDoc): the manifest's side_panel path when declared,
+  // else any path containing "sidepanel" (Claude in Chrome declares none and sets its
+  // path through setOptions). A query derived here is only ever applied to a
+  // document that test recognises, so the two must agree.
   const sp: unknown = "side_panel" in manifest ? manifest.side_panel : undefined;
   const declared = sp && typeof sp === "object" && "default_path" in sp && typeof sp.default_path === "string"
-    ? sp.default_path.split(/[#?]/)[0].replace(/^\/+/, "").split("/").pop() ?? ""
+    ? sp.default_path.split(/[#?]/)[0].replace(/^\/+/, "")
     : "";
   const page = declared
     ? declared.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-    : "[A-Za-z0-9_-]*[sS]ide[_-]?[pP]anel[A-Za-z0-9_-]*\\.html";
+    : "[A-Za-z0-9_\\-./]*sidepanel[A-Za-z0-9_\\-./]*\\.html";
   // The URL literal is usually built just before `windows.create(` (a getURL call
-  // assigned to a variable) or inline in its argument; look on both sides.
-  const head = new RegExp("(?:^|[^A-Za-z0-9_.-])" + page + "\\?([A-Za-z0-9_\\-=&%.]*)");
-  const counts = new Map<string, number>();
+  // assigned to a variable) or inline in its argument; look on both sides and take
+  // the literal nearest the call, since a neighbouring setOptions path or a second
+  // create site can sit inside the same window of text.
+  const head = new RegExp("(?:^|[^A-Za-z0-9_.-])" + page + "\\?([A-Za-z0-9_\\-=&%.]*)", "gi");
+  const REACH = 600;
+  const heads = new Set<string>();
   for (const f of walkScripts(dir)) {
     let src: string;
     try { src = readFileSync(f, "utf-8"); } catch { continue; }
@@ -214,18 +218,21 @@ export function derivePanelWindowQuery(dir: string, manifest: Manifest): string 
       const i = src.indexOf("windows.create(", at);
       if (i < 0) break;
       at = i + 15;
-      const m = head.exec(src.slice(Math.max(0, i - 600), i + 600));
-      if (!m) continue;
-      const pairs = m[1].split("&").filter((kv) => /^[A-Za-z0-9_-]+=[A-Za-z0-9_%.-]+$/.test(kv));
-      if (pairs.length === 0) continue;
-      const q = pairs.join("&");
-      counts.set(q, (counts.get(q) ?? 0) + 1);
+      const lo = Math.max(0, i - REACH);
+      const win = src.slice(lo, i + REACH);
+      let best: { dist: number; query: string } | undefined;
+      head.lastIndex = 0;
+      for (let m = head.exec(win); m; m = head.exec(win)) {
+        const dist = Math.abs(lo + m.index - i);
+        if (!best || dist < best.dist) best = { dist, query: m[1] };
+      }
+      if (!best) continue;
+      const pairs = best.query.split("&").filter((kv) => /^[A-Za-z0-9_-]+=[A-Za-z0-9_%.-]+$/.test(kv));
+      if (pairs.length > 0) heads.add(pairs.join("&"));
     }
   }
-  if (counts.size === 0) return "";
-  const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
-  if (ranked.length > 1 && ranked[0][1] === ranked[1][1]) return "";
-  return ranked[0][0];
+  if (heads.size !== 1) return "";
+  return [...heads][0];
 }
 
 /**

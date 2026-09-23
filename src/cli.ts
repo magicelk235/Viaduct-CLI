@@ -175,7 +175,8 @@ OPTIONS
                             it as a popover. By default viaduct derives it from the
                             bundle: the query the extension itself uses to open that page
                             as a standalone window (mode=window), since a popover is one.
-                            Pass "" to open the page bare. Keys already on the URL win.
+                            Pass "" to open the page bare. A page the extension opened
+                            with a query of its own is left untouched.
       --debug               Emit the shim with debug tracing enabled. Traces persist to a
                             bounded ring buffer (last 2000 entries, batched writes) in
                             storage.local under __viaduct_debug_log__ — read it live from

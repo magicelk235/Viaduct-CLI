@@ -314,7 +314,8 @@ single-extension flags and are rejected here.
                          opens it as a popover. By default it is derived from the
                          bundle: the query the extension itself uses to open that
                          page as a standalone window (e.g. mode=window), since a
-                         popover is one. Pass "" to open the page bare.
+                         popover is one. Pass "" to open the page bare; a page the
+                         extension opened with its own query is left untouched.
     --debug              Emit the shim with debug tracing enabled. Traces persist
                          to a bounded ring buffer (last 2000 entries) in
                          storage.local under __viaduct_debug_log__; read it with

@@ -39,18 +39,31 @@ test("a bundle that never opens its panel as a window yields nothing", (t) => {
   assert.equal(derivePanelWindowQuery(dir, manifest), "");
 });
 
-test("two window forms with different constant heads are ambiguous and nothing is derived", (t) => {
+test("a bundle whose window forms disagree yields nothing, even on a majority", (t) => {
   const dir = bundle({
-    "assets/a.js": 'chrome.windows.create({url:chrome.runtime.getURL("sidepanel.html?mode=window")});',
+    "assets/a.js": 'chrome.windows.create({url:chrome.runtime.getURL("sidepanel.html?mode=window")});' +
+      'chrome.windows.create({url:chrome.runtime.getURL("sidepanel.html?mode=window")});',
     "assets/b.js": 'chrome.windows.create({url:chrome.runtime.getURL("sidepanel.html?mode=compact")});',
   });
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  assert.equal(derivePanelWindowQuery(dir, manifest), "");
+  assert.equal(derivePanelWindowQuery(dir, manifest), "", "a wrong query can break a panel; no query is the status quo");
 });
 
-test("a panel page in a subdirectory is matched by its file name", (t) => {
+test("the literal nearest the call wins over a setOptions path sitting in the same stretch of code", (t) => {
+  // setOptions' `?tabId=` literal comes first in the file and within reach of the
+  // create call; taking the first match would drop the real window form.
   const dir = bundle({
-    "assets/sw.js": 'chrome.windows.create({url:chrome.runtime.getURL("panel/index.html?standalone=1&x=y")});',
+    "assets/sw.js": 'chrome.sidePanel.setOptions({tabId:e,path:`sidepanel.html?tabId=${encodeURIComponent(e)}`,enabled:!0});' +
+      "x".repeat(200) + ';const i=chrome.runtime.getURL(`sidepanel.html?mode=window&sessionId=${t}`);const o=await chrome.windows.create({url:i,type:"popup"});',
+  });
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  assert.equal(derivePanelWindowQuery(dir, manifest), "mode=window");
+});
+
+test("a declared side_panel path in a subdirectory is matched as that path, so an unrelated index.html does not count", (t) => {
+  const dir = bundle({
+    "assets/sw.js": 'chrome.windows.create({url:chrome.runtime.getURL("panel/index.html?standalone=1&x=y")});' +
+      'chrome.windows.create({url:chrome.runtime.getURL("settings/index.html?mode=window")});',
   });
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   assert.equal(derivePanelWindowQuery(dir, { manifest_version: 3, side_panel: { default_path: "/panel/index.html" } }), "standalone=1&x=y");
