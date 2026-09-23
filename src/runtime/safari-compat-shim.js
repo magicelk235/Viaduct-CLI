@@ -6411,11 +6411,19 @@ var __C2S_DEBUG__ = false;
       function markOpen() {
         if (openFired || self.readyState === 3) return;
         openFired = true; self.readyState = 1;
+        dbg("[c2s] ws tunnel open " + self.url.replace(/\?.*$/, ""));
         var q = queued; queued = [];
         for (var i = 0; i < q.length; i++) rawSend(q[i]);
         fire("open", new Event("open"));
       }
-      function emit(data) { fire("message", new MessageEvent("message", { data: data })); }
+      function emit(data) {
+        // --debug: the kind of frame, never its body (a bridge frame carries tool
+        // arguments and results). Enough to tell "paired" from "waiting".
+        if (DBG && typeof data === "string") {
+          try { var jt = JSON.parse(data); if (jt && typeof jt.type === "string") dbg("[c2s] ws tunnel <- " + jt.type); } catch (e) {}
+        }
+        fire("message", new MessageEvent("message", { data: data }));
+      }
       function deliver(m) {
         if (!openFired) markOpen(); // a frame implies the socket is open
         if (m.kind === "chunk") {
@@ -6441,6 +6449,7 @@ var __C2S_DEBUG__ = false;
         if (pollT) { clearTimeout(pollT); pollT = null; }
         if (closedFired) return;
         closedFired = true; self.readyState = 3;
+        dbg("[c2s] ws tunnel close " + self.url.replace(/\?.*$/, "") + " code=" + (code || 1006) + " opened=" + openFired);
         fire("close", new CloseEvent("close", { code: code || 1006, reason: "", wasClean: !!wasClean }));
       }
       function fail() {
@@ -6480,9 +6489,120 @@ var __C2S_DEBUG__ = false;
       return self;
     }
 
+    // A backend the extension declares (host_permissions / CSP connect-src, the same
+    // list the fetch retry uses) that refuses Safari's handshake. The platform socket
+    // gets the first try, since a server that accepts the Safari origin should keep
+    // the fast path; one that answers 403 to `Origin: safari-web-extension://…` kills
+    // the socket before `open`, and that is the only case handled: the same
+    // connection is re-established through the native tunnel, which speaks for the
+    // extension the way the fetch retry does (its own Chrome origin when the build
+    // derived one, no Origin otherwise). Live: Claude in Chrome's browser bridge,
+    // wss://bridge.claudeusercontent.com, 101 to its Chrome origin and to no Origin,
+    // 403 to the Safari one, 1006 on every retry from the converted background.
+    var PROXY_HOSTS = [];
+    try { PROXY_HOSTS = (typeof __C2S_PROXY_CONFIG__ !== "undefined" && __C2S_PROXY_CONFIG__ && __C2S_PROXY_CONFIG__.hosts) || []; } catch (e) {}
+    function isDeclaredBackend(url) {
+      try {
+        var u = new URL(String(url), loc.href);
+        if (u.protocol !== "wss:") return false;
+        var h = u.hostname;
+        for (var i = 0; i < PROXY_HOSTS.length; i++) {
+          var ph = PROXY_HOSTS[i];
+          if (h === ph || (h.length > ph.length && h.slice(-(ph.length + 1)) === "." + ph)) return true;
+        }
+      } catch (e) {}
+      return false;
+    }
+    function traceNative(ws, url) {
+      // Under --debug, the socket's lifecycle lands in the ring: a background that
+      // keeps a long-lived wss:// session has no other visible trace of whether it
+      // ever connected or why it dropped.
+      if (!DBG) return;
+      try {
+        var wsUrl = String(url).replace(/\?.*$/, "");
+        ws.addEventListener("open", function () { dbg("[c2s] ws open " + wsUrl); });
+        ws.addEventListener("close", function (ev) { dbg("[c2s] ws close " + wsUrl + " code=" + (ev && ev.code) + " clean=" + !!(ev && ev.wasClean) + (ev && ev.reason ? " reason=" + ev.reason : "")); });
+        ws.addEventListener("error", function () { dbg("[c2s] ws error " + wsUrl); });
+      } catch (e) {}
+    }
+    function FailoverWS(url, protocols) {
+      var self = new EventTarget();
+      self.url = String(url);
+      self.readyState = 0;
+      self.bufferedAmount = 0;
+      self.protocol = "";
+      self.extensions = "";
+      var binaryType = "blob";
+      try {
+        Object.defineProperty(self, "binaryType", {
+          get: function () { return binaryType; },
+          set: function (v) { binaryType = String(v); if (inner) { try { inner.binaryType = binaryType; } catch (e) {} } },
+          configurable: true,
+        });
+      } catch (e) { self.binaryType = binaryType; }
+      self.onopen = null; self.onmessage = null; self.onerror = null; self.onclose = null;
+      self.CONNECTING = 0; self.OPEN = 1; self.CLOSING = 2; self.CLOSED = 3;
+      var inner = null, opened = false, tunneled = false, closedByApp = false, queued = [];
+      function fire(type, ev) {
+        var h = self["on" + type];
+        if (typeof h === "function") { try { h.call(self, ev); } catch (e) {} }
+        try { self.dispatchEvent(ev); } catch (e) {}
+      }
+      function attach(ws) {
+        inner = ws;
+        try { ws.binaryType = binaryType; } catch (e) {}
+        ws.addEventListener("open", function () {
+          if (inner !== ws) return;
+          opened = true; self.readyState = 1;
+          try { self.protocol = ws.protocol || ""; self.extensions = ws.extensions || ""; } catch (e) {}
+          var q = queued; queued = [];
+          for (var i = 0; i < q.length; i++) { try { ws.send(q[i]); } catch (e) {} }
+          fire("open", new Event("open"));
+        });
+        ws.addEventListener("message", function (ev) {
+          if (inner !== ws) return;
+          fire("message", new MessageEvent("message", { data: ev.data }));
+        });
+        ws.addEventListener("error", function () {
+          if (inner !== ws) return;
+          if (!opened && !tunneled && !closedByApp) return; // a refused handshake: the close below retries
+          fire("error", new Event("error"));
+        });
+        ws.addEventListener("close", function (ev) {
+          if (inner !== ws) return;
+          if (!opened && !tunneled && !closedByApp) {
+            tunneled = true;
+            dbg("[c2s] ws handshake refused by " + self.url.replace(/\?.*$/, "") + " (code=" + (ev && ev.code) + "), re-establishing through the native tunnel");
+            attach(TunnelWS(self.url));
+            return;
+          }
+          self.readyState = 3;
+          fire("close", new CloseEvent("close", { code: (ev && ev.code) || 1006, reason: (ev && ev.reason) || "", wasClean: !!(ev && ev.wasClean) }));
+        });
+      }
+      self.send = function (data) {
+        if (self.readyState === 0) { queued.push(data); return; }
+        if (self.readyState !== 1 || !inner) return;
+        inner.send(data);
+      };
+      self.close = function (code, reason) {
+        if (self.readyState >= 2) return;
+        closedByApp = true;
+        self.readyState = 2;
+        if (inner) { try { (code === undefined) ? inner.close() : inner.close(code, reason); } catch (e) { try { inner.close(); } catch (e2) {} } }
+      };
+      var first = (protocols === undefined) ? new Native(url) : new Native(url, protocols);
+      traceNative(first, url);
+      attach(first);
+      return self;
+    }
+
     function WS(url, protocols) {
       if (shouldTunnel(url)) return TunnelWS(url);
-      return (protocols === undefined) ? new Native(url) : new Native(url, protocols);
+      if (isDeclaredBackend(url)) return FailoverWS(url, protocols);
+      var ws = (protocols === undefined) ? new Native(url) : new Native(url, protocols);
+      traceNative(ws, url);
+      return ws;
     }
     WS.prototype = Native.prototype;
     WS.CONNECTING = 0; WS.OPEN = 1; WS.CLOSING = 2; WS.CLOSED = 3;
