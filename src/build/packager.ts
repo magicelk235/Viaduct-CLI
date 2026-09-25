@@ -448,12 +448,22 @@ export function grantDownloadsFolder(xcodeproj: string): void {
 }
 
 /**
+ * The argument the broker LaunchAgent passes when it starts the container app. The
+ * agent starts it at login and again every time it quits (KeepAlive), and such a
+ * launch only serves the extension, so the app keeps its window closed. Without it,
+ * quitting the app (the window's "Quit and Open Safari Settings…" button, ⌘Q) brought
+ * the window straight back.
+ */
+export const BROKER_LAUNCH_ARG = "--viaduct-broker";
+
+/**
  * Install the native-messaging broker into the (unsandboxed) container app by
  * rewriting its AppDelegate.swift. The broker listens on 127.0.0.1:<port>, gated by
  * a build-time token, and for each `__c2sNM` op the appex forwards it: locates the
  * Chrome native-messaging host manifest, launches the host binary, and pipes Chrome's
  * stdio framing — persisting each launched host across ops keyed by the JS port id.
- * The app stays alive after its window closes so the broker keeps serving.
+ * The app stays alive after its window closes so the broker keeps serving. A launch
+ * carrying BROKER_LAUNCH_ARG starts windowless; opening the app shows the window.
  */
 export function writeAppBroker(xcodeproj: string, opts: { brokerPort: number; brokerToken: string }): void {
   const root = xcodeproj.replace(/[^/]+\.xcodeproj$/, "");
@@ -467,12 +477,25 @@ export function writeAppBroker(xcodeproj: string, opts: { brokerPort: number; br
 //
 import Cocoa
 import Foundation
+import WebKit
 
 @main
 class AppDelegate: NSObject, NSApplicationDelegate {
     // Retain the activity token for the whole process lifetime — releasing it ends the
     // activity and re-arms automatic termination.
     var activityToken: NSObjectProtocol?
+    // The storyboard's window, kept (not released on close) so a reopen can show it again.
+    var mainWindow: NSWindow?
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        mainWindow = NSApp.windows.first { $0.contentViewController != nil }
+        mainWindow?.isReleasedWhenClosed = false
+        // The broker LaunchAgent starts the app at login and again whenever it quits.
+        // That launch only serves the extension, so keep the window closed; ordering it
+        // out here, before the first display pass, leaves no flash.
+        if CommandLine.arguments.contains("${BROKER_LAUNCH_ARG}") {
+            mainWindow?.orderOut(nil)
+        }
+    }
     func applicationDidFinishLaunching(_ notification: Notification) {
         // The broker is a windowless background helper. macOS "automatic termination"
         // reaps such a process when it looks idle (observed live: the app was terminated
@@ -489,6 +512,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // Stay alive after the window closes so the broker keeps serving the extension.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return false
+    }
+    // Opening the app (Finder, Launchpad, Spotlight) while it runs windowless sends a
+    // reopen: show the window, reloaded so it reports the extension's current state.
+    // The LaunchAgent's \`open -g\` sends no reopen, so it never brings the window back.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard !flag, let window = mainWindow else { return true }
+        Self.webView(in: window.contentView)?.reload()
+        window.makeKeyAndOrderFront(nil)
+        return false
+    }
+    static func webView(in view: NSView?) -> WKWebView? {
+        guard let view = view else { return nil }
+        if let web = view as? WKWebView { return web }
+        for sub in view.subviews { if let web = webView(in: sub) { return web } }
+        return nil
     }
 }
 

@@ -2,7 +2,7 @@ import { mkdirSync, existsSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os";
 import { join, resolve, relative, isAbsolute, basename } from "node:path";
 import { run, info, ok, warn, fail, moveBundle } from "../util.js";
-import { pluginkitStatus, defaultBundleId, deriveAppName, plistValue } from "./packager.js";
+import { pluginkitStatus, defaultBundleId, deriveAppName, plistValue, BROKER_LAUNCH_ARG } from "./packager.js";
 
 /** Full path to LaunchServices' lsregister (not on PATH). */
 export const LSREGISTER =
@@ -252,22 +252,15 @@ function brokerAgentPlistPath(bundleId: string): string {
 }
 
 /**
- * Install a LaunchAgent that keeps the container app (the native-messaging broker)
- * running. macOS auto-terminates the idle GUI app (observed live), which kills the
- * broker. The agent launches it via `open -g -W`: `open` gives the app a real GUI
- * session so AppKit initializes and the broker actually starts (launching the binary
- * directly does NOT — applicationDidFinishLaunching never fires), `-g` keeps it in the
- * background, and `-W` blocks until the app exits so KeepAlive relaunches it. RunAtLoad
- * starts it at login.
+ * The broker LaunchAgent plist. It launches the app via `open -g -W`: `open` gives the
+ * app a real GUI session so AppKit initializes and the broker actually starts
+ * (launching the binary directly does NOT — applicationDidFinishLaunching never
+ * fires), `-g` keeps it in the background, and `-W` blocks until the app exits so
+ * KeepAlive relaunches it. RunAtLoad starts it at login. BROKER_LAUNCH_ARG tells the
+ * app the launch is the agent's, so it starts without its window.
  */
-export function installBrokerAgent(appPath: string, bundleId: string): boolean {
-  if (!existsSync(appPath)) {
-    warn(`Broker app not found at ${appPath}; native messaging will only work while the app is open manually.`);
-    return false;
-  }
-  const label = `${bundleId}.broker`;
-  const plist = brokerAgentPlistPath(bundleId);
-  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+export function brokerAgentPlist(appPath: string, label: string): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -278,6 +271,8 @@ export function installBrokerAgent(appPath: string, bundleId: string): boolean {
     <string>-g</string>
     <string>-W</string>
     <string>${appPath}</string>
+    <string>--args</string>
+    <string>${BROKER_LAUNCH_ARG}</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -285,6 +280,21 @@ export function installBrokerAgent(appPath: string, bundleId: string): boolean {
 </dict>
 </plist>
 `;
+}
+
+/**
+ * Install a LaunchAgent that keeps the container app (the native-messaging broker)
+ * running. macOS auto-terminates the idle GUI app (observed live), which kills the
+ * broker; the agent relaunches it (see brokerAgentPlist).
+ */
+export function installBrokerAgent(appPath: string, bundleId: string): boolean {
+  if (!existsSync(appPath)) {
+    warn(`Broker app not found at ${appPath}; native messaging will only work while the app is open manually.`);
+    return false;
+  }
+  const label = `${bundleId}.broker`;
+  const plist = brokerAgentPlistPath(bundleId);
+  const xml = brokerAgentPlist(appPath, label);
   try {
     mkdirSync(join(homedir(), "Library", "LaunchAgents"), { recursive: true });
     writeFileSync(plist, xml, "utf-8");
