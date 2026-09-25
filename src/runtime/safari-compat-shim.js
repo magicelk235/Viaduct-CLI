@@ -408,12 +408,20 @@ var __C2S_DEBUG__ = false;
       // In place on the native event, the same move the storage relay makes on
       // runtime.onMessage; the bundle keeps its own function, so removeListener and
       // hasListener translate it to the wrapper the native event holds.
+      // WebKit caches an event's JS wrapper weakly, and the overrides below live on
+      // that wrapper. A local array does not hold it: the array is reachable only from
+      // closures the wrapper itself holds, so once the storage read above settles the
+      // whole cycle is garbage. Parsing a large bundle's module chunks then collects it,
+      // and the bundle's own chrome.runtime.onInstalled read gets a fresh wrapper with
+      // the native addListener, so the raw "install" reaches it (live: Claude opened a
+      // sign-in tab on every reload even with the version recorded). Root the wrappers
+      // on the page's global object, which lives as long as the listeners do.
       var pinned = [];
+      try { Object.defineProperty(window, "__c2sInstallPins", { value: pinned, configurable: true }); } catch (e) {}
+      if (window.__c2sInstallPins !== pinned) { try { window.__c2sInstallPins = pinned; } catch (e) {} }
       function patch(rt) {
         var ev = rt && rt.onInstalled;
         if (!ev || typeof ev.addListener !== "function" || ev.addListener.__c2sInstallCorrected) return;
-        // WebKit caches an event's JS wrapper weakly; holding it keeps the
-        // overrides below on the object every later read returns.
         pinned.push(ev);
         var add = ev.addListener, remove = ev.removeListener, has = ev.hasListener;
         var addW = function (fn) { return add.call(ev, correct(fn)); };
