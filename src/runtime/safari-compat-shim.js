@@ -371,17 +371,35 @@ var __C2S_DEBUG__ = false;
       var KEY = "__c2sInstalledVersion";
       var version = "";
       try { version = String(api.runtime.getManifest().version || ""); } catch (e) {}
+      // A first install (nothing recorded yet) is held until this page has lived
+      // SETTLE_MS. An install is exactly when Safari reloads the extension several times
+      // in a row: the app is registered, the host app is launched, often launched again.
+      // Delivered at once, the first-run action ran in a page killed a moment later:
+      // killed before it acted, the next load found the version recorded and turned its
+      // install into an update, so a fresh install opened no sign-in tab at all (measured
+      // in Safari after clearing the extension's data: three loads, no tab). Held, it runs
+      // once, in the load that survives. The record is written when the hold ends, event
+      // or not, so a later reload of an extension that booted without an install (browser
+      // launch) is still corrected.
+      var SETTLE_MS = 5000;
+      var settled = null;
+      function writeRecord() {
+        var rec = {}; rec[KEY] = version;
+        try { Promise.resolve(local.set(rec)).catch(function () {}); } catch (e) {}
+      }
       // Resolves to the recorded version, undefined when none is recorded, or null
       // when storage could not be read (then the event passes through as Safari sent it).
       var recorded = new Promise(function (resolve) {
         try {
           Promise.resolve(local.get(KEY)).then(function (r) {
             var prev = r ? r[KEY] : undefined;
-            resolve(typeof prev === "string" ? prev : undefined);
-            if (prev !== version) {
-              var rec = {}; rec[KEY] = version;
-              try { Promise.resolve(local.set(rec)).catch(function () {}); } catch (e) {}
+            if (typeof prev === "string") {
+              resolve(prev);
+              if (prev !== version) writeRecord();
+              return;
             }
+            settled = new Promise(function (done) { setTimeout(function () { writeRecord(); done(); }, SETTLE_MS); });
+            resolve(undefined);
           }, function () { resolve(null); });
         } catch (e) { resolve(null); }
       });
@@ -395,11 +413,13 @@ var __C2S_DEBUG__ = false;
           var self = this, args = arguments;
           if (!details || details.reason !== "install") return fn.apply(self, args);
           recorded.then(function (prev) {
-            var d = details;
             if (typeof prev === "string") {
+              var d = details;
               try { d = Object.assign({}, details, { reason: "update", previousVersion: prev }); } catch (e) { d = details; }
+              return fn.call(self, d);
             }
-            fn.call(self, d);
+            if (prev === undefined && settled) return settled.then(function () { fn.call(self, details); });
+            fn.call(self, details);
           });
         };
         wrappers.set(fn, w);

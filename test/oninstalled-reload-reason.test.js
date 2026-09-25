@@ -18,8 +18,11 @@ import { shimSource } from "../dist/runtime/shim.js";
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
-function makeContext({ page = "background.html", stored = {} } = {}) {
-  const store = { ...stored };
+// `held`: timers of 5s and longer, the ones that stand for "this page lived long enough".
+// A test releases them with live(), or never does to model a load Safari replaced first.
+function makeContext({ page = "background.html", stored = {}, store: shared } = {}) {
+  const store = shared || { ...stored };
+  const held = [];
   const listeners = [];
   const onInstalled = {
     addListener(fn) { if (!listeners.includes(fn)) listeners.push(fn); },
@@ -52,7 +55,7 @@ function makeContext({ page = "background.html", stored = {} } = {}) {
   };
   const sandbox = {
     console,
-    setTimeout: (fn, ms, ...a) => { const t = setTimeout(fn, ms, ...a); t.unref?.(); return t; },
+    setTimeout: (fn, ms, ...a) => { if (ms >= 5000) { held.push(() => fn(...a)); return 0; } const t = setTimeout(fn, ms, ...a); t.unref?.(); return t; },
     setInterval: (fn, ms, ...a) => { const t = setInterval(fn, ms, ...a); t.unref?.(); return t; },
     clearTimeout, clearInterval,
     location: { href: "safari-web-extension://TEST/" + page, origin: "safari-web-extension://TEST", protocol: "safari-web-extension:", pathname: "/" + page },
@@ -72,14 +75,49 @@ function makeContext({ page = "background.html", stored = {} } = {}) {
   const seen = () => JSON.parse(run("JSON.stringify(globalThis.__seen)"));
   run(`globalThis.__seen = []; globalThis.__fn = function (d) { __seen.push(d); };
        chrome.runtime.onInstalled.addListener(__fn);`);
-  return { store, fire, run, seen, listeners };
+  const live = () => { for (const f of held.splice(0)) f(); };
+  return { store, fire, run, seen, listeners, live };
 }
 
-test("a first install reaches the bundle as install and records the version", async () => {
-  const { store, fire, seen } = makeContext();
+test("a first install waits until the page has lived, then reaches the bundle as install and records the version", async () => {
+  const { store, fire, seen, live } = makeContext();
   fire({ reason: "install" });
   await tick(); await tick();
+  assert.deepEqual(seen(), [], "held while Safari may still replace this load");
+  assert.equal(store.__c2sInstalledVersion, undefined);
+  live();
+  await tick(); await tick();
   assert.deepEqual(seen(), [{ reason: "install" }]);
+  assert.equal(store.__c2sInstalledVersion, "1.0.94");
+});
+
+// Installing reloads the extension several times in a row. Delivered at once, the
+// first-run action ran in a load killed a moment later, and the next load, finding the
+// version recorded, reported an update: a fresh install never showed its sign-in tab.
+test("a first install in a load Safari replaces before it settles runs once, in the load that survives", async () => {
+  const store = {};
+  const first = makeContext({ store });
+  first.fire({ reason: "install" });
+  await tick(); await tick();
+  // Replaced: its held timer never runs.
+  const second = makeContext({ store });
+  second.fire({ reason: "install" });
+  await tick(); await tick();
+  second.live();
+  await tick(); await tick();
+  assert.deepEqual(first.seen(), []);
+  assert.deepEqual(second.seen(), [{ reason: "install" }]);
+  const third = makeContext({ store });
+  third.fire({ reason: "install" });
+  await tick(); await tick();
+  assert.deepEqual(third.seen(), [{ reason: "update", previousVersion: "1.0.94" }]);
+});
+
+test("a load that sees no install still records the version once it has lived", async () => {
+  const { store, live } = makeContext();
+  await tick(); await tick();
+  live();
+  await tick();
   assert.equal(store.__c2sInstalledVersion, "1.0.94");
 });
 
