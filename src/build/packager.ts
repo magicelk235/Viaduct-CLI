@@ -1,7 +1,7 @@
 import { readdirSync, existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir, homedir } from "node:os";
-import { join, basename } from "node:path";
+import { join, basename, dirname } from "node:path";
 import { run, info, warn } from "../util.js";
 import type { Platforms } from "../types.js";
 
@@ -449,10 +449,8 @@ export function grantDownloadsFolder(xcodeproj: string): void {
 
 /**
  * The argument the broker LaunchAgent passes when it starts the container app. The
- * agent starts it at login and again every time it quits (KeepAlive), and such a
- * launch only serves the extension, so the app keeps its window closed. Without it,
- * quitting the app (the window's "Quit and Open Safari Settings…" button, ⌘Q) brought
- * the window straight back.
+ * agent starts it at login and again whenever it dies without quitting (a crash), and
+ * such a launch only serves the extension, so the app keeps its window closed.
  */
 export const BROKER_LAUNCH_ARG = "--viaduct-broker";
 
@@ -462,8 +460,11 @@ export const BROKER_LAUNCH_ARG = "--viaduct-broker";
  * a build-time token, and for each `__c2sNM` op the appex forwards it: locates the
  * Chrome native-messaging host manifest, launches the host binary, and pipes Chrome's
  * stdio framing — persisting each launched host across ops keyed by the JS port id.
- * The app stays alive after its window closes so the broker keeps serving. A launch
- * carrying BROKER_LAUNCH_ARG starts windowless; opening the app shows the window.
+ * The app stays alive after its window closes so the broker keeps serving, and the
+ * window's setup button closes the window instead of quitting (keepAppOpenFromSetupButton).
+ * A launch carrying BROKER_LAUNCH_ARG starts windowless; opening the app shows the
+ * window. Quitting the app stops the broker LaunchAgent, so the app stays quit and
+ * can be deleted.
  */
 export function writeAppBroker(xcodeproj: string, opts: { brokerPort: number; brokerToken: string }): void {
   const root = xcodeproj.replace(/[^/]+\.xcodeproj$/, "");
@@ -489,7 +490,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {
         mainWindow = NSApp.windows.first { $0.contentViewController != nil }
         mainWindow?.isReleasedWhenClosed = false
-        // The broker LaunchAgent starts the app at login and again whenever it quits.
+        // The broker LaunchAgent starts the app at login and again if it crashes.
         // That launch only serves the extension, so keep the window closed; ordering it
         // out here, before the first display pass, leaves no flash.
         if CommandLine.arguments.contains("${BROKER_LAUNCH_ARG}") {
@@ -512,6 +513,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // Stay alive after the window closes so the broker keeps serving the extension.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return false
+    }
+    // Every quit that reaches here is deliberate: ⌘Q, a quit Apple event (Activity
+    // Monitor, a script), or logout. Stop the broker LaunchAgent first, or it relaunches
+    // the app the moment it exits: the app could never stay quit, and Finder refuses to
+    // move a running app to the Trash. A crash never gets here, so the agent still
+    // restarts a crashed broker. The agent's plist stays, so login starts it again.
+    func applicationWillTerminate(_ notification: Notification) {
+        guard let id = Bundle.main.bundleIdentifier else { return }
+        let launchctl = Process()
+        launchctl.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        launchctl.arguments = ["bootout", "gui/" + String(getuid()) + "/" + id + ".broker"]
+        launchctl.standardOutput = FileHandle.nullDevice
+        launchctl.standardError = FileHandle.nullDevice
+        guard (try? launchctl.run()) != nil else { return }
+        launchctl.waitUntilExit()
     }
     // Opening the app (Finder, Launchpad, Spotlight) while it runs windowless sends a
     // reopen: show the window, reloaded so it reports the extension's current state.
@@ -941,7 +957,27 @@ final class NMBroker {
     }
 }
 `;
-  for (const d of delegates) writeFileSync(d, swift, "utf-8");
+  for (const d of delegates) {
+    writeFileSync(d, swift, "utf-8");
+    keepAppOpenFromSetupButton(dirname(d));
+  }
+}
+
+/**
+ * The app's window has one button, Apple's template's "Quit and Open Safari Settings…",
+ * which opens Safari's settings and then terminates the app. In a broker build a quit
+ * stops native messaging until the next login (see applicationWillTerminate above), and
+ * that button is the first thing a user clicks after installing. So it closes the window
+ * instead, the app keeps serving in the background, and its label drops "Quit".
+ */
+function keepAppOpenFromSetupButton(appDir: string): void {
+  for (const file of findFiles(appDir, (n) => n === "ViewController.swift" || n === "Script.js" || n === "Main.html", 3)) {
+    const src = readFileSync(file, "utf-8");
+    const next = file.endsWith(".swift")
+      ? src.replace(/\b(?:NSApplication\.shared|NSApp)\.terminate\(nil\)/g, "self.view.window?.close()")
+      : src.replace(/Quit and Open Safari /g, "Open Safari ");
+    if (next !== src) writeFileSync(file, next, "utf-8");
+  }
 }
 
 function pickScheme(xcodeproj: string, appName: string, platforms: Platforms): string | null {

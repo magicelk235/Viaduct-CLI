@@ -7,9 +7,8 @@ import { execFileSync } from "node:child_process";
 import { writeAppBroker, BROKER_LAUNCH_ARG } from "../dist/build/packager.js";
 import { brokerAgentPlist } from "../dist/build/installer.js";
 
-// The broker LaunchAgent relaunches the container app every time it quits (KeepAlive)
-// and at login. Those launches must start windowless, or quitting the app from its own
-// window ("Quit and Open Safari Settings…", ⌘Q) brings the window straight back.
+// The broker LaunchAgent starts the container app at login and relaunches it after a
+// crash. Those launches must start windowless, or the window pops up on its own.
 
 test("the broker LaunchAgent launches the app with the windowless-launch argument", () => {
   const app = "/Users/me/Applications/My Ext.app";
@@ -18,7 +17,6 @@ test("the broker LaunchAgent launches the app with the windowless-launch argumen
   }).toString();
   const agent = JSON.parse(json);
   assert.deepEqual(agent.ProgramArguments, ["/usr/bin/open", "-g", "-W", app, "--args", BROKER_LAUNCH_ARG]);
-  assert.equal(agent.KeepAlive, true);
   assert.equal(agent.RunAtLoad, true);
 });
 

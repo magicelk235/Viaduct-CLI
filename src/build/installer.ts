@@ -258,6 +258,11 @@ function brokerAgentPlistPath(bundleId: string): string {
  * fires), `-g` keeps it in the background, and `-W` blocks until the app exits so
  * KeepAlive relaunches it. RunAtLoad starts it at login. BROKER_LAUNCH_ARG tells the
  * app the launch is the agent's, so it starts without its window.
+ *
+ * KeepAlive holds only while the app exists (PathState). A quit boots the agent out
+ * from inside the app (applicationWillTerminate, packager.ts), so what it relaunches
+ * is a crash. Once the app is deleted, the plist left behind runs `open` once at login
+ * and stops, instead of retrying the missing app forever.
  */
 export function brokerAgentPlist(appPath: string, label: string): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -275,7 +280,11 @@ export function brokerAgentPlist(appPath: string, label: string): string {
     <string>${BROKER_LAUNCH_ARG}</string>
   </array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>PathState</key>
+    <dict><key>${appPath}</key><true/></dict>
+  </dict>
   <key>ProcessType</key><string>Background</string>
 </dict>
 </plist>
