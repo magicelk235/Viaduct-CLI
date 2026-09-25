@@ -263,6 +263,18 @@
     });
   }, PROBE_GRACE_MS);
 
+  // The background's liveness check after Safari reloads the extension (host app
+  // launching, app replaced on reinstall). A relay injected by the context that died
+  // keeps running with that context's dead API and never hears this, so a missing
+  // answer tells the background the page cannot reach it (identity-polyfill.js).
+  try {
+    api.runtime.onMessage.addListener(function (m, sender, sendResponse) {
+      if (!m || m.__bridgeRelayPing !== true) return;
+      try { sendResponse(true); } catch (e) {}
+      return Promise.resolve(true);
+    });
+  } catch (e) {}
+
   window.addEventListener("message", function (ev) {
     if (ev.source !== window) return;
     if (ev.origin !== window.location.origin) return;

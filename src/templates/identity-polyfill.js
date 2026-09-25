@@ -562,4 +562,159 @@
       });
     });
   }
+
+  // Safari reloads a converted extension where Chrome never would: the host app
+  // launching, the app being replaced on reinstall. Content scripts already running in
+  // open tabs stay bound to the context that died: their `browser` is that context's,
+  // every call into it goes nowhere, and Safari never injects them again. Injecting the
+  // relay again does not help either; it lands in the same content world and picks up
+  // the same dead `browser` (measured). A fresh install's sign-in tab, opened by the
+  // first load and still open when the next load replaced it, answered the Authorize
+  // click with claude.ai's "Authorization failed", while a tab opened after the reload
+  // signed in fine. So remember the bridge-origin tabs this extension opens, and on
+  // every load reload any it opened in the last minute whose relay no longer answers:
+  // a fresh document gets content scripts bound to the running context.
+  (function () {
+    var RELAY = "page-bridge-cs.js", KEY = "__c2sBridgeTabs", RECENT_MS = 60000;
+    var tabs = api.tabs, local = api.storage && api.storage.local;
+    if (!tabs || typeof tabs.create !== "function" || typeof tabs.query !== "function" ||
+        typeof tabs.reload !== "function" || typeof tabs.sendMessage !== "function" ||
+        !local || typeof local.get !== "function" || typeof local.set !== "function") return;
+    var patterns = [];
+    try {
+      var cs = api.runtime.getManifest().content_scripts || [];
+      for (var i = 0; i < cs.length; i++) {
+        if (cs[i] && Array.isArray(cs[i].js) && cs[i].js.indexOf(RELAY) >= 0 && Array.isArray(cs[i].matches)) {
+          patterns = patterns.concat(cs[i].matches);
+        }
+      }
+    } catch (e) {}
+    var res = [];
+    for (var j = 0; j < patterns.length; j++) { var re = patternToRegExp(patterns[j]); if (re) res.push(re); }
+    if (!res.length) return;
+
+    // A match pattern (<scheme>://<host><path>, or <all_urls>) as a RegExp over a URL.
+    function patternToRegExp(p) {
+      if (p === "<all_urls>") return /^(https?|wss?|file|ftp):\/\//;
+      var m = /^(\*|https?|wss?|file|ftp):\/\/(\*|\*\.[^/*]+|[^/*]*)(\/.*)$/.exec(String(p));
+      if (!m) return null;
+      var esc = function (s) { return s.replace(/[.+?^${}()|[\]\\]/g, "\\$&"); };
+      var scheme = m[1] === "*" ? "https?" : esc(m[1]);
+      var host = m[2] === "*" ? "[^/]+" : m[2].indexOf("*.") === 0 ? "([^/]+\\.)?" + esc(m[2].slice(2)) : esc(m[2]);
+      var path = esc(m[3]).replace(/\*/g, ".*");
+      return new RegExp("^" + scheme + "://" + host + "(:\\d+)?" + path + "$");
+    }
+    function onBridgeOrigin(url) {
+      if (typeof url !== "string") return false;
+      for (var k = 0; k < res.length; k++) if (res[k].test(url)) return true;
+      return false;
+    }
+    // Safari's tabs API returns promises; the callback form is Chrome's. `fn` runs once.
+    function call(f, args, fn) {
+      var once = false;
+      var done = function (v, failed) { if (!once) { once = true; fn(v, failed); } };
+      try {
+        var r = f.apply(tabs, args);
+        if (r && typeof r.then === "function") { r.then(function (v) { done(v, false); }, function () { done(undefined, true); }); return; }
+      } catch (e) { return done(undefined, true); }
+      try {
+        f.apply(tabs, args.concat([function (v) {
+          var err = null; try { err = api.runtime.lastError; } catch (e) {}
+          done(err ? undefined : v, !!err);
+        }]));
+      } catch (e) { done(undefined, true); }
+    }
+    // Remembered by URL: a tab id from the context that died means nothing to the next
+    // one (measured: tabs.get on it fails after the reload), while the URL, an authorize
+    // URL with its own `state` for example, still names that one tab. A sign-in page
+    // often redirects, so the context that opened the tab follows it for RECENT_MS and
+    // remembers each URL it lands on. `n` counts the reloads spent on an entry: a tab
+    // whose relay can never answer (site access still on Ask, so no content script at
+    // all) is reloaded at most MAX_RELOADS times, not on every background wake.
+    var MAX_RELOADS = 2;
+    function recent(list) {
+      var now = Date.now(), out = [];
+      if (Array.isArray(list)) for (var n = 0; n < list.length; n++) {
+        if (list[n] && typeof list[n].url === "string" && now - list[n].t < RECENT_MS) out.push(list[n]);
+      }
+      return out;
+    }
+    // Read-modify-write, one at a time: a redirect noted while the create is still being
+    // recorded must not drop either entry.
+    var queue = Promise.resolve();
+    function update(fn) {
+      queue = queue.then(function () { return local.get(KEY); }).then(function (r) {
+        var o = {}; o[KEY] = fn(recent(r && r[KEY]));
+        return local.set(o);
+      }).catch(function () {});
+    }
+    function remember(url) {
+      update(function (list) {
+        return list.filter(function (e) { return e.url !== url; }).concat([{ url: url, t: Date.now(), n: 0 }]);
+      });
+    }
+    function follow(id, url) {
+      var until = Date.now() + RECENT_MS, last = url;
+      (function poll() {
+        if (Date.now() > until) return;
+        call(tabs.get, [id], function (tab, failed) {
+          if (failed || !tab) return;
+          if (typeof tab.url === "string" && tab.url && tab.url !== last) {
+            last = tab.url;
+            if (onBridgeOrigin(last)) remember(last);
+          }
+          setTimeout(poll, 1000);
+        });
+      })();
+    }
+
+    var nativeCreate = tabs.create;
+    if (!nativeCreate.__c2sBridgeTabs) {
+      var create = function (props, cb) {
+        var track = !!(props && onBridgeOrigin(props.url));
+        if (track) remember(props.url);
+        var note = function (tab) {
+          if (!track) return;
+          track = false;
+          if (tab && tab.id != null && typeof tabs.get === "function") follow(tab.id, props.url);
+        };
+        if (typeof cb !== "function") {
+          var r = nativeCreate.call(tabs, props);
+          if (r && typeof r.then === "function") r.then(note, function () {});
+          return r;
+        }
+        return nativeCreate.call(tabs, props, function (tab) { note(tab); return cb.apply(this, arguments); });
+      };
+      create.__c2sBridgeTabs = true;
+      try { tabs.create = create; } catch (e) {}
+      if (tabs.create !== create) {
+        try { Object.defineProperty(tabs, "create", { value: create, writable: true, configurable: true }); } catch (e) {}
+      }
+    }
+
+    Promise.resolve(local.get(KEY)).then(function (r) {
+      var entries = recent(r && r[KEY]).filter(function (e) { return !(e.n >= MAX_RELOADS); });
+      if (!entries.length) return;
+      var wanted = entries.map(function (e) { return e.url; });
+      call(tabs.query, [{}], function (list, failed) {
+        if (failed || !Array.isArray(list)) return;
+        list.forEach(function (tab) {
+          if (!tab || tab.id == null || !onBridgeOrigin(tab.url) || wanted.indexOf(tab.url) < 0) return;
+          var decided = false, t = null;
+          var decide = function (alive) {
+            if (decided) return; decided = true;
+            clearTimeout(t);
+            if (alive) return;
+            DBG("[idpoly] reloading tab", tab.id, "— its page bridge belongs to a context Safari replaced");
+            update(function (all) {
+              return all.map(function (e) { return e.url === tab.url ? { url: e.url, t: e.t, n: (e.n || 0) + 1 } : e; });
+            });
+            try { var p = tabs.reload(tab.id); if (p && typeof p.then === "function") p.then(null, function () {}); } catch (e) {}
+          };
+          t = setTimeout(function () { decide(false); }, 1000);
+          call(tabs.sendMessage, [tab.id, { __bridgeRelayPing: true }], function (v) { decide(v === true); });
+        });
+      });
+    }).catch(function () {});
+  })();
 })();
