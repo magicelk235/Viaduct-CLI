@@ -345,6 +345,98 @@ var __C2S_DEBUG__ = false;
   // didn't get covered above.
   if (api.runtime) backfillRuntimeEvents(api.runtime);
 
+  // Safari fires runtime.onInstalled {reason:"install"} every time it reloads the
+  // extension mid-session with an unchanged bundle: reinstalling the host app,
+  // launching the host app again, re-enabling the extension. WebKit
+  // (determineInstallReasonDuringLoad) queues ExtensionInstall for any load that is
+  // not at browser launch and sees no version or bundle-hash change. Chrome fires
+  // "install" once per install, and bundles act on it once: Claude opens its sign-in
+  // tab, so each reload opened another one on top of the first. The background
+  // records the installed version in storage.local, read at boot before the bundle
+  // runs; an "install" that arrives with a version already recorded reaches the
+  // bundle as the "update" Chrome reports for a reload, previousVersion included, so
+  // install-time setup (menus, alarms) still runs. Only the background decides: it
+  // is the one context alive when the event fires, and a second reader would race
+  // the first one's write.
+  (function () {
+    try {
+      if (typeof window === "undefined" || typeof location === "undefined") return;
+      if (!/^(safari-web-extension|chrome-extension|moz-extension):$/.test(location.protocol)) return;
+      var bg = false;
+      try { bg = !!(api.extension && typeof api.extension.getBackgroundPage === "function" && api.extension.getBackgroundPage() === window); } catch (e) {}
+      if (!bg) { try { bg = /\/background\.html$/.test(location.pathname); } catch (e) {} }
+      if (!bg) return;
+      var local = api.storage && api.storage.local;
+      if (!local || typeof local.get !== "function" || typeof local.set !== "function") return;
+      var KEY = "__c2sInstalledVersion";
+      var version = "";
+      try { version = String(api.runtime.getManifest().version || ""); } catch (e) {}
+      // Resolves to the recorded version, undefined when none is recorded, or null
+      // when storage could not be read (then the event passes through as Safari sent it).
+      var recorded = new Promise(function (resolve) {
+        try {
+          Promise.resolve(local.get(KEY)).then(function (r) {
+            var prev = r ? r[KEY] : undefined;
+            resolve(typeof prev === "string" ? prev : undefined);
+            if (prev !== version) {
+              var rec = {}; rec[KEY] = version;
+              try { Promise.resolve(local.set(rec)).catch(function () {}); } catch (e) {}
+            }
+          }, function () { resolve(null); });
+        } catch (e) { resolve(null); }
+      });
+      var wrappers = typeof WeakMap === "function" ? new WeakMap() : null;
+      if (!wrappers) return;
+      function correct(fn) {
+        if (typeof fn !== "function") return fn;
+        var w = wrappers.get(fn);
+        if (w) return w;
+        w = function (details) {
+          var self = this, args = arguments;
+          if (!details || details.reason !== "install") return fn.apply(self, args);
+          recorded.then(function (prev) {
+            var d = details;
+            if (typeof prev === "string") {
+              try { d = Object.assign({}, details, { reason: "update", previousVersion: prev }); } catch (e) { d = details; }
+            }
+            fn.call(self, d);
+          });
+        };
+        wrappers.set(fn, w);
+        return w;
+      }
+      // In place on the native event, the same move the storage relay makes on
+      // runtime.onMessage; the bundle keeps its own function, so removeListener and
+      // hasListener translate it to the wrapper the native event holds.
+      var pinned = [];
+      function patch(rt) {
+        var ev = rt && rt.onInstalled;
+        if (!ev || typeof ev.addListener !== "function" || ev.addListener.__c2sInstallCorrected) return;
+        // WebKit caches an event's JS wrapper weakly; holding it keeps the
+        // overrides below on the object every later read returns.
+        pinned.push(ev);
+        var add = ev.addListener, remove = ev.removeListener, has = ev.hasListener;
+        var addW = function (fn) { return add.call(ev, correct(fn)); };
+        addW.__c2sInstallCorrected = true;
+        installOverride(ev, "addListener", addW);
+        if (typeof remove === "function") {
+          installOverride(ev, "removeListener", function (fn) {
+            var w = typeof fn === "function" ? wrappers.get(fn) : null;
+            return remove.call(ev, w || fn);
+          });
+        }
+        if (typeof has === "function") {
+          installOverride(ev, "hasListener", function (fn) {
+            var w = typeof fn === "function" ? wrappers.get(fn) : null;
+            return has.call(ev, w || fn);
+          });
+        }
+      }
+      patch(api.runtime);
+      if (hasChrome && chrome.runtime && chrome.runtime !== api.runtime) patch(chrome.runtime);
+    } catch (e) {}
+  })();
+
   // chrome.scripting exists in Safari but omits the ExecutionWorld / RegistrationWorld
   // enum objects. SW/background code reads chrome.scripting.ExecutionWorld.ISOLATED
   // at module-eval (Bitwarden, React DevTools), which throws and aborts the bundle.
