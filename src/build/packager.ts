@@ -265,16 +265,21 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling, URLSessio
     // not a default launch, so the app starts windowless; activates = false keeps focus
     // on Safari. Concurrent calls wait on the lock instead of each launching.
     static let launchLock = NSLock()
-    // The app exited without ever serving: the user quit it during this Safari session
-    // (AppDelegate.applicationWillTerminate) and it declined the launch. Stop launching
-    // it; a call that reaches a broker (the user opened the app) clears this.
+    // Guarded by launchLock. launchDeclined: the app exited without ever serving, so the
+    // user quit it during this Safari session (AppDelegate.applicationWillTerminate) and
+    // it declined the launch; stop launching until a call reaches a broker again (the
+    // user opened the app). launchRetryAfter: a launch that failed outright (app moved
+    // or trashed, broker never came up) isn't retried for a while, so the calls queued
+    // behind it fail fast instead of each waiting out the same timeout.
     static var launchDeclined = false
+    static var launchRetryAfter = Date.distantPast
     static func launchBroker() -> Bool {
         #if os(macOS)
         launchLock.lock()
         defer { launchLock.unlock() }
         if let fd = connectBroker() { close(fd); return true }
-        if launchDeclined { return false }
+        if launchDeclined || Date() < launchRetryAfter { return false }
+        launchRetryAfter = Date().addingTimeInterval(30)
         // <app>.app/Contents/PlugIns/<extension>.appex, and the appex id is the app id
         // plus ".Extension" (patchProjectBundleIds). The sandbox keeps the appex from
         // reading the app's own Info.plist, so the id comes from the appex's.
@@ -286,18 +291,24 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling, URLSessio
         cfg.activates = false
         cfg.addsToRecentItems = false
         cfg.promptsUserIfNeeded = false
-        NSWorkspace.shared.open([url], withApplicationAt: appURL, configuration: cfg, completionHandler: nil)
-        var seen = false
+        var openError: Error?
+        let opened = DispatchSemaphore(value: 0)
+        NSWorkspace.shared.open([url], withApplicationAt: appURL, configuration: cfg) { _, error in
+            openError = error
+            opened.signal()
+        }
         let deadline = Date().addingTimeInterval(10)
+        if opened.wait(timeout: .now() + 10) == .timedOut || openError != nil { return false }
+        var seen = false
         while Date() < deadline {
-            usleep(100_000)
-            if let fd = connectBroker() { close(fd); return true }
+            if let fd = connectBroker() { close(fd); launchRetryAfter = .distantPast; return true }
             if !NSRunningApplication.runningApplications(withBundleIdentifier: appId).isEmpty {
                 seen = true
             } else if seen {
                 launchDeclined = true
                 return false
             }
+            usleep(100_000)
         }
         #endif
         return false
@@ -317,7 +328,10 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling, URLSessio
             }
         }
         if let reply = reply {
+            Self.launchLock.lock()
             Self.launchDeclined = false
+            Self.launchRetryAfter = .distantPast
+            Self.launchLock.unlock()
             self.reply(context, reply)
         } else {
             self.reply(context, ["error": "native-messaging broker unavailable; open the extension's app", "closed": true])

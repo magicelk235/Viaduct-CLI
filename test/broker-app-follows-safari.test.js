@@ -72,9 +72,9 @@ test("the extension starts the app when no broker is listening, without focus", 
     const swift = readFileSync(join(extDir, "SafariWebExtensionHandler.swift"), "utf-8");
     const launch = method(swift, "launchBroker");
     assert.match(launch, /\.broker:launch/);
-    assert.match(launch, /withApplicationAt: appURL/);
-    assert.match(launch, /activates = false/);
     assert.match(launch, /launchDeclined = true/, "an app that exits without serving is not launched again");
+    assert.match(launch, /Date\(\) < launchRetryAfter \{ return false \}/, "calls queued behind a failed launch fail fast");
+    assert.match(launch, /activates = false/);
     assert.match(method(swift, "handleNative"), /launchBroker\(\)/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
