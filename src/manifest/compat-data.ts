@@ -144,13 +144,13 @@ export const UNSUPPORTED_APIS: Record<
   "runtime.connectNative": {
     severity: "info",
     message: "connectNative is bridged: the (unsandboxed) container app runs a loopback broker that launches the Chrome native-messaging host from its on-disk manifest and pipes stdio framing; the sandboxed appex relays to it.",
-    fix: "Keep the container app running (it hosts the broker) and install the companion app that registered the native host.",
+    fix: "Install the companion app that registered the native host. The extension starts the container app (it hosts the broker) when it needs it.",
     shimmed: true,
   },
   "runtime.sendNativeMessage": {
     severity: "info",
     message: "sendNativeMessage is bridged: the container app's broker launches the manifest-declared native host for one exchange and returns its reply; the sandboxed appex relays over loopback.",
-    fix: "Keep the container app running and install the companion app that registered the native host.",
+    fix: "Install the companion app that registered the native host. The extension starts the container app when it needs it.",
     shimmed: true,
   },
   "tabs.move": { severity: "warning", message: "tabs.move is unsupported.", fix: "Remove or rework UX." },

@@ -151,7 +151,8 @@ export function patchProjectBundleIds(xcodeproj: string, bundleId: string): void
  *     broker that runs in the (unsandboxed) container app. The sandbox forbids the
  *     appex from exec'ing the host or reading Chrome's manifest dir, so the actual
  *     launch happens in the app; here we only relay. `network.client` permits the
- *     loopback connection.
+ *     loopback connection. When nothing listens, the appex starts the app through
+ *     its broker URL and waits for the broker (launchBroker; see writeAppBroker).
  *
  * Writes the handler when there's a proxy allowlist OR native messaging is used.
  */
@@ -183,6 +184,9 @@ export function writeNativeHandler(
 //
 import SafariServices
 import Foundation
+#if os(macOS)
+import AppKit
+#endif
 
 class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling, URLSessionTaskDelegate {
     static let allowHosts: Set<String> = [${hostsLiteral}]
@@ -228,13 +232,11 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling, URLSessio
         }
         return ok
     }
-    // One request/reply round-trip to the broker over 127.0.0.1. Returns nil when the
-    // broker (container app) isn't running.
-    static func brokerCall(_ obj: [String: Any]) -> [String: Any]? {
+    // A socket connected to the broker on 127.0.0.1, or nil when nothing listens there.
+    static func connectBroker() -> Int32? {
         if brokerPort == 0 { return nil }
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         if fd < 0 { return nil }
-        defer { close(fd) }
         _ = fcntl(fd, F_SETNOSIGPIPE, 1)
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
@@ -245,15 +247,77 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling, URLSessio
                 Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        if c < 0 { return nil }
+        if c < 0 { close(fd); return nil }
+        return fd
+    }
+    // One request/reply round-trip to the broker. nil when the broker (container app)
+    // isn't running or the round-trip broke.
+    static func brokerCall(_ obj: [String: Any]) -> [String: Any]? {
+        guard let fd = connectBroker() else { return nil }
+        defer { close(fd) }
         guard let frame = frameData(obj), writeAll(fd, frame) else { return nil }
         return readFrame(fd) as? [String: Any]
+    }
+
+    // The container app runs only while Safari does, started here on demand: the first
+    // native call of a Safari session (or after the app crashed) finds nothing
+    // listening, opens the app's broker URL, and waits for the broker. Opening a URL is
+    // not a default launch, so the app starts windowless; activates = false keeps focus
+    // on Safari. Concurrent calls wait on the lock instead of each launching.
+    static let launchLock = NSLock()
+    // The app exited without ever serving: the user quit it during this Safari session
+    // (AppDelegate.applicationWillTerminate) and it declined the launch. Stop launching
+    // it; a call that reaches a broker (the user opened the app) clears this.
+    static var launchDeclined = false
+    static func launchBroker() -> Bool {
+        #if os(macOS)
+        launchLock.lock()
+        defer { launchLock.unlock() }
+        if let fd = connectBroker() { close(fd); return true }
+        if launchDeclined { return false }
+        // <app>.app/Contents/PlugIns/<extension>.appex, and the appex id is the app id
+        // plus ".Extension" (patchProjectBundleIds). The sandbox keeps the appex from
+        // reading the app's own Info.plist, so the id comes from the appex's.
+        let appURL = Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        guard let extId = Bundle.main.bundleIdentifier, extId.hasSuffix(".Extension") else { return false }
+        let appId = String(extId.dropLast(".Extension".count))
+        guard let url = URL(string: appId.lowercased() + ".broker:launch") else { return false }
+        let cfg = NSWorkspace.OpenConfiguration()
+        cfg.activates = false
+        cfg.addsToRecentItems = false
+        cfg.promptsUserIfNeeded = false
+        NSWorkspace.shared.open([url], withApplicationAt: appURL, configuration: cfg, completionHandler: nil)
+        var seen = false
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            usleep(100_000)
+            if let fd = connectBroker() { close(fd); return true }
+            if !NSRunningApplication.runningApplications(withBundleIdentifier: appId).isEmpty {
+                seen = true
+            } else if seen {
+                launchDeclined = true
+                return false
+            }
+        }
+        #endif
+        return false
     }
 
     func handleNative(_ context: NSExtensionContext, _ dict: [String: Any]) {
         var env = dict
         env["token"] = Self.brokerToken
-        if let reply = Self.brokerCall(env) {
+        var reply = Self.brokerCall(env)
+        // Retry only when nothing was listening: a round-trip that broke after
+        // connecting may already have been acted on.
+        if reply == nil {
+            if let fd = Self.connectBroker() {
+                close(fd)
+            } else if Self.launchBroker() {
+                reply = Self.brokerCall(env)
+            }
+        }
+        if let reply = reply {
+            Self.launchDeclined = false
             self.reply(context, reply)
         } else {
             self.reply(context, ["error": "native-messaging broker unavailable; open the extension's app", "closed": true])
@@ -448,23 +512,18 @@ export function grantDownloadsFolder(xcodeproj: string): void {
 }
 
 /**
- * The argument the broker LaunchAgent passes when it starts the container app. The
- * agent starts it at login and again whenever it dies without quitting (a crash), and
- * such a launch only serves the extension, so the app keeps its window closed.
- */
-export const BROKER_LAUNCH_ARG = "--viaduct-broker";
-
-/**
  * Install the native-messaging broker into the (unsandboxed) container app by
  * rewriting its AppDelegate.swift. The broker listens on 127.0.0.1:<port>, gated by
  * a build-time token, and for each `__c2sNM` op the appex forwards it: locates the
  * Chrome native-messaging host manifest, launches the host binary, and pipes Chrome's
  * stdio framing — persisting each launched host across ops keyed by the JS port id.
- * The app stays alive after its window closes so the broker keeps serving, and the
- * window's setup button closes the window instead of quitting (keepAppOpenFromSetupButton).
- * A launch carrying BROKER_LAUNCH_ARG starts windowless; opening the app shows the
- * window. Quitting the app stops the broker LaunchAgent, so the app stays quit and
- * can be deleted.
+ *
+ * The app lives as long as Safari does. The appex starts it on demand through its
+ * broker URL (writeNativeHandler), a launch that stays windowless; the app quits
+ * when the last Safari quits. A user quit sticks for the rest of that Safari session,
+ * so the app can be quit and deleted while Safari runs. Opening the app shows the
+ * window, and the window's setup button closes the window instead of quitting
+ * (keepAppOpenFromSetupButton).
  */
 export function writeAppBroker(xcodeproj: string, opts: { brokerPort: number; brokerToken: string }): void {
   const root = xcodeproj.replace(/[^/]+\.xcodeproj$/, "");
@@ -487,51 +546,91 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var activityToken: NSObjectProtocol?
     // The storyboard's window, kept (not released on close) so a reopen can show it again.
     var mainWindow: NSWindow?
+    // The browsers that load the extension; the broker only exists for them. Exact ids:
+    // Safari's helper apps (com.apple.Safari.SandboxBroker, …) share the prefix and
+    // never quit.
+    static let browsers: Set<String> = ["com.apple.Safari", "com.apple.SafariTechnologyPreview"]
+    // The browser sessions (pid@launch time) the user quit the app during.
+    static let declinedKey = "ViaductDeclinedBrowserSessions"
+    static func browserSessions() -> [String] {
+        return NSWorkspace.shared.runningApplications.compactMap { app in
+            guard let id = app.bundleIdentifier, browsers.contains(id), !app.isTerminated else { return nil }
+            return String(app.processIdentifier) + "@" + String(Int(app.launchDate?.timeIntervalSince1970 ?? 0))
+        }
+    }
+    // The launch opened the extension's broker URL (SafariWebExtensionHandler.launchBroker).
+    // AppKit delivers a launch URL between willFinishLaunching and didFinishLaunching.
+    var launchedByExtension = false
     func applicationWillFinishLaunching(_ notification: Notification) {
         mainWindow = NSApp.windows.first { $0.contentViewController != nil }
         mainWindow?.isReleasedWhenClosed = false
-        // The broker LaunchAgent starts the app at login and again if it crashes.
-        // That launch only serves the extension, so keep the window closed; ordering it
-        // out here, before the first display pass, leaves no flash.
-        if CommandLine.arguments.contains("${BROKER_LAUNCH_ARG}") {
-            mainWindow?.orderOut(nil)
-        }
+        // Hidden until the launch says who asked for it; ordering it out here, before
+        // the first display pass, leaves no flash. didFinishLaunching shows it again
+        // for a user launch.
+        mainWindow?.orderOut(nil)
+    }
+    func application(_ application: NSApplication, open urls: [URL]) {
+        launchedByExtension = true
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // The extension's launch only serves the extension and stays windowless; any
+        // other launch is the user's. launchIsDefaultUserInfoKey can't tell them apart:
+        // it is false for a plain open too whenever AppKit restores the window.
+        let userLaunch = !launchedByExtension
+        if userLaunch {
+            UserDefaults.standard.removeObject(forKey: Self.declinedKey)
+        } else if let declined = UserDefaults.standard.stringArray(forKey: Self.declinedKey),
+                  Self.browserSessions().contains(where: { declined.contains($0) }) {
+            // The user quit the app during this Safari session: stay quit until Safari
+            // restarts or the user opens the app. The appex stops asking once it sees
+            // the app exit without a broker.
+            NSApp.terminate(nil)
+            return
+        }
         // The broker is a windowless background helper. macOS "automatic termination"
-        // reaps such a process when it looks idle (observed live: the app was terminated
-        // and KeepAlive-relaunched), which WIPES the broker's in-memory host map and
-        // orphans live native hosts → every subsequent poll returns closed. Holding a
-        // background activity for the whole process lifetime is the documented, reliable
-        // opt-out (it disables both automatic and sudden termination while held).
+        // reaps such a process when it looks idle (observed live), which WIPES the
+        // broker's in-memory host map and orphans live native hosts → every subsequent
+        // poll returns closed. Holding a background activity for the whole process
+        // lifetime is the documented, reliable opt-out (it disables both automatic and
+        // sudden termination while held).
         NSApp.setActivationPolicy(.accessory)
         activityToken = ProcessInfo.processInfo.beginActivity(
             options: [.automaticTerminationDisabled, .suddenTerminationDisabled, .background],
             reason: "native-messaging broker")
+        // Quit with Safari: the extension, and every native host it opened, is gone.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  let id = app.bundleIdentifier, Self.browsers.contains(id) else { return }
+            if Self.browserSessions().isEmpty && !(self?.mainWindow?.isVisible ?? false) {
+                NSApp.terminate(nil)
+            }
+        }
         NMBroker.shared.start()
+        if userLaunch { mainWindow?.makeKeyAndOrderFront(nil) }
     }
-    // Stay alive after the window closes so the broker keeps serving the extension.
+    // Closing the window leaves the broker serving while Safari runs, and quits once
+    // Safari is gone (the window was all that kept the app open).
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        return false
+        return Self.browserSessions().isEmpty
     }
-    // Every quit that reaches here is deliberate: ⌘Q, a quit Apple event (Activity
-    // Monitor, a script), or logout. Stop the broker LaunchAgent first, or it relaunches
-    // the app the moment it exits: the app could never stay quit, and Finder refuses to
-    // move a running app to the Trash. A crash never gets here, so the agent still
-    // restarts a crashed broker. The agent's plist stays, so login starts it again.
+    // A quit while Safari runs is the user's: ⌘Q, Activity Monitor, a quit Apple event.
+    // Remember that Safari session so the extension's next native call doesn't start
+    // the app straight back up (it polls every ~150 ms), which would leave the app
+    // impossible to quit and, running, impossible to move to the Trash. Quitting with
+    // Safari finds no session and clears the record.
     func applicationWillTerminate(_ notification: Notification) {
-        guard let id = Bundle.main.bundleIdentifier else { return }
-        let launchctl = Process()
-        launchctl.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        launchctl.arguments = ["bootout", "gui/" + String(getuid()) + "/" + id + ".broker"]
-        launchctl.standardOutput = FileHandle.nullDevice
-        launchctl.standardError = FileHandle.nullDevice
-        guard (try? launchctl.run()) != nil else { return }
-        launchctl.waitUntilExit()
+        let sessions = Self.browserSessions()
+        if sessions.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.declinedKey)
+        } else {
+            UserDefaults.standard.set(sessions, forKey: Self.declinedKey)
+        }
     }
     // Opening the app (Finder, Launchpad, Spotlight) while it runs windowless sends a
     // reopen: show the window, reloaded so it reports the extension's current state.
-    // The LaunchAgent's \`open -g\` sends no reopen, so it never brings the window back.
+    // The extension's URL launch sends no reopen, so it never brings the window back.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         guard !flag, let window = mainWindow else { return true }
         Self.webView(in: window.contentView)?.reload()
@@ -959,16 +1058,36 @@ final class NMBroker {
 `;
   for (const d of delegates) {
     writeFileSync(d, swift, "utf-8");
+    registerBrokerUrlScheme(join(dirname(d), "Info.plist"));
     keepAppOpenFromSetupButton(dirname(d));
   }
 }
 
 /**
+ * The URL scheme the appex opens to start the app: `<app bundle id>.broker:`. Opening a
+ * URL is not a default launch, which is how the app tells the extension's launch from
+ * the user's and keeps its window closed. A sandboxed caller can't pass launch
+ * arguments, so a URL is the signal it can send.
+ */
+function registerBrokerUrlScheme(infoPlist: string): void {
+  if (!existsSync(infoPlist)) return;
+  const src = readFileSync(infoPlist, "utf-8");
+  if (src.includes("CFBundleURLTypes")) return;
+  const entry =
+    "\t<key>CFBundleURLTypes</key>\n\t<array>\n\t\t<dict>\n" +
+    "\t\t\t<key>CFBundleURLName</key>\n\t\t\t<string>$(PRODUCT_BUNDLE_IDENTIFIER).broker</string>\n" +
+    "\t\t\t<key>CFBundleURLSchemes</key>\n\t\t\t<array>\n\t\t\t\t<string>$(PRODUCT_BUNDLE_IDENTIFIER).broker</string>\n\t\t\t</array>\n" +
+    "\t\t</dict>\n\t</array>\n";
+  const next = src.replace(/<\/dict>\s*<\/plist>\s*$/, (tail) => entry + tail);
+  if (next !== src) writeFileSync(infoPlist, next, "utf-8");
+}
+
+/**
  * The app's window has one button, Apple's template's "Quit and Open Safari Settings…",
- * which opens Safari's settings and then terminates the app. In a broker build a quit
- * stops native messaging until the next login (see applicationWillTerminate above), and
- * that button is the first thing a user clicks after installing. So it closes the window
- * instead, the app keeps serving in the background, and its label drops "Quit".
+ * which opens Safari's settings and then terminates the app. In a broker build that quit
+ * stops native messaging for the rest of the Safari session (see applicationWillTerminate
+ * above), and the button is the first thing a user clicks after installing. So it closes
+ * the window instead, the app keeps serving in the background, and its label drops "Quit".
  */
 function keepAppOpenFromSetupButton(appDir: string): void {
   for (const file of findFiles(appDir, (n) => n === "ViewController.swift" || n === "Script.js" || n === "Main.html", 3)) {

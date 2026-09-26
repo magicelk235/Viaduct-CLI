@@ -1,8 +1,8 @@
-import { mkdirSync, existsSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, existsSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, relative, isAbsolute, basename } from "node:path";
 import { run, info, ok, warn, fail, moveBundle } from "../util.js";
-import { pluginkitStatus, defaultBundleId, deriveAppName, plistValue, BROKER_LAUNCH_ARG } from "./packager.js";
+import { pluginkitStatus, defaultBundleId, deriveAppName, plistValue } from "./packager.js";
 
 /** Full path to LaunchServices' lsregister (not on PATH). */
 export const LSREGISTER =
@@ -40,8 +40,8 @@ export function expandHome(p: string): string {
 }
 
 /**
- * Read an installed .app's real CFBundleIdentifier (what the broker LaunchAgent was
- * keyed on at install time — a custom --bundle-id, not necessarily com.viaduct.<name>).
+ * Read an installed .app's real CFBundleIdentifier (what an earlier install's broker
+ * LaunchAgent was keyed on — a custom --bundle-id, not necessarily com.viaduct.<name>).
  * Handles both bundle layouts: macOS nests Info.plist under Contents/, iOS is flat.
  * Falls back to the derived default id when the plist can't be read (bundle already
  * gone, unreadable) so uninstall still makes a best-effort broker cleanup.
@@ -84,6 +84,12 @@ export function installToSafari(opts: InstallOptions): InstallResult {
   const dest = join(targetDir, `${opts.appName}.app`);
 
   info(`Installing host app → ${dest}`);
+  // An earlier install may still be running from dest, possibly under a LaunchAgent that
+  // restarts it. Remove the agent first, then stop the app, so the new bundle is what
+  // runs next.
+  if (existsSync(dest)) removeLegacyBrokerAgent(installedBundleId(dest, opts.appName));
+  removeLegacyBrokerAgent(opts.bundleId);
+  stopRunningApp(dest);
   // Move (not copy) the signed Release product here, leaving no duplicate behind. A
   // same-volume rename is atomic and preserves the signature/seal untouched.
   if (!moveBundle(opts.builtAppPath, dest)) {
@@ -223,12 +229,13 @@ export function uninstallFromSafari(appName: string, installDir?: string): boole
     return false;
   }
 
-  // Remove the broker LaunchAgent (best-effort). It was keyed on the app's ACTUAL
-  // bundle id when installed, which may be a custom --bundle-id, not com.viaduct.<name>.
-  // Read it back off the still-present bundle (this runs before the rmSync below) so a
-  // custom-id install's plist is actually removed; fall back to the default id only if
-  // the plist read fails.
-  uninstallBrokerAgent(installedBundleId(dest, cleanName));
+  // Remove a LaunchAgent an earlier install left (best-effort). It was keyed on the
+  // app's ACTUAL bundle id when installed, which may be a custom --bundle-id, not
+  // com.viaduct.<name>. Read it back off the still-present bundle (this runs before the
+  // rmSync below); fall back to the default id only if the plist read fails. Then stop
+  // the app, so nothing keeps running from the deleted bundle.
+  removeLegacyBrokerAgent(installedBundleId(dest, cleanName));
+  stopRunningApp(dest);
 
   // Unregister BEFORE deleting so LaunchServices drops the appex record cleanly.
   const unreg = run(LSREGISTER, ["-u", dest]);
@@ -246,96 +253,34 @@ export function uninstallFromSafari(appName: string, installDir?: string): boole
   return true;
 }
 
-/** Path to the per-user LaunchAgent plist that keeps the broker alive. */
-function brokerAgentPlistPath(bundleId: string): string {
-  return join(homedir(), "Library", "LaunchAgents", `${bundleId}.broker.plist`);
-}
-
 /**
- * The broker LaunchAgent plist. It launches the app via `open -g -W`: `open` gives the
- * app a real GUI session so AppKit initializes and the broker actually starts
- * (launching the binary directly does NOT — applicationDidFinishLaunching never
- * fires), `-g` keeps it in the background, and `-W` blocks until the app exits so
- * KeepAlive relaunches it. RunAtLoad starts it at login. BROKER_LAUNCH_ARG tells the
- * app the launch is the agent's, so it starts without its window.
- *
- * KeepAlive holds only while the app exists (PathState). A quit boots the agent out
- * from inside the app (applicationWillTerminate, packager.ts), so what it relaunches
- * is a crash. Once the app is deleted, the plist left behind runs `open` once at login
- * and stops, instead of retrying the missing app forever.
+ * Remove the broker LaunchAgent (`<bundleId>.broker`) that earlier installs wrote. It
+ * restarted the app at login and whenever it exited, so the app could never stay quit
+ * and Finder refused to trash it. The app now runs only while Safari does, started on
+ * demand by the appex (writeAppBroker, packager.ts), so the agent only gets in the way.
  */
-export function brokerAgentPlist(appPath: string, label: string): string {
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>${label}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/bin/open</string>
-    <string>-g</string>
-    <string>-W</string>
-    <string>${appPath}</string>
-    <string>--args</string>
-    <string>${BROKER_LAUNCH_ARG}</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key>
-  <dict>
-    <key>PathState</key>
-    <dict><key>${appPath}</key><true/></dict>
-  </dict>
-  <key>ProcessType</key><string>Background</string>
-</dict>
-</plist>
-`;
-}
-
-/**
- * Install a LaunchAgent that keeps the container app (the native-messaging broker)
- * running. macOS auto-terminates the idle GUI app (observed live), which kills the
- * broker; the agent relaunches it (see brokerAgentPlist).
- */
-export function installBrokerAgent(appPath: string, bundleId: string): boolean {
-  if (!existsSync(appPath)) {
-    warn(`Broker app not found at ${appPath}; native messaging will only work while the app is open manually.`);
-    return false;
-  }
+function removeLegacyBrokerAgent(bundleId: string): void {
   const label = `${bundleId}.broker`;
-  const plist = brokerAgentPlistPath(bundleId);
-  const xml = brokerAgentPlist(appPath, label);
-  try {
-    mkdirSync(join(homedir(), "Library", "LaunchAgents"), { recursive: true });
-    writeFileSync(plist, xml, "utf-8");
-  } catch (e) {
-    warn(`Could not write broker LaunchAgent: ${(e as Error).message}`);
-    return false;
-  }
-  const uid = String(process.getuid?.() ?? "");
-  const domain = `gui/${uid}`;
-  // Re-bootstrap cleanly: bootout an old instance (ignore errors), then bootstrap.
-  run("launchctl", ["bootout", `${domain}/${label}`]);
-  const boot = run("launchctl", ["bootstrap", domain, plist]);
-  if (boot.code !== 0) {
-    // Fall back to the legacy load verb on older macOS.
-    const legacy = run("launchctl", ["load", "-w", plist]);
-    if (legacy.code !== 0) {
-      warn(`Could not load broker LaunchAgent (${boot.stderr.trim() || legacy.stderr.trim() || "launchctl failed"}); the broker will only run while the app is open.`);
-      return false;
-    }
-  }
-  ok(`Broker LaunchAgent installed (${label}); native messaging stays alive across restarts.`);
-  return true;
-}
-
-/** Remove and unload the broker LaunchAgent, if present. */
-export function uninstallBrokerAgent(bundleId: string): void {
-  const label = `${bundleId}.broker`;
-  const plist = brokerAgentPlistPath(bundleId);
-  const uid = String(process.getuid?.() ?? "");
-  run("launchctl", ["bootout", `gui/${uid}/${label}`]);
+  const plist = join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
+  run("launchctl", ["bootout", `gui/${process.getuid?.() ?? ""}/${label}`]);
   if (existsSync(plist)) {
     run("launchctl", ["unload", "-w", plist]);
     try { rmSync(plist, { force: true }); } catch { /* best effort */ }
+  }
+}
+
+/**
+ * Stop a host app still running from `appPath`, with SIGTERM. Not a quit Apple event:
+ * a quit while Safari runs reads as the user's and keeps the app from starting again
+ * for the rest of that Safari session (applicationWillTerminate, packager.ts). Install
+ * replaces the bundle and uninstall deletes it, so the old process has to go; the
+ * extension starts the new one on its next native call.
+ */
+function stopRunningApp(appPath: string): void {
+  const exe = join(appPath, "Contents", "MacOS") + "/";
+  for (const line of run("/bin/ps", ["-axo", "pid=,args="]).stdout.split("\n")) {
+    const m = line.match(/^\s*(\d+)\s(.*)$/);
+    if (!m || !m[2].startsWith(exe)) continue;
+    try { process.kill(Number(m[1]), "SIGTERM"); } catch { /* already gone */ }
   }
 }

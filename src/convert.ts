@@ -12,7 +12,7 @@ import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
 import { synthesizePlaceholderIcons } from "./input/icons.js";
 import { writeTempLoadInstructions } from "./build/tempload.js";
-import { installToSafari, installBrokerAgent } from "./build/installer.js";
+import { installToSafari } from "./build/installer.js";
 import {
   runPackager,
   patchProjectBundleIds,
@@ -462,7 +462,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
         writeAppBroker(xcodeproj, { brokerPort, brokerToken });
         unsandboxAppTarget(xcodeproj);
         ok(`Native-messaging broker installed in the app (loopback :${brokerPort}); app target unsandboxed (appex stays sandboxed).`);
-        warn("Native messaging needs the container app running (it hosts the broker) and the companion app's native host installed. The app stays open in the background after you close its window; quitting it stops native messaging.");
+        warn("Native messaging needs the companion app's native host installed. The extension starts its container app (which hosts the broker) when it needs it, and the app quits with Safari.");
       }
     }
 
@@ -537,9 +537,6 @@ export function convert(opts: ConvertOptions): ConvertResult {
         result.appPath = inst.installedAppPath;
         result.installedAppPath = inst.installedAppPath;
         ok(`Installed → ${inst.installedAppPath}`);
-        // Keep the broker (in the container app) alive across restarts/idle so the
-        // sandboxed appex can always reach it over loopback.
-        if (usesNativeMessaging) installBrokerAgent(inst.installedAppPath, bundleId);
       } else {
         // The user asked for --install and it didn't happen. The build is fine, so we
         // still surface the app path, but flag the run as install-failed so the CLI
