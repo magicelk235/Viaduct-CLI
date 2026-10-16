@@ -153,6 +153,106 @@ var __C2S_DEBUG__ = false;
   api = typeof browser !== "undefined" ? browser : (typeof chrome !== "undefined" ? chrome : null);
   hasChrome = typeof chrome !== "undefined";
   if (!api) return;
+
+  // ── EXTENSION FRAMES INSIDE A WEB PAGE ──────────────────────────────────────
+  // A content script that iframes one of the extension's pages into a site (an
+  // in-page HUD, command bar, picker) puts that page in the SITE's WebContent
+  // process. Safari only marks a process privileged for an extension when the page
+  // it was created for belongs to that extension, so this frame's process never
+  // is. It still exposes `tabs`, `windows`, `scripting`, … to the frame, but the
+  // UI process validates every call to those namespaces against the privileged
+  // process and, on a mismatch, treats the frame as a compromised web process and
+  // terminates it, taking the user's page down with it (WebKit's
+  // isLoadedAndPrivilegedMessage validator; logged as "Received an invalid message
+  // WebExtensionContext_TabsQuery from WebContent process"). Chrome runs those calls
+  // normally. So in such a frame every method of those namespaces is relayed to the
+  // background, which holds the real API and answers over runtime messaging (a
+  // `runtime`/`storage` call is validated as merely loaded and is safe here).
+  var C2S_FRAME_RELAY = "__c2sFrameApi";
+  var C2S_PRIVILEGED_NS = ["tabs", "windows", "action", "browserAction", "pageAction", "alarms", "bookmarks", "commands",
+    "cookies", "declarativeNetRequest", "menus", "contextMenus", "notifications", "offscreen", "scripting", "sidebarAction",
+    "sidePanel", "webNavigation"];
+  var c2sFramedInWebPage = (function () {
+    try {
+      if (typeof window === "undefined" || typeof location === "undefined") return false;
+      if (!/^(safari-web-extension|chrome-extension|moz-extension):$/.test(location.protocol)) return false;
+      if (window.top === window) return false;
+      // A frame inside the extension's own popup or tab shares its privileged process.
+      try { return window.top.location.protocol !== location.protocol; } catch (e) { return true; }
+    } catch (e) { return false; }
+  })();
+  if (c2sFramedInWebPage) {
+    (function () {
+      var relay = function (ns, m) {
+        return function () {
+          var args = Array.prototype.slice.call(arguments);
+          var cb = (args.length && typeof args[args.length - 1] === "function") ? args.pop() : null;
+          // A Port cannot cross the relay; fail the one call instead of the whole tab.
+          if (m === "connect") throw new Error(ns + ".connect() is unavailable in an extension frame embedded in a web page");
+          var p = new Promise(function (resolve, reject) {
+            var answer = function (r) {
+              if (r && typeof r === "object" && "err" in r) reject(new Error(r.err));
+              else resolve(r && typeof r === "object" ? r.v : undefined);
+            };
+            try {
+              var rt = (typeof chrome !== "undefined" && chrome.runtime) || api.runtime;
+              var q = rt.sendMessage({ __c2sFrameApi: { ns: ns, m: m, args: args } });
+              if (q && typeof q.then === "function") q.then(answer, reject);
+            } catch (e) { reject(e); }
+          });
+          if (!cb) return p;
+          p.then(function (v) { try { cb(v); } catch (e) {} }, function (e) {
+            setLastErr({ message: String((e && e.message) || e) });
+            try { cb(); } catch (x) {}
+            setLastErr(undefined);
+          });
+          return undefined;
+        };
+      };
+      // A fresh object per namespace rather than patching members in place: Safari's
+      // `scripting` is an exotic slot whose members ignore both assignment and
+      // defineProperty, while the (thawed) root accepts a replacement. Events and
+      // enums carry over untouched; adding a listener is not a privileged call.
+      var relayed = function (nsName, ns) {
+        var out = {};
+        // WebKit keeps the methods on the namespace's prototype, and some namespaces
+        // (scripting) make them non-enumerable, so walk the chain by own names.
+        var names = [];
+        for (var o = ns; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
+          try { var own = Object.getOwnPropertyNames(o); for (var oi = 0; oi < own.length; oi++) if (own[oi] !== "constructor" && names.indexOf(own[oi]) < 0) names.push(own[oi]); } catch (e) {}
+        }
+        for (var mi = 0; mi < names.length; mi++) {
+          var v; try { v = ns[names[mi]]; } catch (e) { continue; }
+          out[names[mi]] = (typeof v === "function") ? relay(nsName, names[mi]) : v;
+        }
+        return out;
+      };
+      var roots = [api];
+      if (typeof chrome !== "undefined" && chrome && roots.indexOf(chrome) < 0) roots.push(chrome);
+      for (var ri = 0; ri < roots.length; ri++) {
+        for (var ni = 0; ni < C2S_PRIVILEGED_NS.length; ni++) {
+          var nsName = C2S_PRIVILEGED_NS[ni];
+          var ns; try { ns = roots[ri][nsName]; } catch (e) { continue; }
+          if (!ns || typeof ns !== "object" || ns.__c2sFrameRelayed) continue;
+          var out = relayed(nsName, ns);
+          try { out.__c2sFrameRelayed = true; } catch (e) {}
+          if (!installOverride(roots[ri], nsName, out)) {
+            // The root kept its slot (a native root that was never frozen, so never
+            // thawed). Patch the members, and where an exotic namespace ignores that,
+            // the prototype WebKit keeps them on: in this realm every call must relay.
+            for (var pk in out) {
+              if (typeof out[pk] !== "function" || installOverride(ns, pk, out[pk])) continue;
+              var proto = Object.getPrototypeOf(ns);
+              while (proto && !Object.prototype.hasOwnProperty.call(proto, pk)) proto = Object.getPrototypeOf(proto);
+              if (proto && proto !== Object.prototype) installOverride(proto, pk, out[pk]);
+            }
+            try { ns.__c2sFrameRelayed = true; } catch (e) {}
+          }
+        }
+      }
+      dbg("[c2s] extension frame inside a web page: privileged API calls relay to the background");
+    })();
+  }
   // ────────────────────────────────────────────────────────────────────────────
 
   // navigator.userAgent Chrome-version spoof. Websites (and extension code reacting
@@ -7268,6 +7368,51 @@ var __C2S_DEBUG__ = false;
       if (!target) return;
       for (var op in proxied) installOverride(target, op, proxied[op]);
     })();
+
+    // Background side of the embedded-frame relay (see EXTENSION FRAMES INSIDE A WEB
+    // PAGE near the top). Registered after the storage relay for the same reason as
+    // the session owner above. Only the extension's own documents may use it: a
+    // content script's sender.url is the web page, and letting one through would
+    // hand it APIs (cookies, scripting) Chrome never gives a content script.
+    if (c2sIsBackgroundDoc()) {
+      try {
+        chrome.runtime.onMessage.addListener(function (msg, sender, respond) {
+          var req = msg && msg[C2S_FRAME_RELAY];
+          if (!req || typeof req.ns !== "string" || typeof req.m !== "string") return;
+          var base = "";
+          try { base = chrome.runtime.getURL("").toLowerCase(); } catch (e) {}
+          var from = String((sender && sender.url) || "").toLowerCase();
+          if (!base || from.indexOf(base) !== 0 || C2S_PRIVILEGED_NS.indexOf(req.ns) < 0) return;
+          return new Promise(function (resolve) {
+            var done = function (o) { try { respond(o); } catch (e) {} resolve(o); };
+            var fail = function (e) { done({ err: String((e && e.message) || e) }); };
+            try {
+              var ns = req.ns, m = req.m, args = Array.isArray(req.args) ? req.args : [];
+              var run = function (tab) {
+                // "Current" means the frame's own tab, which only the sender can name here.
+                if (ns === "tabs" && m === "getCurrent") return done({ v: tab });
+                if (ns === "windows" && m === "getCurrent") {
+                  if (!tab || typeof tab.windowId !== "number") return fail("No current window");
+                  m = "get"; args = [tab.windowId].concat(args);
+                }
+                var target = chrome[ns], fn = target && target[m];
+                if (typeof fn !== "function") return fail(ns + "." + m + " is not a function");
+                var r = fn.apply(target, args);
+                if (r && typeof r.then === "function") r.then(function (v) { done({ v: v }); }, fail);
+                else done({ v: r });
+              };
+              var tab = sender && sender.tab;
+              if (tab || m !== "getCurrent") return run(tab);
+              // A request that came through the storage relay carries no tab. The frame
+              // sits in a page the user is on, so take the focused window's active tab.
+              var lq = chrome.tabs.query({ active: true, lastFocusedWindow: true });
+              if (lq && typeof lq.then === "function") lq.then(function (ts) { run(ts && ts[0]); }, function () { run(undefined); });
+              else run(undefined);
+            } catch (e) { fail(e); }
+          });
+        });
+      } catch (e) {}
+    }
 
   // api.anthropic.com requires the "anthropic-dangerous-direct-browser-access"
   // header on every browser-origin request; the SDK adds it to /v1/messages but
