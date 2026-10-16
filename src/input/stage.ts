@@ -660,6 +660,64 @@ export function idempotentContentScriptGlobals(
   return modified;
 }
 
+// Safari also evaluates a content-script group once per GRANTED origin pattern whose host
+// covers the page, not once per page. An extension that never asks for <all_urls> gets
+// each of its requested patterns granted individually (Safari's site-access grant writes
+// the whole requested list, host_permissions plus every content_scripts `matches`), so a
+// bundle with many path-specific matches on one host runs that many times into the same
+// world and document. Measured on Augmented Steam: 49 of its 196 patterns are on
+// *.steampowered.com, and every store page got 49 copies of each widget; granting two of
+// them gave exactly two runs. A grant of *.youtube.com plus www.youtube.com (Return
+// YouTube Dislike's) would double up the same way.
+//
+// So each content-script file records on `document` that it ran and throws at its top on
+// a repeat, which stops that one file. The repeats all land in one task (measured: 49
+// evaluations over ~420 ms, none of their zero-delay timers fired before the last), so
+// the mark clears on the next macrotask: a later, deliberate run of the same file
+// (scripting.executeScript re-injecting it, a second content_scripts entry at another
+// run_at) still runs, as in Chrome. DOM expandos are per world, so the isolated and page
+// worlds keep separate marks. Inserted after a "use strict" prologue so strictness is
+// kept, and on the first line so source-map line numbers don't move.
+const RERUN_GUARD_KEY = "__c2sRanContentScripts";
+const PROLOGUE_RE = /^(?:\s+|\/\/[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*(["'])use strict\1[ \t]*;?/;
+
+export function guardContentScriptReruns(
+  stageDir: string,
+  manifest: { content_scripts?: Array<{ js?: unknown }> }
+): number {
+  const files = new Set<string>();
+  for (const cs of manifest.content_scripts ?? []) {
+    if (!Array.isArray(cs.js)) continue;
+    for (const j of cs.js) {
+      if (typeof j === "string" && j) files.add(j.replace(/^\.?\//, "").replace(/\\/g, "/"));
+    }
+  }
+  let modified = 0;
+  for (const rel of files) {
+    const file = join(stageDir, rel);
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    if (content.includes(RERUN_GUARD_KEY)) continue;
+    const k = JSON.stringify(rel);
+    const mark = `document.${RERUN_GUARD_KEY}`;
+    const guard =
+      `if(typeof document!=="undefined"){if((${mark}=${mark}||{})[${k}])` +
+      `throw new Error("Safari evaluated this content script again in the same document; the repeat is skipped");` +
+      `${mark}[${k}]=1;setTimeout(function(){try{delete ${mark}[${k}]}catch(e){}},0);}`;
+    const bom = content.startsWith("\uFEFF") ? "\uFEFF" : "";
+    const body = bom ? content.slice(1) : content;
+    const m = PROLOGUE_RE.exec(body);
+    const out = m ? body.slice(0, m[0].length) + ";" + guard + body.slice(m[0].length) : guard + body;
+    writeFileSync(file, bom + out, "utf-8");
+    modified++;
+  }
+  return modified;
+}
+
 // A template literal whose ENTIRE value is `chrome-extension://${<ext-id>}/<path>` is a
 // self-page navigation (fed to tabs.create / window.open / location=), NOT an OAuth
 // redirect_uri. rewriteChromeSchemeLiterals deliberately skips `chrome-extension://${…}`

@@ -6,7 +6,7 @@ import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
 import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths, raiseMinVersionForMainWorld, MAIN_WORLD_MIN_SAFARI_VERSION } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
-import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteExtensionOriginFromRuntimeId, rewriteChromeSchemeLiterals, rewriteNativeMessagingCalls, rewriteExtensionIdPlaceholderUrls, guardAncestorOriginsAccess, guardGeckoSettingsAccess, rewriteSelfPageExtensionUrls, rewriteBackgroundContextChecks, idempotentContentScriptGlobals, guardLocaleTailMessage } from "./input/stage.js";
+import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteExtensionOriginFromRuntimeId, rewriteChromeSchemeLiterals, rewriteNativeMessagingCalls, rewriteExtensionIdPlaceholderUrls, guardAncestorOriginsAccess, guardGeckoSettingsAccess, rewriteSelfPageExtensionUrls, rewriteBackgroundContextChecks, idempotentContentScriptGlobals, guardContentScriptReruns, guardLocaleTailMessage } from "./input/stage.js";
 import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireUserScriptsContentScript, wireCdpKeepalive, deriveProxyHosts, derivePanelWindowQuery, DEBUG_RPC_TOKEN_FILENAME } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
@@ -320,6 +320,11 @@ export function convert(opts: ConvertOptions): ConvertResult {
 
     const strippedMaps = stripDanglingSourcemaps(stageDir);
     if (strippedMaps > 0) ok(`Stripped dangling sourcemap refs from ${strippedMaps} script(s)`);
+
+    // Safari evaluates a content-script group once per granted origin pattern on the
+    // page's host. Every content script, ours included, so runs once per document.
+    const guarded = guardContentScriptReruns(stageDir, transformed);
+    if (guarded > 0) ok(`Guarded ${guarded} content script(s) against Safari's repeated injection`);
 
     // The world:"MAIN" entries wirePageWorldMainInjection added above need a Safari floor
     // that can run them: below 18.4 Safari ignores the entry silently. Only OUR
