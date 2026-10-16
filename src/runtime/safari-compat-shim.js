@@ -1909,12 +1909,12 @@ var __C2S_DEBUG__ = false;
       }
 
       // chrome.tabs zoom surface (getZoom/setZoom/get|setZoomSettings/onZoomChange) is
-      // ABSENT in Safari. A bundle that reads `chrome.tabs.onZoomChange.addListener` at
-      // module-eval hits `undefined.addListener` → TypeError that aborts the whole
+      // ABSENT in older Safari. A bundle that reads `chrome.tabs.onZoomChange.addListener`
+      // at module-eval hits `undefined.addListener` → TypeError that aborts the whole
       // SW/popup script (every later listener never registers). Backfill inert,
       // promise/callback-dual stubs so the surface is reachable without crashing; zoom
-      // is a no-op (Safari can't programmatically zoom a tab) but get* returns sane
-      // defaults so callers don't choke on undefined. Only fill what Safari omits.
+      // is a no-op there but get* returns sane defaults so callers don't choke on
+      // undefined. Only fill what Safari omits.
       if (chrome.tabs) {
         var zoomDual = function (value, cb) {
           if (typeof cb === "function") { try { cb(value); } catch (e) {} return; }
@@ -1933,6 +1933,22 @@ var __C2S_DEBUG__ = false;
           chrome.tabs.setZoomSettings = function (tabId, settings, cb) { if (typeof settings === "function") cb = settings; return zoomDual(undefined, cb); };
         }
         if (!chrome.tabs.onZoomChange) chrome.tabs.onZoomChange = event();
+
+        // Safari 27 does zoom a tab, but a factor of 0, Chrome's "back to the default
+        // zoom" (Vimium's zoomReset), is clamped to Safari's 50% minimum instead. The
+        // default is 1, the same factor getZoomSettings reports above.
+        if (typeof chrome.tabs.setZoom === "function" && !chrome.tabs.setZoom.__c2sZeroDefault) {
+          var __setZoom = chrome.tabs.setZoom;
+          var __zoomReset = function () {
+            var args = Array.prototype.slice.call(arguments);
+            // setZoom(factor[, cb]) or setZoom(tabId, factor[, cb]).
+            var fi = (args.length >= 2 && typeof args[1] === "number") ? 1 : 0;
+            if (args[fi] === 0) args[fi] = 1;
+            return __setZoom.apply(chrome.tabs, args);
+          };
+          __zoomReset.__c2sZeroDefault = true;
+          installOverride(chrome.tabs, "setZoom", __zoomReset);
+        }
 
         // Other Chrome-only chrome.tabs methods Safari omits. Real extensions call
         // these directly (UrbanVPN, GoogleTranslate, ClaudeChrome, Requestly,
