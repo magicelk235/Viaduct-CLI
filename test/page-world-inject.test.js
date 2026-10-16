@@ -129,3 +129,44 @@ test("falls back to <all_urls> when the extension declares no content-script mat
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("detects a page-world script staged through setAttribute(\"src\", …)", () => {
+  // Language Reactor: n.setAttribute("src",chrome.runtime.getURL("pageScript_lly.min.js"))
+  const dir = stage({
+    "content_youtube.js": 'const n=document.createElement("script");n.setAttribute("src",chrome.runtime.getURL("pageScript_lly.min.js")),(document.head||document.documentElement).appendChild(n);',
+    "pageScript_lly.min.js": "1;",
+  });
+  const manifest = { manifest_version: 3, content_scripts: [{ matches: ["*://*.youtube.com/*"], js: ["content_youtube.js"] }] };
+  try {
+    assert.deepEqual(wirePageWorldMainInjection(dir, manifest), ["pageScript_lly.min.js"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("each page-world twin keeps to the sites of the content script that injects it", () => {
+  // One page script per site; a YouTube script running on Netflix is not what Chrome does.
+  const dir = stage({
+    "content_youtube.js": 'n.setAttribute("src",chrome.runtime.getURL("pageScript_lly.min.js"));',
+    "content_netflix.js": 'n.src=chrome.runtime.getURL("pageScript_lln.min.js");',
+    "pageScript_lly.min.js": "1;",
+    "pageScript_lln.min.js": "1;",
+  });
+  const manifest = {
+    manifest_version: 3,
+    content_scripts: [
+      { matches: ["https://*.netflix.com/*"], js: ["content_netflix.js"] },
+      { matches: ["*://*.youtube.com/*"], js: ["./content_youtube.js"], all_frames: true },
+    ],
+  };
+  try {
+    wirePageWorldMainInjection(dir, manifest);
+    const byFile = Object.fromEntries(mainEntries(manifest).map((e) => [e.js[0], e]));
+    assert.deepEqual(byFile["pageScript_lly.min.js"].matches, ["*://*.youtube.com/*"]);
+    assert.equal(byFile["pageScript_lly.min.js"].all_frames, true);
+    assert.deepEqual(byFile["pageScript_lln.min.js"].matches, ["https://*.netflix.com/*"]);
+    assert.equal(byFile["pageScript_lln.min.js"].all_frames, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

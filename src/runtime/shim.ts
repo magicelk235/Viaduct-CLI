@@ -799,14 +799,17 @@ export function wireActionHotkey(dir: string, manifest: Manifest): string | null
   return label;
 }
 
-// A content script staging a page-world <script>: `<el>.src = <ns>.runtime.getURL("x.js")`.
-// The captured group is the resource path. Chrome exempts web-accessible-resource scripts
-// from the page's CSP; Safari does NOT, so `<script src="safari-web-extension://…">` is
-// refused by a strict page CSP (e.g. YouTube's script-src) and the page-world code never
-// runs — the extension's MAIN-world logic silently dies (live report: Jump Cutter's
-// MediaSource-clone bridge → no audio analysis → playback stuck at silence speed).
-const PAGE_WORLD_INJECT_RE =
-  /\.src\s*=\s*[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\.runtime\.getURL\(\s*(["'])([^"'`]+\.m?js)\1\s*\)/g;
+// A content script staging a page-world <script>: `<el>.src = <ns>.runtime.getURL("x.js")`,
+// or the same through `<el>.setAttribute("src", …)` (Language Reactor). The captured group
+// is the resource path. Chrome exempts web-accessible-resource scripts from the page's CSP;
+// Safari does NOT, so `<script src="safari-web-extension://…">` is refused by a strict page
+// CSP (e.g. YouTube's script-src) and the page-world code never runs — the extension's
+// MAIN-world logic silently dies (live report: Jump Cutter's MediaSource-clone bridge → no
+// audio analysis → playback stuck at silence speed).
+const PAGE_WORLD_INJECT_RES = [
+  /\.src\s*=\s*[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\.runtime\.getURL\(\s*(["'])([^"'`]+\.m?js)\1\s*\)/g,
+  /\.setAttribute\(\s*["']src["']\s*,\s*[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\.runtime\.getURL\(\s*(["'])([^"'`]+\.m?js)\1\s*\)/g,
+];
 
 /**
  * Re-declare every page-world script a content script injects via
@@ -972,35 +975,46 @@ export function wirePageWorldMainInjection(dir: string, manifest: Manifest): str
     [ACTION_HOTKEY_FILENAME]: true,
     [USERSCRIPTS_CS_FILENAME]: true,
   };
-  const targets = new Set<string>();
+  // target → the files (staged-relative) that inject it
+  const targets = new Map<string, Set<string>>();
   for (const file of walkScripts(dir)) {
     if (ownFiles[basename(file)]) continue;
     let src: string;
     try { src = readFileSync(file, "utf-8"); } catch { continue; }
     if (src.indexOf(".getURL") === -1) continue;
-    PAGE_WORLD_INJECT_RE.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = PAGE_WORLD_INJECT_RE.exec(src)) !== null) {
-      targets.add(m[2].replace(/^\.?\/+/, ""));
+    const rel = relative(dir, file).replace(/\\/g, "/");
+    for (const re of PAGE_WORLD_INJECT_RES) {
+      re.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(src)) !== null) {
+        const t = m[2].replace(/^\.?\/+/, "");
+        if (!targets.has(t)) targets.set(t, new Set());
+        targets.get(t)!.add(rel);
+      }
     }
   }
   if (targets.size === 0) return [];
 
-  // Mirror the extension's own content-script reach (match patterns + frame options) so
-  // the MAIN-world twin runs exactly where the isolated injector would — never broader.
-  const csMatches = new Set<string>();
-  let allFrames = false;
-  let matchAboutBlank = false;
-  for (const cs of manifest.content_scripts) {
-    if (cs.world === "MAIN") continue;
-    for (const mt of cs.matches ?? []) csMatches.add(mt);
-    if (cs.all_frames) allFrames = true;
-    if (cs.match_about_blank) matchAboutBlank = true;
-  }
-  const matches = csMatches.size > 0 ? [...csMatches] : ["<all_urls>"];
+  // Mirror the content-script reach (match patterns + frame options) of the entries whose
+  // files inject the target, so the MAIN-world twin runs exactly where its injector would.
+  // One extension can stage a different page script per site (Language Reactor: YouTube,
+  // Netflix, Amazon); each twin keeps to its own site. An injector no declared entry lists
+  // (registered at runtime) falls back to the reach of every declared entry.
+  const reachOf = (entries: NonNullable<Manifest["content_scripts"]>) => {
+    const matches = new Set<string>();
+    let allFrames = false;
+    let matchAboutBlank = false;
+    for (const cs of entries) {
+      for (const mt of cs.matches ?? []) matches.add(mt);
+      if (cs.all_frames) allFrames = true;
+      if (cs.match_about_blank) matchAboutBlank = true;
+    }
+    return { matches: matches.size > 0 ? [...matches] : ["<all_urls>"], allFrames, matchAboutBlank };
+  };
+  const isolated = manifest.content_scripts.filter((cs) => cs.world !== "MAIN");
 
   const wired: string[] = [];
-  for (const target of targets) {
+  for (const [target, injectors] of targets) {
     if (ownFiles[basename(target)]) continue;
     // Must be a real file we can run as a content script.
     if (!existsSync(join(dir, target))) continue;
@@ -1010,6 +1024,10 @@ export function wirePageWorldMainInjection(dir: string, manifest: Manifest): str
       (cs) => cs.world === "MAIN" && Array.isArray(cs.js) && cs.js.includes(target),
     );
     if (already) continue;
+    const owners = isolated.filter(
+      (cs) => Array.isArray(cs.js) && cs.js.some((j) => typeof j === "string" && injectors.has(j.replace(/^\.?\/+/, "").replace(/\\/g, "/"))),
+    );
+    const { matches, allFrames, matchAboutBlank } = reachOf(owners.length > 0 ? owners : isolated);
     manifest.content_scripts.push({
       matches,
       js: [target],
