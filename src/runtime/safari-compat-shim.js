@@ -5493,6 +5493,23 @@ var __C2S_DEBUG__ = false;
       onHeadersReceived: event(), onAuthRequired: event(), onResponseStarted: event(),
       onBeforeRedirect: event(), onCompleted: event(), onErrorOccurred: event(),
       onActionIgnored: event(),
+      // Chrome's option enums, read at startup to decide what to ask for:
+      //   if (utils.hasOwn(chrome.webRequest.OnBeforeSendHeadersOptions, 'EXTRA_HEADERS'))
+      // (Privacy Badger). Safari has none of them, so that read throws, its listeners
+      // never start, and the badger object is never created: nothing gets blocked.
+      // EXTRA_HEADERS is left out on purpose: Safari has no extraHeaders mode, and its
+      // absence is the answer that feature check is looking for.
+      ResourceType: { MAIN_FRAME: "main_frame", SUB_FRAME: "sub_frame", STYLESHEET: "stylesheet", SCRIPT: "script", IMAGE: "image", FONT: "font", OBJECT: "object", XMLHTTPREQUEST: "xmlhttprequest", PING: "ping", CSP_REPORT: "csp_report", MEDIA: "media", WEBSOCKET: "websocket", WEBBUNDLE: "webbundle", OTHER: "other" },
+      OnBeforeRequestOptions: { BLOCKING: "blocking", REQUEST_BODY: "requestBody" },
+      OnBeforeSendHeadersOptions: { REQUEST_HEADERS: "requestHeaders", BLOCKING: "blocking" },
+      OnSendHeadersOptions: { REQUEST_HEADERS: "requestHeaders" },
+      OnHeadersReceivedOptions: { BLOCKING: "blocking", RESPONSE_HEADERS: "responseHeaders" },
+      OnAuthRequiredOptions: { RESPONSE_HEADERS: "responseHeaders", BLOCKING: "blocking", ASYNC_BLOCKING: "asyncBlocking" },
+      OnResponseStartedOptions: { RESPONSE_HEADERS: "responseHeaders" },
+      OnBeforeRedirectOptions: { RESPONSE_HEADERS: "responseHeaders" },
+      OnCompletedOptions: { RESPONSE_HEADERS: "responseHeaders" },
+      OnErrorOccurredOptions: {},
+      IgnoredActionType: { REDIRECT: "redirect", REQUEST_HEADERS: "request_headers", RESPONSE_HEADERS: "response_headers", AUTH_CREDENTIALS: "auth_credentials" },
     });
     // Safari's NATIVE webRequest addListener THROWS on filter urls with schemes
     // its match-pattern parser rejects — ws:///wss:// are valid in Chrome (websocket
