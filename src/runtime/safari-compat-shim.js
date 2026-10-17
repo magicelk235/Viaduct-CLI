@@ -226,9 +226,11 @@ var __C2S_DEBUG__ = false;
     try {
       if (typeof window === "undefined" || typeof location === "undefined") return false;
       if (!/^(safari-web-extension|chrome-extension|moz-extension):$/.test(location.protocol)) return false;
-      if (window.top === window) return false;
+      var topWin = window.top;
+      if (!topWin || topWin === window) return false;
       // A frame inside the extension's own popup or tab shares its privileged process.
-      try { return window.top.location.protocol !== location.protocol; } catch (e) { return true; }
+      // Reading a cross-origin parent's location throws, which is what marks a site.
+      try { return topWin.location.protocol !== location.protocol; } catch (e) { return true; }
     } catch (e) { return false; }
   })();
   if (c2sFramedInWebPage) {
