@@ -1403,7 +1403,7 @@ var __C2S_DEBUG__ = false;
   // Report each tab once, under the window its own windowId names.
   function oneWindowPerTab(tabs, qi) {
     if (!Array.isArray(tabs) || tabs.length < 2) return tabs;
-    var seen = Object.create(null), out = [];
+    var seen = Object.create(null), drop = null;
     var wid = qi && typeof qi.windowId === "number" && qi.windowId >= 0 ? qi.windowId : null;
     if (wid === null && qi && (qi.currentWindow || qi.lastFocusedWindow)) {
       // The window asked about is the one its unpinned tabs report.
@@ -1411,13 +1411,13 @@ var __C2S_DEBUG__ = false;
     }
     for (var j = 0; j < tabs.length; j++) {
       var t = tabs[j];
-      if (!t || t.id == null) { out.push(t); continue; }
-      if (seen[t.id]) continue;
-      if (wid !== null && typeof t.windowId === "number" && t.windowId !== wid) continue;
+      if (!t || t.id == null) continue;
+      if (seen[t.id] || (wid !== null && typeof t.windowId === "number" && t.windowId !== wid)) { (drop = drop || {})[j] = true; continue; }
       seen[t.id] = true;
-      out.push(t);
     }
-    return out;
+    // Most answers have no pinned tab in them: hand those back as they came.
+    if (!drop) return tabs;
+    return tabs.filter(function (x, k) { return !drop[k]; });
   }
   function wrapWindowTabs(ns) {
     var w = ns && ns.windows;
