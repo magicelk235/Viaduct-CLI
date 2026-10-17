@@ -7524,17 +7524,33 @@ var __C2S_DEBUG__ = false;
         // request in storage for a later scan once listeners exist.
         if (listeners.length === 0) return;
         processed[rec.id] = true;
-        var responded = false;
+        var responded = false, beat = null;
         var sr = function (resp) {
           if (responded) return; responded = true;
+          if (beat) { clearInterval(beat); beat = null; }
           var o = {}; o[RSP + rec.id] = { from: SELF, has: resp !== undefined, resp: resp, t: Date.now() };
           try { store.local.set(o); } catch (e) {}
         };
+        var willAnswer = false;
         for (var i = 0; i < listeners.length; i++) {
           try {
             var ret = listeners[i](rec.msg, rec.sender || {}, sr);
-            if (ret && typeof ret.then === "function") ret.then(function (v) { sr(v); }, function () { sr(undefined); });
+            if (ret === true) willAnswer = true;
+            else if (ret && typeof ret.then === "function") { willAnswer = true; ret.then(function (v) { sr(v); }, function () { sr(undefined); }); }
           } catch (e) {}
+        }
+        // A listener that answers later can take as long as it likes in Chrome; Web
+        // Scraper's `scrape` resolves only when its scraper window closes, minutes on.
+        // Tell the sender the answer is coming, and keep saying so, so it waits past
+        // its deadline for as long as this context is alive to answer.
+        if (willAnswer && !responded) {
+          var pend = function () {
+            if (responded) return;
+            var o = {}; o[RSP + rec.id] = { from: SELF, pending: true, t: Date.now() };
+            try { store.local.set(o); } catch (e) {}
+          };
+          pend();
+          beat = setInterval(pend, MBX_TTL / 3);
         }
       }
       // Backstop for a suspended background: storage.onChanged doesn't wake a sleeping
@@ -7583,8 +7599,15 @@ var __C2S_DEBUG__ = false;
             try { store.onChanged.removeListener(onCh); } catch (e) {}
             rm(rspKey); rm(reqKey); resolve(v);
           }
+          // A pending record means the receiver is still working on it: wait as long
+          // as its heartbeat stays fresh. Returns true once the reply is final.
           function accept(nv) {
+            if (nv && nv.pending) {
+              deadline = Math.max(deadline, (nv.t || 0) + MBX_TTL);
+              return false;
+            }
             finish(nv && nv.has ? nv.resp : undefined);
+            return true;
           }
           var onCh = function (ch, area) {
             if (area !== "local" || done || !ch[rspKey]) return;
@@ -7598,8 +7621,9 @@ var __C2S_DEBUG__ = false;
               store.local.get([rspKey], function (res) {
                 if (done) return;
                 var nv = res && res[rspKey];
-                if (nv) { accept(nv); return; }
-                pollT = setTimeout(poll, 120);
+                if (nv && accept(nv)) return;
+                // A reply known to be on its way needs no 120 ms polling.
+                pollT = setTimeout(poll, nv && nv.pending ? 1000 : 120);
               });
             } catch (e) { pollT = setTimeout(poll, 120); }
           }
