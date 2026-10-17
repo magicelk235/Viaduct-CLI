@@ -792,6 +792,83 @@ var __C2S_DEBUG__ = false;
   if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) { var __brt = mutableNamespace(browser, "runtime"); patchGetURL(__brt); backfillRuntimeEvents(__brt); }
   if (api && api !== __browser && !(hasChrome && api === chrome)) { var __art = mutableNamespace(api, "runtime"); patchGetURL(__art); backfillRuntimeEvents(__art); }
 
+  // The flip side of the lowercase getURL(""): a bundle that builds a resource URL from
+  // it (`const root = getURL(""); root + "offscreen.html"`) asks for a lowercase host,
+  // and Safari's resource server is case-sensitive on it. Measured from an extension
+  // page: fetch and XHR fail ("Load failed"), a Worker errors, an iframe loads an empty
+  // document, and tabs.create opens a blank tab. Live: Stylus builds its offscreen
+  // document's URL that way, the emulated offscreen frame came up empty, and no style
+  // could be compiled or installed. The loaders the extension reaches through the shim
+  // put the host back in Safari's case; anything not on the extension's own origin
+  // passes through untouched. Comparisons against getURL("") are B4's tradeoff and
+  // stay as they are.
+  var c2sRealRoot = "";
+  try { if (hasChrome && chrome.runtime && typeof chrome.runtime.getURL === "function") c2sRealRoot = String(chrome.runtime.getURL("/") || ""); } catch (e) {}
+  if (!/^[a-z][a-z0-9+.-]*:\/\/[^/]+\/$/i.test(c2sRealRoot)) c2sRealRoot = "";
+  function c2sCanonOwnUrl(u) {
+    if (!c2sRealRoot || typeof u !== "string" || u.length < c2sRealRoot.length) return u;
+    var head = u.slice(0, c2sRealRoot.length);
+    if (head === c2sRealRoot || head.toLowerCase() !== c2sRealRoot.toLowerCase()) return u;
+    return c2sRealRoot + u.slice(c2sRealRoot.length);
+  }
+  try {
+    var c2sG = (typeof self !== "undefined") ? self : (typeof window !== "undefined" ? window : null);
+    if (c2sRealRoot && c2sG && typeof c2sG.fetch === "function" && !c2sG.fetch.__c2sOwnCase) {
+      var c2sFetchCase = c2sG.fetch;
+      var c2sFetchCanon = function (input, init) {
+        try {
+          if (typeof input === "string") input = c2sCanonOwnUrl(input);
+          else if (input && typeof URL !== "undefined" && input instanceof URL) input = c2sCanonOwnUrl(input.href);
+          else if (input && typeof Request !== "undefined" && input instanceof Request) {
+            var cu = c2sCanonOwnUrl(input.url);
+            if (cu !== input.url) input = new Request(cu, input);
+          }
+        } catch (e) {}
+        return c2sFetchCase.call(this, input, init);
+      };
+      c2sFetchCanon.__c2sOwnCase = true;
+      c2sG.fetch = c2sFetchCanon;
+    }
+    if (c2sRealRoot && typeof XMLHttpRequest !== "undefined" && XMLHttpRequest.prototype && !XMLHttpRequest.prototype.open.__c2sOwnCase) {
+      var c2sXhrOpen = XMLHttpRequest.prototype.open;
+      var c2sXhrOpenCanon = function (m, u) {
+        var args = Array.prototype.slice.call(arguments);
+        try { if (args.length > 1) args[1] = c2sCanonOwnUrl(typeof u === "string" ? u : (u && u.href) || u); } catch (e) {}
+        return c2sXhrOpen.apply(this, args);
+      };
+      c2sXhrOpenCanon.__c2sOwnCase = true;
+      XMLHttpRequest.prototype.open = c2sXhrOpenCanon;
+    }
+    var c2sCanonProps = function (props) {
+      if (!props || typeof props !== "object") return props;
+      var u = props.url;
+      var cu = Array.isArray(u) ? u.map(c2sCanonOwnUrl) : c2sCanonOwnUrl(u);
+      if (cu === u || (Array.isArray(u) && cu.every(function (x, i) { return x === u[i]; }))) return props;
+      return Object.assign({}, props, { url: cu });
+    };
+    var c2sWrapUrlCall = function (nsName, method, propsIndex) {
+      if (!hasChrome || !chrome[nsName]) return;
+      var ns = mutableNamespace(chrome, nsName) || chrome[nsName];
+      var orig = ns[method];
+      if (typeof orig !== "function" || orig.__c2sOwnCase) return;
+      var w = function () {
+        var args = Array.prototype.slice.call(arguments);
+        // tabs.update(props) | tabs.update(tabId, props); create takes props first.
+        var at = propsIndex;
+        if (method === "update" && args.length && typeof args[0] === "object") at = 0;
+        try { args[at] = c2sCanonProps(args[at]); } catch (e) {}
+        return orig.apply(this, args);
+      };
+      w.__c2sOwnCase = true;
+      installOverride(ns, method, w);
+    };
+    if (c2sRealRoot) {
+      c2sWrapUrlCall("tabs", "create", 0);
+      c2sWrapUrlCall("tabs", "update", 1);
+      c2sWrapUrlCall("windows", "create", 0);
+    }
+  } catch (e) {}
+
   // runtime.connect() wake-the-background. Safari THROWS synchronously
   // "Invalid call to runtime.connect(). No runtime.onConnect listeners found." when
   // the non-persistent background page is suspended at connect() time — Chrome would
@@ -3233,7 +3310,9 @@ var __C2S_DEBUG__ = false;
           var url = opts && opts.url ? opts.url : "";
           var abs = chrome.runtime && chrome.runtime.getURL ? chrome.runtime.getURL(url) : url;
           var f = document.createElement("iframe");
-          f.src = abs;
+          // Load from Safari's host case; clients.matchAll still reports the URL as the
+          // extension wrote it, which is what it compares against.
+          f.src = c2sCanonOwnUrl(abs);
           f.setAttribute("aria-hidden", "true");
           f.style.cssText = "position:absolute;width:0;height:0;border:0;visibility:hidden;left:-9999px;";
           __offscreenFrame = f;
