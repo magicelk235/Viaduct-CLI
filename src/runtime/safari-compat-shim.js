@@ -154,6 +154,56 @@ var __C2S_DEBUG__ = false;
   hasChrome = typeof chrome !== "undefined";
   if (!api) return;
 
+  // Chrome's namespace functions don't care what `this` is: bundles copy them out
+  //   scripting: { executeScript: chrome.scripting.executeScript }   // Hypothesis
+  // and call them off another object. WebKit keeps them on the namespace's prototype
+  // and takes `this` as the namespace; called off anything else, executeScript
+  // resolves undefined without running (measured), so Hypothesis's sidebar never
+  // injected. Rebind on the prototype, shared by every wrapper WebKit hands out (an
+  // instance property dies with the wrapper, which WebKit holds weakly): a foreign
+  // `this` falls back to the namespace object the method was read from at boot.
+  (function () {
+    try {
+      var roots = [api];
+      if (typeof chrome !== "undefined" && chrome && roots.indexOf(chrome) < 0) roots.push(chrome);
+      // proto → the one namespace object it backs; a prototype two namespaces share
+      // has no single fallback and is left alone.
+      var protos = [], owners = [];
+      for (var ri = 0; ri < roots.length; ri++) {
+        var keys; try { keys = Object.getOwnPropertyNames(roots[ri]); } catch (e) { continue; }
+        for (var ki = 0; ki < keys.length; ki++) {
+          var ns; try { ns = roots[ri][keys[ki]]; } catch (e) { continue; }
+          if (!ns || typeof ns !== "object") continue;
+          var proto = Object.getPrototypeOf(ns);
+          if (!proto || proto === Object.prototype) continue;
+          var at = protos.indexOf(proto);
+          if (at < 0) { protos.push(proto); owners.push(ns); }
+          else if (owners[at] !== ns) owners[at] = null;
+        }
+      }
+      for (var qi = 0; qi < protos.length; qi++) {
+        if (!owners[qi]) continue;
+        var names; try { names = Object.getOwnPropertyNames(protos[qi]); } catch (e) { continue; }
+        for (var pi = 0; pi < names.length; pi++) {
+          if (names[pi] === "constructor") continue;
+          var d; try { d = Object.getOwnPropertyDescriptor(protos[qi], names[pi]); } catch (e) { continue; }
+          if (!d || typeof d.value !== "function" || !d.configurable) continue;
+          (function (proto, ns, name, orig, d) {
+            var rebound = function () {
+              var self = (this && typeof this === "object" && proto.isPrototypeOf(this)) ? this : ns;
+              return orig.apply(self, arguments);
+            };
+            // Writable even where WebKit reports writable:false: its own slot still
+            // lets `ns.method = fn` land on the namespace (the shim's wrappers and
+            // extensions do it), and an ordinary read-only data property would make
+            // that assignment throw in strict code.
+            try { Object.defineProperty(proto, name, { value: rebound, writable: true, enumerable: d.enumerable, configurable: true }); } catch (e) {}
+          })(protos[qi], owners[qi], names[pi], d.value, d);
+        }
+      }
+    } catch (e) {}
+  })();
+
   // ── EXTENSION FRAMES INSIDE A WEB PAGE ──────────────────────────────────────
   // A content script that iframes one of the extension's pages into a site (an
   // in-page HUD, command bar, picker) puts that page in the SITE's WebContent
