@@ -6236,7 +6236,7 @@ var __C2S_DEBUG__ = false;
       var ns = MAYBE_MISSING[mi];
       if (!chrome[ns]) { try { chrome[ns] = inertProxy(); } catch (e) {} }
     }
-  } catch (__namespaceBackfillErr) {}
+  } catch (__namespaceBackfillErr) { dbg("[c2s] namespace backfills stopped early: " + String((__namespaceBackfillErr && __namespaceBackfillErr.stack) || __namespaceBackfillErr)); }
 
   // ── DNR header rules, applied to the extension's OWN requests ──────────────
   // Safari never applies a modifyHeaders rule (measured, see below), so the wrap
