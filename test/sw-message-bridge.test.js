@@ -59,7 +59,7 @@ function makeRuntimePort(name) {
   };
 }
 
-function runShim(href, { manifest = { manifest_version: 3 }, serviceWorker } = {}) {
+function runShim(href, { manifest = { manifest_version: 3 }, serviceWorker, shimConfig = {} } = {}) {
   const timers = new Set();
   const url = new URL(href);
   // new URL() reports origin "null" for an unknown scheme; Safari reports the real one.
@@ -115,7 +115,7 @@ function runShim(href, { manifest = { manifest_version: 3 }, serviceWorker } = {
   sandbox.self = sandbox;
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
-  vm.runInContext(shimSource({ origin: "", hosts: [] }), sandbox, { filename: "safari-compat-shim.js" });
+  vm.runInContext(shimSource(shimConfig), sandbox, { filename: "safari-compat-shim.js" });
 
   const dispose = () => { for (const h of timers) { clearTimeout(h); clearInterval(h); } timers.clear(); };
   return { sandbox, connects, onConnectListeners, selfEvents, dispose };
@@ -285,4 +285,22 @@ test("a page that really is controlled keeps its own container", async (t) => {
 
   assert.equal(await sandbox.navigator.serviceWorker.ready, own, "a live worker wins over the emulation");
   assert.equal(sandbox.navigator.serviceWorker.controller, own.active);
+});
+
+// A controller means the page's requests go through the worker's fetch handler.
+// Stylus writes `<script src="data?…">` into each page and answers it from onfetch,
+// and only falls back to asking its API when there is no controller; the emulated
+// controller sent it down the fetch path, nothing answered, and every Stylus page
+// (popup, manager, editor, installer) sat on "Loading...".
+test("a background that handles fetch gets no emulated controller, ready still tunnels", async (t) => {
+  const serviceWorker = deadContainer();
+  const { sandbox, connects, dispose } = runShim("safari-web-extension://abc/popup.html", { serviceWorker, shimConfig: { backgroundHandlesFetch: true } });
+  t.after(dispose);
+
+  assert.equal(sandbox.navigator.serviceWorker.controller, null);
+  const reg = await readyWithin(sandbox.navigator.serviceWorker);
+  assert.ok(reg && reg.active, "messages to the worker must still have a way through");
+  reg.active.postMessage({ hello: 1 });
+  assert.equal(connects.length, 1);
+  assert.deepEqual(plain(connects[0].sent[0]).data, { hello: 1 });
 });

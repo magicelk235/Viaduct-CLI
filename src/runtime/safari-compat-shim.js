@@ -3377,7 +3377,7 @@ var __C2S_DEBUG__ = false;
               // The offscreen document answers on event.source (Violentmonkey's
               // request bus does: source.postMessage({id, res})). Name its own
               // emulated worker, whose postMessage comes straight back here.
-              try { Object.defineProperty(ev, "source", { value: sw.controller || null, writable: true, configurable: true }); } catch (e) {}
+              try { Object.defineProperty(ev, "source", { value: w.__c2sSwWorker || sw.controller || null, writable: true, configurable: true }); } catch (e) {}
               sw.dispatchEvent(ev);
               return;
             }
@@ -3810,13 +3810,25 @@ var __C2S_DEBUG__ = false;
     // Chrome resolves `ready` as soon as the worker is active, which for a converted
     // background page is always: a postMessage buffers behind connect() while the page
     // wakes, so resolving now can't lose a send.
+    //
+    // A controller says more than "a worker exists": it says this page's requests go
+    // through the worker's fetch handler. When the source worker has one, the bundle
+    // trusts it to answer (Stylus writes `<script src="data?…">` into each page and
+    // serves it from onfetch, and only skips that for its API when there is no
+    // controller). Nothing here can serve such a request, so the page then gets no
+    // controller and takes its no-worker path; `ready` still carries messages.
+    var swFetch = false;
+    try { swFetch = !!(__C2S_PROXY_CONFIG__ && __C2S_PROXY_CONFIG__.swFetch); } catch (e) {}
     var patch = {
-      ready: Promise.resolve(reg), controller: worker,
+      ready: Promise.resolve(reg), controller: swFetch ? null : worker,
       register: function () { return Promise.resolve(reg); },
       getRegistration: function () { return Promise.resolve(reg); },
       getRegistrations: function () { return Promise.resolve([reg]); },
       startMessages: function () {},
     };
+    // The offscreen emulation names this worker as the source of what it delivers,
+    // whether or not it is the controller.
+    try { Object.defineProperty(window, "__c2sSwWorker", { value: worker, configurable: true }); } catch (e) {}
     // Patch the native container in place so object identity survives (the offscreen
     // emulation above dispatches on w.navigator.serviceWorker) and addEventListener /
     // onmessage stay the platform's. Per property, so one frozen slot can't cost the

@@ -95,6 +95,11 @@ export interface ShimConfig {
    *  they are absent (`mode=window`). Same slot the shim uses for `?tabId=`, applied
    *  synchronously before the page's scripts run. Empty/omitted → nothing written. */
   panelQuery?: string;
+  /** The source background service worker handles `fetch` events. A page with a
+   *  controller expects its requests to reach that handler, which a converted
+   *  background page cannot serve, so the navigator.serviceWorker emulation then
+   *  leaves `controller` null and the bundle takes its no-worker path. */
+  backgroundHandlesFetch?: boolean;
 }
 
 export function shimSource(config: ShimConfig = {}): string {
@@ -112,6 +117,7 @@ export function shimSource(config: ShimConfig = {}): string {
     hosts: config.proxyHosts || [],
     cdp: config.cdp !== false,
     panelQuery: config.panelQuery || "",
+    swFetch: config.backgroundHandlesFetch === true,
   }).replace(/[\u2028\u2029]/g, (c) => c === "\u2028" ? "\\u2028" : "\\u2029");
   let runtime = readFileSync(join(RUNTIME_DIR, SHIM_FILENAME), "utf-8");
   // --debug emit: flip the compiled-in trace gate and splice the ring-buffer
@@ -233,6 +239,46 @@ export function derivePanelWindowQuery(dir: string, manifest: Manifest): string 
   }
   if (heads.size !== 1) return "";
   return [...heads][0];
+}
+
+/**
+ * Does the source background service worker handle `fetch` events? Read from the
+ * worker script and the scripts it pulls in with importScripts() or a static
+ * import. Such a worker serves requests its pages make (Stylus answers each page's
+ * `<script src="data?…">` from onfetch), which the converted background page can't.
+ */
+export function backgroundHandlesFetch(dir: string, manifest: Manifest): boolean {
+  const bg = manifest.background as { service_worker?: unknown } | undefined;
+  const entry = typeof bg?.service_worker === "string" ? bg.service_worker : "";
+  if (!entry) return false;
+  const handlesFetch = /\bonfetch\s*=(?!=)|\baddEventListener\s*\(\s*["'`]fetch["'`]/;
+  const importScriptsCall = /\bimportScripts\s*\(([^)]*)\)/g;
+  const staticImport = /(?:^|[;\s}])(?:import|export)\s*(?:[\w$*{},\s]+?\s*from\s*)?["']([^"']+)["']/g;
+  const seen = new Set<string>();
+  const queue = [entry.replace(/^\//, "")];
+  while (queue.length > 0 && seen.size < 200) {
+    const rel = queue.shift() as string;
+    if (seen.has(rel)) continue;
+    seen.add(rel);
+    let src: string;
+    try {
+      src = readFileSync(join(dir, rel), "utf-8");
+    } catch {
+      continue;
+    }
+    if (handlesFetch.test(src)) return true;
+    const refs: string[] = [];
+    for (const m of src.matchAll(importScriptsCall)) {
+      for (const lit of m[1].matchAll(/["'`]([^"'`]+)["'`]/g)) refs.push(lit[1]);
+    }
+    for (const m of src.matchAll(staticImport)) refs.push(m[1]);
+    for (const ref of refs) {
+      if (/^[a-z][a-z0-9+.-]*:/i.test(ref)) continue;
+      const next = ref.startsWith("/") ? ref.slice(1) : join(dirname(rel), ref);
+      if (!seen.has(next)) queue.push(next);
+    }
+  }
+  return false;
 }
 
 /**

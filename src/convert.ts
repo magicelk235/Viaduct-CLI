@@ -7,7 +7,7 @@ import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths, raiseMinVersionForMainWorld, MAIN_WORLD_MIN_SAFARI_VERSION } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
 import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteExtensionOriginFromRuntimeId, rewriteChromeSchemeLiterals, rewriteNativeMessagingCalls, rewriteExtensionIdPlaceholderUrls, guardAncestorOriginsAccess, guardGeckoSettingsAccess, rewriteSelfPageExtensionUrls, rewriteBackgroundContextChecks, idempotentContentScriptGlobals, guardContentScriptReruns, guardLocaleTailMessage } from "./input/stage.js";
-import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireUserScriptsContentScript, wireCdpKeepalive, deriveProxyHosts, derivePanelWindowQuery, DEBUG_RPC_TOKEN_FILENAME } from "./runtime/shim.js";
+import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireUserScriptsContentScript, wireCdpKeepalive, deriveProxyHosts, derivePanelWindowQuery, backgroundHandlesFetch, DEBUG_RPC_TOKEN_FILENAME } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
 import { synthesizePlaceholderIcons } from "./input/icons.js";
@@ -246,6 +246,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
         debug: opts.debug === true,
         debugRpcToken,
         panelQuery,
+        backgroundHandlesFetch: backgroundHandlesFetch(stageDir, manifest),
       });
       if (opts.panelQuery) ok(`Side-panel page opens with ?${opts.panelQuery.replace(/^\?/, "")} (--panel-query)`);
       else if (derivedPanelQuery) ok(`Side-panel page opens with ?${derivedPanelQuery}, the query the extension uses for the page's own window mode (Safari shows a side panel as a standalone popover)`);
