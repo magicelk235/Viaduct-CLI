@@ -2,7 +2,7 @@ import { readdirSync, readFileSync, existsSync, realpathSync, statSync } from "n
 import { join, relative } from "node:path";
 import type { Issue, Manifest, Platforms } from "../types.js";
 import { UNSUPPORTED_APIS, parseJsonc, resolveI18nStringStrict } from "../manifest/manifest.js";
-import { matchBalancedParen } from "../runtime/shim.js";
+import { matchBalancedParen, rootLiteralsFromGetURL } from "../runtime/shim.js";
 
 /**
  * Recursive file finder. Dirent-based so each entry costs no extra stat (only
@@ -212,10 +212,11 @@ function scanJsContent(content: string, rel: string, issues: Issue[], isServiceW
   // The converter neutralizes EVERY importScripts call, so a static first call
   // must not mask later dynamic ones (webpack/Workbox SWs commonly do a static
   // precache import first, then a dynamic chunk-loader call).
-  // Static only when every arg is a bare string literal we can hoist verbatim
-  // (e.g. "a.js", 'b.js'). Anything else — a variable, a concat (base + "a.js"),
-  // a getURL("x") call — can't be statically hoisted and silently loses its
-  // imported code, so it must warn, not reassure.
+  // Static only when every arg is a string literal we can hoist verbatim (e.g.
+  // "a.js", 'b.js'), counting runtime.getURL("x") as the literal "/x", which the
+  // converter rewrites the same way. Anything else — a variable, a concat
+  // (base + "a.js") — can't be statically hoisted and silently loses its imported
+  // code, so it must warn, not reassure.
   // Only the manifest-declared service worker is converted (importScripts hoisted
   // and neutralized). importScripts in any OTHER file — a genuine web worker —
   // keeps working in Safari untouched, so flagging it would be a false alarm.
@@ -230,7 +231,7 @@ function scanJsContent(content: string, rel: string, issues: Issue[], isServiceW
     if (isFirstAt === -1) isFirstAt = m.index;
     const end = matchBalancedParen(content, m.index + m[0].length - 1);
     if (end < 0) break;
-    const argList = content.slice(m.index + m[0].length, end - 1);
+    const argList = rootLiteralsFromGetURL(content.slice(m.index + m[0].length, end - 1));
     IS_OPEN_RE.lastIndex = end;
     if (argList.trim() !== "" && !STATIC_LITERAL_LIST.test(argList)) {
       isDynamicAt = m.index;

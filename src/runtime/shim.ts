@@ -1233,6 +1233,16 @@ function hoistImportScripts(dir: string, swPath: string): HoistResult {
   return { tags: tags.length ? tags.join("\n") + "\n" : "", hoisted: seen, dynamic };
 }
 
+// `importScripts(chrome.runtime.getURL("js/a.js"))` (Wappalyzer) names a file as surely
+// as a bare literal does, but relative to the extension ROOT, not the worker's dir.
+// Rewrite each such call to the root-absolute literal "/js/a.js" before the argument
+// list is classified, so it is hoisted like any static target instead of being
+// neutralized as "dynamic" with its code lost. Shared with the analyzer.
+const GETURL_LITERAL_RE = /(?:[A-Za-z_$][\w$]*\s*\.\s*)*runtime\s*\.\s*getURL\s*\(\s*(["'`])([^"'`$\\]+)\1\s*\)/g;
+export function rootLiteralsFromGetURL(argList: string): string {
+  return argList.replace(GETURL_LITERAL_RE, (_m, _q, lit: string) => JSON.stringify("/" + lit.replace(/^\/+/, "")));
+}
+
 /**
  * Replace every importScripts(...) call in ONE file with a void-0 no-op and
  * return the resolvable string-literal targets (root-relative, existing on disk)
@@ -1274,7 +1284,7 @@ function neutralizeImportScripts(dir: string, rootRel: string, resolveDir: strin
     const openParen = mm.index + mm[0].length - 1; // index of the "(" itself
     const end = matchBalancedParen(src, openParen); // index just past the ")"
     if (end < 0) continue; // unbalanced (shouldn't happen in valid JS) → leave as-is
-    const argList = src.slice(openParen + 1, end - 1);
+    const argList = rootLiteralsFromGetURL(src.slice(openParen + 1, end - 1));
     // Anything left after stripping STATIC literals and separators means an
     // argument is computed at runtime (`o.p+o.u(t)`, a variable, an interpolated
     // template) — the target can't be hoisted here. Strip "…"/'…' and only
