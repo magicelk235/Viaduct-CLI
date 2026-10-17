@@ -3264,6 +3264,52 @@ var __C2S_DEBUG__ = false;
     // Expose state for runtime.getContexts (defined later in the namespace-backfill block).
     try { chrome.runtime && (chrome.runtime.__c2sOffscreen = function () { return __offscreenFrame ? __offscreenUrl : null; }); } catch (e) {}
 
+    // One client object per offscreen document, so the client a message event names as
+    // its source is the same one matchAll reports.
+    var __offscreenClient = function () {
+      var f = __offscreenFrame;
+      if (!f) return null;
+      if (f.__c2sClient) return f.__c2sClient;
+      var client = {
+        id: "c2s-offscreen", type: "window", url: __offscreenAbsUrl,
+        frameType: "nested", focused: false, visibilityState: "hidden",
+        focus: function () { return Promise.resolve(this); },
+        // A real client.postMessage arrives as a "message" event on the client
+        // document's navigator.serviceWorker, carrying any transferred ports.
+        // Dropping it strands every caller that awaits a reply on a transferred
+        // MessagePort — Chrome's documented SW->offscreen binary handshake
+        // (client.postMessage(msg, [port2]) then await port1.onmessage). Nothing
+        // throws, so it reads as a silent hang: live, Tampermonkey's editor save
+        // wraps the script source in an object URL created offscreen, and saving
+        // any userscript spun forever on "Please wait...".
+        postMessage: function (data, transfer) {
+          var w = f.contentWindow;
+          if (!w) return;
+          var ports = transfer || [];
+          try {
+            var sw = w.navigator && w.navigator.serviceWorker;
+            if (sw && typeof sw.dispatchEvent === "function" && w.MessageEvent) {
+              // A real postMessage hands the receiver its own copy; passing the
+              // object itself lets a receiver that writes to it hit the sender's
+              // (possibly frozen) object. Clone in the receiving realm.
+              var copy = data;
+              try { copy = w.structuredClone(data); } catch (e) {}
+              var ev = new w.MessageEvent("message", { data: copy, ports: ports });
+              // The offscreen document answers on event.source (Violentmonkey's
+              // request bus does: source.postMessage({id, res})). Name its own
+              // emulated worker, whose postMessage comes straight back here.
+              try { Object.defineProperty(ev, "source", { value: sw.controller || null, writable: true, configurable: true }); } catch (e) {}
+              sw.dispatchEvent(ev);
+              return;
+            }
+          } catch (e) {}
+          // Fall back to a window message for offscreen docs that listen there.
+          try { w.postMessage(data, "*", ports); } catch (e) {}
+        },
+      };
+      f.__c2sClient = client;
+      return client;
+    };
     // MV3 SW code probes for its offscreen document via self.clients.matchAll()
     // (ServiceWorkerClients — Chrome's documented hasDocument pattern, used by
     // Google Translate among others). The converted background PAGE has no
@@ -3275,35 +3321,8 @@ var __C2S_DEBUG__ = false;
         self.clients = {
           // Ignores matchAll(options) filters — extensions only scan urls
           matchAll: function () {
-            var out = [];
-            if (__offscreenFrame) out.push({
-              id: "c2s-offscreen", type: "window", url: __offscreenAbsUrl,
-              frameType: "nested", focused: false, visibilityState: "hidden",
-              focus: function () { return Promise.resolve(this); },
-              // A real client.postMessage arrives as a "message" event on the client
-              // document's navigator.serviceWorker, carrying any transferred ports.
-              // Dropping it strands every caller that awaits a reply on a transferred
-              // MessagePort — Chrome's documented SW->offscreen binary handshake
-              // (client.postMessage(msg, [port2]) then await port1.onmessage). Nothing
-              // throws, so it reads as a silent hang: live, Tampermonkey's editor save
-              // wraps the script source in an object URL created offscreen, and saving
-              // any userscript spun forever on "Please wait...".
-              postMessage: function (data, transfer) {
-                var w = __offscreenFrame && __offscreenFrame.contentWindow;
-                if (!w) return;
-                var ports = transfer || [];
-                try {
-                  var sw = w.navigator && w.navigator.serviceWorker;
-                  if (sw && typeof sw.dispatchEvent === "function" && w.MessageEvent) {
-                    sw.dispatchEvent(new w.MessageEvent("message", { data: data, ports: ports }));
-                    return;
-                  }
-                } catch (e) {}
-                // Fall back to a window message for offscreen docs that listen there.
-                try { w.postMessage(data, "*", ports); } catch (e) {}
-              },
-            });
-            return Promise.resolve(out);
+            var c = __offscreenClient();
+            return Promise.resolve(c ? [c] : []);
           },
           get: function () { return Promise.resolve(undefined); },
           claim: function () { return Promise.resolve(); },
@@ -3311,6 +3330,26 @@ var __C2S_DEBUG__ = false;
         };
       } catch (e) {}
     }
+    // The other direction: the offscreen document posting to its "service worker"
+    // (navigator.serviceWorker.controller / ready.active). The page-side emulation
+    // below tunnels that over runtime.connect, which Safari never delivers within
+    // the sending page, and the background IS this page. The iframe is same-origin,
+    // so it calls this instead; the message reaches the background as the message
+    // event a worker would get, with the offscreen client as its source.
+    try {
+      window.__c2sOffscreenHost = function (data, ports, from) {
+        if (!__offscreenFrame || !from || from !== __offscreenFrame.contentWindow) return false;
+        var c = __offscreenClient();
+        var ev;
+        var copy = data;
+        try { copy = structuredClone(data); } catch (e) {}
+        try { ev = new MessageEvent("message", { data: copy, ports: ports || [] }); } catch (e) { return false; }
+        try { Object.defineProperty(ev, "source", { value: c, writable: true, configurable: true }); } catch (e) {}
+        try { ev.waitUntil = function () {}; } catch (e) {}
+        try { self.dispatchEvent(ev); } catch (e) { return false; }
+        return true;
+      };
+    } catch (e) {}
 
     // Safari never delivers runtime.sendMessage to frames of the SENDING page
     // (Chrome delivers to every other frame). The emulated offscreen doc is an
@@ -3425,6 +3464,107 @@ var __C2S_DEBUG__ = false;
             sink = resolve;
             flush();
           });
+        });
+      }
+    } catch (e) {}
+
+    // The same same-page exclusion drops runtime.connect: a background that opens a
+    // port to its offscreen document (Violentmonkey: connect({name:"offscreen"}) right
+    // after createDocument) gets a port that disconnects at once, because the only
+    // listener lives in an iframe of its own page. Its GM_xmlhttpRequest died with
+    // "Offscreen document disconnected". Receiver side: every extension page records
+    // its own onConnect listeners and can be handed a port directly. Sender side: the
+    // page hosting the iframe gives it one end of a local port pair. Messages cross as
+    // JSON, as runtime ports carry them, parsed in the receiving realm, and arrive on
+    // a later task. Only the iframe gets the port when it listens; another page this
+    // background connects to by then would be missed.
+    var __localConnFns = [];
+    try {
+      var __ocEv = chrome.runtime && chrome.runtime.onConnect;
+      if (__ocEv && typeof __ocEv.addListener === "function") {
+        var __ocAdd = __ocEv.addListener;
+        var __ocRemove = __ocEv.removeListener;
+        installOverride(__ocEv, "addListener", function (fn) {
+          if (typeof fn === "function" && !fn.__c2sInternal && __localConnFns.indexOf(fn) < 0) __localConnFns.push(fn);
+          return __ocAdd.apply(this, arguments);
+        });
+        if (typeof __ocRemove === "function") installOverride(__ocEv, "removeListener", function (fn) {
+          var i = __localConnFns.indexOf(fn);
+          if (i >= 0) __localConnFns.splice(i, 1);
+          return __ocRemove.apply(this, arguments);
+        });
+        window.__c2sDeliverLocalConnect = function (port) {
+          if (!__localConnFns.length) return false;
+          var fns = __localConnFns.slice();
+          for (var i = 0; i < fns.length; i++) { try { fns[i](port); } catch (e) {} }
+          return true;
+        };
+      }
+    } catch (e) {}
+    var __localPortPair = function (name, senderJSON, receiverJSON, receiverSender) {
+      var mk = function (json) {
+        var msgFns = [], discFns = [], peer = null, open = true;
+        var ev = function (list) {
+          return {
+            addListener: function (f) { if (typeof f === "function" && list.indexOf(f) < 0) list.push(f); },
+            removeListener: function (f) { var i = list.indexOf(f); if (i >= 0) list.splice(i, 1); },
+            hasListener: function (f) { return list.indexOf(f) >= 0; },
+          };
+        };
+        var p = { name: name, onMessage: ev(msgFns), onDisconnect: ev(discFns) };
+        p.postMessage = function (m) {
+          if (!open) throw new Error("Attempting to use a disconnected port object");
+          var text = m === undefined ? undefined : JSON.stringify(m);
+          var target = peer;
+          setTimeout(function () { if (target && target.__c2sOpen()) target.__c2sReceive(text); }, 0);
+        };
+        p.disconnect = function () {
+          if (!open) return;
+          open = false;
+          var target = peer;
+          setTimeout(function () { if (target) target.__c2sPeerGone(); }, 0);
+        };
+        p.__c2sOpen = function () { return open; };
+        p.__c2sReceive = function (text) {
+          var m; try { m = text === undefined ? undefined : json.parse(text); } catch (e) { return; }
+          var l = msgFns.slice();
+          for (var i = 0; i < l.length; i++) { try { l[i](m, p); } catch (e) {} }
+        };
+        p.__c2sPeerGone = function () {
+          if (!open) return;
+          open = false;
+          var l = discFns.slice();
+          for (var i = 0; i < l.length; i++) { try { l[i](p); } catch (e) {} }
+        };
+        p.__c2sPeer = function (q) { peer = q; };
+        return p;
+      };
+      var a = mk(senderJSON), b = mk(receiverJSON);
+      a.__c2sPeer(b); b.__c2sPeer(a);
+      b.sender = receiverSender;
+      return [a, b];
+    };
+    try {
+      var __rtConnectLocal = chrome.runtime && chrome.runtime.connect;
+      if (typeof __rtConnectLocal === "function") {
+        installOverride(chrome.runtime, "connect", function () {
+          var args = Array.prototype.slice.call(arguments);
+          var w = __offscreenFrame && __offscreenFrame.contentWindow;
+          var deliver = (w && typeof w.__c2sDeliverLocalConnect === "function") ? w.__c2sDeliverLocalConnect : null;
+          // connect() | connect(info) | connect(extensionId, info)
+          var extId = typeof args[0] === "string" ? args[0] : null;
+          var info = extId !== null ? args[1] : args[0];
+          var name = (info && typeof info.name === "string") ? info.name : "";
+          if (!deliver || (extId !== null && extId !== chrome.runtime.id) || /^__(c2s|viaduct)/.test(name)) {
+            return __rtConnectLocal.apply(chrome.runtime, args);
+          }
+          var pair = __localPortPair(name, JSON, w.JSON || JSON, {
+            id: chrome.runtime.id,
+            url: (typeof location !== "undefined" ? location.href : ""),
+            origin: (typeof location !== "undefined" ? location.origin : ""),
+          });
+          if (!deliver(pair[1])) return __rtConnectLocal.apply(chrome.runtime, args);
+          return pair[0];
         });
       }
     } catch (e) {}
@@ -3553,6 +3693,13 @@ var __C2S_DEBUG__ = false;
         var list = [];
         if (transfer && transfer.length) list = transfer;
         else if (transfer && transfer.transfer && transfer.transfer.length) list = transfer.transfer; // postMessage(data, {transfer})
+        // An emulated offscreen document is an iframe of the background page itself,
+        // where the runtime.connect tunnel can't go (Safari skips the sending page).
+        // Hand the message to the page hosting it; a site's frame can't read
+        // window.parent, so it keeps the tunnel.
+        var host = null;
+        try { if (window.parent && window.parent !== window && typeof window.parent.__c2sOffscreenHost === "function") host = window.parent.__c2sOffscreenHost; } catch (e) {}
+        if (host) { try { if (host(data, list, window)) return; } catch (e) {} }
         var pids = [];
         for (var i = 0; i < list.length; i++) {
           var p = list[i];
