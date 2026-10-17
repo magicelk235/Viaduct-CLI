@@ -191,6 +191,37 @@ test("a content script's relayed navigation fires the event", (t) => {
   assert.equal(hist[0].tabId, 9, "tabId must come from the sender — Cloaked messages that tab back");
 });
 
+// Safari checks documentId wherever an extension hands it back: tabs.sendMessage with
+// {documentId: "9"} rejects ("not a document identifier"), so a fabricated one turns
+// the reply Stylus sends on each SPA navigation into a rejection.
+test("a synthesized navigation never makes up a documentId", (t) => {
+  const { chrome, relay, update, dispose } = runShim();
+  t.after(dispose);
+  const hist = [];
+  chrome.webNavigation.onHistoryStateUpdated.addListener((d) => hist.push(d));
+
+  const from = { tab: { id: 9 }, frameId: 0 };
+  relay("https://example.com/", from);
+  relay("https://example.com/next", from);
+  update(4, { url: "https://example.org/" });
+  update(4, { url: "https://example.org/next" });
+
+  assert.equal(hist.length, 2);
+  for (const d of hist) assert.ok(!("documentId" in d), "documentId must be absent, got " + d.documentId);
+});
+
+test("a relayed navigation carries the sender's real documentId", (t) => {
+  const { chrome, relay, dispose } = runShim();
+  t.after(dispose);
+  const hist = [];
+  chrome.webNavigation.onHistoryStateUpdated.addListener((d) => hist.push(d));
+
+  const from = { tab: { id: 9 }, frameId: 0, documentId: "7F3A2C10-0000-4000-8000-000000000001" };
+  relay("https://example.com/", from);
+  relay("https://example.com/next", from);
+  assert.equal(hist[0].documentId, from.documentId);
+});
+
 test("a relayed fragment-only change routes to onReferenceFragmentUpdated", (t) => {
   const { chrome, relay, dispose } = runShim();
   t.after(dispose);

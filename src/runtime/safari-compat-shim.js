@@ -5268,7 +5268,7 @@ var __C2S_DEBUG__ = false;
       // Both sources can describe the same navigation; emitting twice would double every
       // listener's work (Cloaked would install its bridge twice).
       var __recentNav = Object.create(null);
-      var __emitNav = function (tabId, prev, next, frameId) {
+      var __emitNav = function (tabId, prev, next, frameId, documentId) {
         if (!next || prev === next) return;
         var key = tabId + "|" + next;
         var now = Date.now();
@@ -5276,11 +5276,17 @@ var __C2S_DEBUG__ = false;
         __recentNav[key] = now;
         // Only the fragment moved → reference-fragment; anything else → history state.
         var ev = prev && __stripHash(prev) === __stripHash(next) ? fragEv : histEv;
-        ev._emit({
+        var details = {
           tabId: tabId, url: next, frameId: frameId || 0, parentFrameId: -1, processId: -1,
           timeStamp: now, transitionType: "link", transitionQualifiers: [],
-          documentId: String(tabId),
-        });
+        };
+        // Safari validates documentId wherever it is passed back (tabs.sendMessage's
+        // {documentId} rejects "140 is not a document identifier"), so a made-up one
+        // turns a delivered message into a rejection. Live: Stylus answers each SPA
+        // navigation with sendTab(tabId, urlChanged, {documentId}) and the page never
+        // re-matched its styles. Pass the sender's real id; leave it out otherwise.
+        if (typeof documentId === "string" && documentId) details.documentId = documentId;
+        ev._emit(details);
       };
 
       // Receiving half only: a content script gets the same inert stubs backfilled, but it
@@ -5304,7 +5310,7 @@ var __C2S_DEBUG__ = false;
             // onCommitted's event, not one of ours.
             var prev = __lastTabUrl[tabId];
             __lastTabUrl[tabId] = next;
-            if (prev) __emitNav(tabId, prev, next, sender.frameId);
+            if (prev) __emitNav(tabId, prev, next, sender.frameId, sender.documentId);
             // Answered synchronously, so this reply wins over any the bundle might send.
             try { if (typeof respond === "function") respond({ __c2sNavWatch: __navWanted() }); } catch (e) {}
           });
