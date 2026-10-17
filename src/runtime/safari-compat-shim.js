@@ -1359,7 +1359,7 @@ var __C2S_DEBUG__ = false;
           var q3 = Object.assign({}, qi); delete q3.currentWindow; delete q3.lastFocusedWindow;
           return runQuery(q3);
         });
-      });
+      }).then(function (res) { return oneWindowPerTab(res, qi); });
       if (typeof cb === "function") { p.then(function (r) { cb(r); }, function () { cb([]); }); return; }
       return p;
     };
@@ -1394,6 +1394,59 @@ var __C2S_DEBUG__ = false;
     }
     ns.tabs.__c2sWrapped = true;
   }
+  // A pinned tab in Safari belongs to every window: tabs.query({}) returns it once per
+  // open window (same id, its home windowId each time), a query for another window
+  // includes it with the home window's id, and windows.getAll({populate}) lists it
+  // under every window. In Chrome a tab is in exactly one window. A session manager
+  // saves all windows and restores the pinned tab once per window, multiplying it on
+  // each restore (live: Tab Session Manager saved five copies of one pinned tab).
+  // Report each tab once, under the window its own windowId names.
+  function oneWindowPerTab(tabs, qi) {
+    if (!Array.isArray(tabs) || tabs.length < 2) return tabs;
+    var seen = Object.create(null), out = [];
+    var wid = qi && typeof qi.windowId === "number" && qi.windowId >= 0 ? qi.windowId : null;
+    if (wid === null && qi && (qi.currentWindow || qi.lastFocusedWindow)) {
+      // The window asked about is the one its unpinned tabs report.
+      for (var i = 0; i < tabs.length; i++) { if (tabs[i] && !tabs[i].pinned) { wid = tabs[i].windowId; break; } }
+    }
+    for (var j = 0; j < tabs.length; j++) {
+      var t = tabs[j];
+      if (!t || t.id == null) { out.push(t); continue; }
+      if (seen[t.id]) continue;
+      if (wid !== null && typeof t.windowId === "number" && t.windowId !== wid) continue;
+      seen[t.id] = true;
+      out.push(t);
+    }
+    return out;
+  }
+  function wrapWindowTabs(ns) {
+    var w = ns && ns.windows;
+    if (!w || w.__c2sOneWindow) return;
+    var fix = function (win) {
+      if (win && Array.isArray(win.tabs)) {
+        var only = win.tabs.filter(function (t) { return !t || typeof t.windowId !== "number" || t.windowId === win.id; });
+        if (only.length !== win.tabs.length) { try { win.tabs = only; } catch (e) {} }
+      }
+      return win;
+    };
+    ["get", "getAll", "getCurrent", "getLastFocused"].forEach(function (name) {
+      var orig = w[name];
+      if (typeof orig !== "function") return;
+      var wrapped = function () {
+        var args = Array.prototype.slice.call(arguments);
+        var cb = typeof args[args.length - 1] === "function" ? args.pop() : null;
+        var apply = function (r) { return Array.isArray(r) ? r.map(fix) : fix(r); };
+        if (cb) {
+          args.push(function (r) { try { r = apply(r); } catch (e) {} return cb.apply(this, [r].concat(Array.prototype.slice.call(arguments, 1))); });
+          return orig.apply(w, args);
+        }
+        var ret = orig.apply(w, args);
+        return ret && typeof ret.then === "function" ? ret.then(function (r) { try { return apply(r); } catch (e) { return r; } }) : ret;
+      };
+      installOverride(w, name, wrapped);
+    });
+    try { w.__c2sOneWindow = true; } catch (e) {}
+  }
   // Resolve a harmless stub tab (callback or promise) for a swallowed navigation.
   function dualTab(cb) {
     var stub = { id: -1, url: "" };
@@ -1402,6 +1455,8 @@ var __C2S_DEBUG__ = false;
   }
   wrapTabsQuery(hasChrome ? chrome : null);
   if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) wrapTabsQuery(browser);
+  if (hasChrome && chrome.windows) wrapWindowTabs({ windows: mutableNamespace(chrome, "windows") || chrome.windows });
+  if (typeof browser !== "undefined" && browser.windows && (!hasChrome || browser !== chrome)) wrapWindowTabs({ windows: mutableNamespace(browser, "windows") || browser.windows });
 
   // Safari never delivers tabs.onActivated to a converted background page. Probed live
   // on Honey: the background registers the listener at boot, the user clicks between
