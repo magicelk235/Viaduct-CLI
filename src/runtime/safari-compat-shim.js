@@ -6610,6 +6610,7 @@ var __C2S_DEBUG__ = false;
       };
       var wrapped = function (opts, cb) {
         try { dnrNoteHeaderRules(opts); } catch (e) {}
+        try { dnrNoteNavRules(name === "updateSessionRules" ? "session" : "dynamic", opts); } catch (e) {}
         try { opts = stripModifyHeaders(opts); } catch (e) {}
         var addCount = (opts && opts.addRules && opts.addRules.length) || 0;
         var removeCount = (opts && opts.removeRuleIds && opts.removeRuleIds.length) || 0;
@@ -6656,6 +6657,193 @@ var __C2S_DEBUG__ = false;
     wrapDnrUpdate("updateSessionRules");
     wrapDnrUpdate("updateDynamicRules");
   }
+
+  // Safari accepts a DNR `redirect` rule, lists it back from get{Session,Dynamic}Rules,
+  // and never redirects. Measured on Safari Technology Preview with all-website access:
+  // `url`, `extensionPath` and `regexSubstitution` redirects on a top-level navigation
+  // all load the original page, while a `block` rule in the same store blocks it.
+  // Alternation in a regexFilter (`\.user\.(?:css|less|styl)`) is refused outright on
+  // top of that (D2). Live: Stylus installs a .user.css from any site through exactly
+  // such a redirect to its install page, and Tampermonkey does the same for .user.js.
+  //
+  // Top-level navigations are the one case the extension itself can redirect: the
+  // background sees the navigation start and can point the tab elsewhere. So keep the
+  // redirect rules the extension registers, as written (JS RegExp has alternation),
+  // and act on them from the background page. Allow rules are kept too, so a
+  // higher-priority allow still wins, as in Chrome. Sub-frame and subresource
+  // redirects stay out of reach. A response-header condition can't be evaluated
+  // (Safari reports no response headers) and is ignored. Session rules are kept in
+  // storage.session so they end with the browser session, like the real ones.
+  var dnrNavRules = { session: Object.create(null), dynamic: Object.create(null) };
+  var DNR_NAV_KEY = "__c2sDnrNavRules";
+  var dnrNavArea = function (store) {
+    try { return store === "session" ? (api.storage && api.storage.session) : (api.storage && api.storage.local); } catch (e) { return null; }
+  };
+  var dnrIsNavRule = function (rule) {
+    var a = rule && rule.action, c = rule && rule.condition;
+    if (!a || !c || rule.id == null) return false;
+    if (a.type !== "redirect" && a.type !== "allow" && a.type !== "allowAllRequests") return false;
+    // Chrome: with no type list at all a rule matches everything except main_frame.
+    if (Array.isArray(c.resourceTypes)) return c.resourceTypes.indexOf("main_frame") >= 0;
+    return Array.isArray(c.excludedResourceTypes) && c.excludedResourceTypes.indexOf("main_frame") < 0;
+  };
+  function dnrNoteNavRules(store, opts) {
+    if (!opts) return;
+    var map = dnrNavRules[store], changed = false;
+    if (Array.isArray(opts.removeRuleIds)) for (var r = 0; r < opts.removeRuleIds.length; r++) { if (map[opts.removeRuleIds[r]]) { delete map[opts.removeRuleIds[r]]; changed = true; } }
+    if (Array.isArray(opts.addRules)) for (var a = 0; a < opts.addRules.length; a++) {
+      var rule = opts.addRules[a];
+      if (!rule || rule.id == null) continue;
+      // Re-adding an id replaces the rule, whatever it becomes.
+      if (map[rule.id]) { delete map[rule.id]; changed = true; }
+      if (dnrIsNavRule(rule)) { map[rule.id] = rule; changed = true; }
+    }
+    if (!changed) return;
+    var area = dnrNavArea(store);
+    if (!area) return;
+    try {
+      var obj = {}; obj[DNR_NAV_KEY] = map;
+      var p = area.set(obj, function () { try { void (api.runtime && api.runtime.lastError); } catch (e) {} });
+      if (p && typeof p.catch === "function") p.catch(function () {});
+    } catch (e) {}
+  }
+  var dnrHostIn = function (host, list) {
+    for (var i = 0; i < list.length; i++) {
+      var d = String(list[i]).toLowerCase();
+      if (host === d || host.slice(-(d.length + 1)) === "." + d) return true;
+    }
+    return false;
+  };
+  // Does the rule's condition hold for a top-level navigation to url in tabId?
+  function dnrNavMatches(rule, url, tabId) {
+    var c = rule.condition;
+    // A navigation the user started has no initiator, and Chrome's domainType is
+    // judged against one; a rule keyed on either can't be decided here.
+    if (c.initiatorDomains || c.domains || c.domainType) return false;
+    if (c.requestMethods && c.requestMethods.indexOf("get") < 0) return false;
+    if (c.excludedRequestMethods && c.excludedRequestMethods.indexOf("get") >= 0) return false;
+    if (c.tabIds && c.tabIds.indexOf(tabId) < 0) return false;
+    if (c.excludedTabIds && c.excludedTabIds.indexOf(tabId) >= 0) return false;
+    var host = "";
+    try { host = new URL(url).hostname.toLowerCase(); } catch (e) { return false; }
+    if (c.requestDomains && !dnrHostIn(host, c.requestDomains)) return false;
+    if (c.excludedRequestDomains && dnrHostIn(host, c.excludedRequestDomains)) return false;
+    try {
+      if (c.regexFilter) return new RegExp(c.regexFilter, c.isUrlFilterCaseSensitive ? "" : "i").test(url);
+      if (c.urlFilter) return dnrUrlFilterToRegExp(c.urlFilter, c.isUrlFilterCaseSensitive).test(url);
+    } catch (e) { return false; }
+    return true;
+  }
+  function dnrRedirectTarget(rule, url) {
+    var r = (rule.action && rule.action.redirect) || {};
+    if (typeof r.url === "string") return r.url;
+    if (typeof r.extensionPath === "string") {
+      try { return chrome.runtime.getURL(r.extensionPath); } catch (e) { return null; }
+    }
+    var c = rule.condition;
+    if (typeof r.regexSubstitution === "string" && c.regexFilter) {
+      var m;
+      try { m = new RegExp(c.regexFilter, c.isUrlFilterCaseSensitive ? "" : "i").exec(url); } catch (e) { return null; }
+      if (!m) return null;
+      return r.regexSubstitution.replace(/\\(\\|\d)/g, function (_, d) { return d === "\\" ? "\\" : (m[+d] || ""); });
+    }
+    if (r.transform && typeof r.transform === "object") {
+      var t = r.transform, u;
+      try { u = new URL(url); } catch (e) { return null; }
+      try {
+        if (t.scheme) u.protocol = t.scheme + ":";
+        if (t.username != null) u.username = t.username;
+        if (t.password != null) u.password = t.password;
+        if (t.host != null) u.hostname = t.host;
+        if (t.port != null) u.port = t.port;
+        if (t.path != null) u.pathname = t.path;
+        if (t.query != null) u.search = t.query;
+        else if (t.queryTransform) {
+          var q = u.searchParams, qt = t.queryTransform;
+          (qt.removeParams || []).forEach(function (k) { q.delete(k); });
+          (qt.addOrReplaceParams || []).forEach(function (p) {
+            if (!p || p.key == null) return;
+            if (q.has(p.key)) q.set(p.key, p.value);
+            else if (!p.replaceOnly) q.append(p.key, p.value);
+          });
+        }
+        if (t.fragment != null) u.hash = t.fragment;
+      } catch (e) { return null; }
+      return u.href;
+    }
+    return null;
+  }
+  // Chrome picks the highest priority; on a tie allow beats allowAllRequests beats redirect.
+  var DNR_NAV_RANK = { allow: 3, allowAllRequests: 2, redirect: 1 };
+  function dnrNavRedirectFor(url, tabId) {
+    var best = null;
+    ["session", "dynamic"].forEach(function (store) {
+      var map = dnrNavRules[store];
+      for (var id in map) {
+        var rule = map[id];
+        if (!dnrNavMatches(rule, url, tabId)) continue;
+        var pr = rule.priority || 1, rk = DNR_NAV_RANK[rule.action.type] || 0;
+        if (!best || pr > best.pr || (pr === best.pr && rk > best.rk)) best = { rule: rule, pr: pr, rk: rk };
+      }
+    });
+    if (!best || best.rule.action.type !== "redirect") return null;
+    var target = dnrRedirectTarget(best.rule, url);
+    return target && target !== url ? target : null;
+  }
+  try {
+    var dnrNavBg = false;
+    try { dnrNavBg = !!(api.extension && typeof api.extension.getBackgroundPage === "function" && api.extension.getBackgroundPage() === window); } catch (e) {}
+    if (!dnrNavBg) { try { dnrNavBg = /\/background\.html$/.test(location.pathname); } catch (e) {} }
+    if (dnrNavBg && hasChrome && chrome.declarativeNetRequest && chrome.tabs && typeof chrome.tabs.update === "function") {
+      ["session", "dynamic"].forEach(function (store) {
+        var area = dnrNavArea(store);
+        if (!area) return;
+        var load = function (res) {
+          var stored = res && res[DNR_NAV_KEY];
+          if (stored && typeof stored === "object") for (var id in stored) { if (!dnrNavRules[store][id]) dnrNavRules[store][id] = stored[id]; }
+        };
+        try {
+          var lp = area.get(DNR_NAV_KEY, function (res) { try { void (api.runtime && api.runtime.lastError); } catch (e) {} load(res); });
+          if (lp && typeof lp.then === "function") lp.then(load, function () {});
+        } catch (e) {}
+      });
+      // A page that registers rules updates storage; the background follows it.
+      if (api.storage && api.storage.onChanged && api.storage.onChanged.addListener) {
+        api.storage.onChanged.addListener(function (changes, areaName) {
+          if (!changes || !changes[DNR_NAV_KEY]) return;
+          var store = areaName === "session" ? "session" : areaName === "local" ? "dynamic" : null;
+          if (!store) return;
+          var nv = changes[DNR_NAV_KEY].newValue, map = Object.create(null);
+          if (nv && typeof nv === "object") for (var id in nv) map[id] = nv[id];
+          dnrNavRules[store] = map;
+        });
+      }
+      // The target of a redirect we just made is a navigation too; never chase it.
+      var dnrNavLast = Object.create(null);
+      var dnrOnNav = function (tabId, frameId, url) {
+        if (frameId !== 0 || tabId == null || tabId < 0 || !/^(https?|ftp|file):/i.test(String(url || ""))) return;
+        if (dnrNavLast[tabId] && dnrNavLast[tabId].url === url && Date.now() - dnrNavLast[tabId].at < 3000) return;
+        var target = dnrNavRedirectFor(url, tabId);
+        if (!target) return;
+        dnrNavLast[tabId] = { url: target, at: Date.now() };
+        dbg("[c2s] DNR redirect " + url + " -> " + target);
+        try {
+          var up = chrome.tabs.update(tabId, { url: target });
+          if (up && typeof up.catch === "function") up.catch(function () {});
+        } catch (e) {}
+      };
+      // Registered while the background evaluates: Safari delivers no webNavigation
+      // event to a listener added later.
+      var wn = chrome.webNavigation, wr = chrome.webRequest;
+      if (wn && wn.onBeforeNavigate && typeof wn.onBeforeNavigate.addListener === "function" && !wn.onBeforeNavigate.__c2sInert) {
+        wn.onBeforeNavigate.addListener(function (d) { if (d) dnrOnNav(d.tabId, d.frameId, d.url); });
+      } else if (wr && wr.onBeforeRequest && typeof wr.onBeforeRequest.addListener === "function") {
+        wr.onBeforeRequest.addListener(function (d) { if (d && d.type === "main_frame") dnrOnNav(d.tabId, d.frameId, d.url); }, { urls: ["<all_urls>"], types: ["main_frame"] });
+      } else if (chrome.tabs.onUpdated && typeof chrome.tabs.onUpdated.addListener === "function") {
+        chrome.tabs.onUpdated.addListener(function (tabId, info) { if (info && info.url && info.status === "loading") dnrOnNav(tabId, 0, info.url); });
+      }
+    }
+  } catch (e) {}
 
   // ── NATIVE MESSAGING BRIDGE ────────────────────────────────────────────────
   // Chrome extensions reach a locally-installed companion app through
