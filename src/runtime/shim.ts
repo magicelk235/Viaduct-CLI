@@ -258,6 +258,20 @@ function headInsertIndex(html: string): number {
   return -1;
 }
 
+/**
+ * Insert markup at the top of the page's head. A page with no `<head>` tag gets it
+ * after its doctype: anything but whitespace or comments ahead of `<!DOCTYPE html>`
+ * drops the page into quirks mode, which reflows layout built for standards mode
+ * (Violentmonkey's install page ships `<!DOCTYPE html>` with no head).
+ */
+function insertAtHeadStart(html: string, markup: string): string {
+  const at = headInsertIndex(html);
+  if (at >= 0) return html.slice(0, at) + "\n    " + markup + html.slice(at);
+  const doctype = /^(?:\uFEFF)?(?:\s|<!--[\s\S]*?-->)*<!doctype\b[^>]*>/i.exec(html);
+  if (doctype) return html.slice(0, doctype[0].length) + "\n" + markup + html.slice(doctype[0].length);
+  return markup + "\n" + html;
+}
+
 function walkHtmlFiles(dir: string, acc: string[] = []): string[] {
   let entries;
   try {
@@ -357,13 +371,7 @@ export function injectShimIntoHtmlPages(dir: string, polyfillFile?: string): num
     // never produces duplicates. Polyfill stays before the shim.
     const missing = [polyTag, shimTag, csTag].filter((t) => t && !html.includes(t));
     if (missing.length === 0) continue;
-    const toInsert = missing.join("\n    ");
-    const at = headInsertIndex(html);
-    if (at >= 0) {
-      html = html.slice(0, at) + "\n    " + toInsert + html.slice(at);
-    } else {
-      html = toInsert + "\n" + html;
-    }
+    html = insertAtHeadStart(html, missing.join("\n    "));
     writeFileSync(file, html, "utf-8");
     count++;
   }
@@ -431,12 +439,7 @@ export function injectPopupSizing(dir: string, popupFile: string, fullHeight = f
   // the specificity tiebreak, which is why a plain `:root` override didn't take.
   const flexAnchor = `:root:root:root{justify-content:flex-start!important;align-items:flex-start!important;}`;
   const style = `<style id="${marker}">:root{color-scheme:light dark;}${sizeFloor}${flexAnchor}</style>`;
-  const at = headInsertIndex(html);
-  if (at >= 0) {
-    html = html.slice(0, at) + "\n    " + style + html.slice(at);
-  } else {
-    html = style + "\n" + html;
-  }
+  html = insertAtHeadStart(html, style);
   writeFileSync(file, html, "utf-8");
 }
 
