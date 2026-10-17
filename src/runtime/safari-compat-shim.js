@@ -5685,7 +5685,17 @@ var __C2S_DEBUG__ = false;
         "onHeadersReceived", "onAuthRequired", "onResponseStarted",
         "onBeforeRedirect", "onCompleted", "onErrorOccurred"];
       for (var i = 0; i < evNames.length; i++) {
-        try { sanitizeAdd(wr[evNames[i]]); } catch (e) {}
+        try {
+          var wev = wr[evNames[i]];
+          sanitizeAdd(wev);
+          // Hand the patched wrapper out from then on. A later read of the property
+          // can get a fresh event object with a fresh prototype (measured: a hasListener
+          // override on one event's prototype was missing from its sibling's a moment
+          // later), so neither the instance nor the prototype patch survives it, and
+          // Privacy Badger's startup addListener with ws:// URLs reached the native one
+          // and threw. The namespace object itself is stable and the slot configurable.
+          if (wev && typeof wev === "object") installOverride(wr, evNames[i], wev);
+        } catch (e) {}
       }
       // A distinct browser root (non-Safari hosts) exposes its own event objects.
       try {
