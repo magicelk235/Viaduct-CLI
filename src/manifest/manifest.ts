@@ -1229,3 +1229,24 @@ export function writeManifest(targetDir: string, manifest: Manifest): void {
   }
   writeFileSync(join(targetDir, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n", "utf-8");
 }
+
+/**
+ * Remove reserved commands declared as a bare `{}` (`"_execute_action": {}`, common in
+ * MV3 bundles). Chrome accepts them; Safari records "Empty or invalid command in the
+ * `commands` manifest entry" and lists it under Settings → Extensions. Safari
+ * synthesizes the same command without the entry (titled from the extension), so the
+ * command list is identical either way. One with a shortcut or a description loads
+ * cleanly and is kept. Runs after the action hotkey and click bridge are wired, which
+ * read the declared commands to pick a shortcut. Returns the names removed.
+ */
+export function dropEmptyReservedCommands(m: Manifest): string[] {
+  const cmds = m.commands as Record<string, unknown> | undefined;
+  if (!cmds || typeof cmds !== "object") return [];
+  const dropped = Object.keys(cmds).filter((name) => {
+    const def = cmds[name];
+    return /^_execute_/.test(name) && !!def && typeof def === "object" && Object.keys(def).length === 0;
+  });
+  for (const name of dropped) delete cmds[name];
+  if (dropped.length && Object.keys(cmds).length === 0) delete m.commands;
+  return dropped;
+}

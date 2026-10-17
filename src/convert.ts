@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve, basename, sep } from "node:path";
 import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
 import { extractExtension } from "./input/extract.js";
-import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths, raiseMinVersionForMainWorld, MAIN_WORLD_MIN_SAFARI_VERSION } from "./manifest/manifest.js";
+import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths, raiseMinVersionForMainWorld, MAIN_WORLD_MIN_SAFARI_VERSION, dropEmptyReservedCommands } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
 import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteExtensionOriginFromRuntimeId, rewriteChromeSchemeLiterals, rewriteNativeMessagingCalls, rewriteExtensionIdPlaceholderUrls, guardAncestorOriginsAccess, guardGeckoSettingsAccess, rewriteSelfPageExtensionUrls, rewriteBackgroundContextChecks, idempotentContentScriptGlobals, guardContentScriptReruns, guardLocaleTailMessage } from "./input/stage.js";
 import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireUserScriptsContentScript, wireCdpKeepalive, deriveProxyHosts, derivePanelWindowQuery, backgroundHandlesFetch, DEBUG_RPC_TOKEN_FILENAME } from "./runtime/shim.js";
@@ -291,6 +291,9 @@ export function convert(opts: ConvertOptions): ConvertResult {
     } else if (wireActionClickBridge(stageDir, transformed)) {
       ok("Action-click bridge: synthetic popup replays action.onClicked (Safari won't fire it on the toolbar button; shows a brief popover)");
     }
+    // After the wiring above, which reads the declared commands to choose a shortcut.
+    const emptyCommands = dropEmptyReservedCommands(transformed);
+    if (emptyCommands.length) ok(`Dropped empty ${emptyCommands.join(", ")} command (Safari flags it; it synthesizes the same command)`);
 
     if (convertServiceWorkerToBackgroundPage(stageDir, transformed, polyfillFile)) {
       ok("Service worker → persistent background page (Safari reachability)");
