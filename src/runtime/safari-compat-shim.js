@@ -4193,12 +4193,29 @@ var __C2S_DEBUG__ = false;
     // still updates when only the per-tab call was rejected.
     if (chrome.action) {
       var TAB_GONE_RE = /tab not found|no tab|invalid tab/i;
+      // Chrome takes setIcon({path, imageData}) and uses the imageData; Safari throws
+      // "cannot specify both 'path' and 'imageData'". Violentmonkey passes both on
+      // every icon change (imageData from a cache that may still be empty), so its
+      // toolbar icon never changed. Send one: the imageData when it holds an image,
+      // otherwise the path.
+      var oneIconSource = function (details) {
+        if (!details || typeof details !== "object" || details.path == null || details.imageData == null) return details;
+        var img = details.imageData, hasImage = false;
+        if (typeof img === "object") {
+          if (typeof img.width === "number" && img.data) hasImage = true; // a bare ImageData
+          else for (var k in img) { if (img[k] && typeof img[k] === "object") { hasImage = true; break; } }
+        }
+        var d = Object.assign({}, details);
+        if (hasImage) delete d.path; else delete d.imageData;
+        return d;
+      };
       var wrapActionSetter = function (name) {
         var orig = chrome.action[name];
         if (typeof orig !== "function" || chrome.action["__c2s_" + name]) return;
         chrome.action["__c2s_" + name] = true;
         chrome.action[name] = function (details, cb) {
           var self = this;
+          if (name === "setIcon") details = oneIconSource(details);
           var call = function (d) {
             try {
               var r = orig.call(self, d);
