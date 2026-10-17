@@ -166,6 +166,7 @@ var __C2S_DEBUG__ = false;
     try {
       var roots = [api];
       if (typeof chrome !== "undefined" && chrome && roots.indexOf(chrome) < 0) roots.push(chrome);
+      var isProtoOf = Object.prototype.isPrototypeOf;
       // proto → the one namespace object it backs; a prototype two namespaces share
       // has no single fallback and is left alone.
       var protos = [], owners = [];
@@ -190,7 +191,7 @@ var __C2S_DEBUG__ = false;
           if (!d || typeof d.value !== "function" || !d.configurable) continue;
           (function (proto, ns, name, orig, d) {
             var rebound = function () {
-              var self = (this && typeof this === "object" && proto.isPrototypeOf(this)) ? this : ns;
+              var self = (this && typeof this === "object" && isProtoOf.call(proto, this)) ? this : ns;
               return orig.apply(self, arguments);
             };
             // Writable even where WebKit reports writable:false: its own slot still
