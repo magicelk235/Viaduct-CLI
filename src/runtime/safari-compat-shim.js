@@ -5571,35 +5571,45 @@ var __C2S_DEBUG__ = false;
     })();
 
     // chrome.devtools — DevTools-page extensions (devtools_page in the manifest)
-    // have NO Safari equivalent; the panels/network/inspectedWindow surface is
-    // absent, so a devtools.html bundle reading chrome.devtools.network.onRequestFinished
-    // throws on load. Backfill inert stubs so the devtools page loads without
-    // crashing (panels simply never appear — there is no Safari host for them).
-    chrome.devtools = chrome.devtools || {};
-    fill(chrome.devtools, {
-      inspectedWindow: {
-        tabId: -1,
-        eval: function (expr, opts, cb) { if (typeof opts === "function") { cb = opts; } return dual(undefined, cb); },
-        getResources: function (cb) { return dual([], cb); },
-        reload: function () {},
-        onResourceAdded: event(), onResourceContentCommitted: event(),
-      },
-      network: {
-        getHAR: function (cb) { return dual({ entries: [] }, cb); },
-        onRequestFinished: event(), onNavigated: event(),
-      },
-      panels: {
-        themeName: "default",
-        // elements/sources sidebar panes: bundles call createSidebarPane(title, cb)
-        // at devtools-load (the elements panel extension pattern). Missing it throws
-        // and kills the devtools page. Hand back an inert ExtensionSidebarPane.
-        elements: { onSelectionChanged: event(), createSidebarPane: function (title, cb) { var pane = { setObject: function () {}, setExpression: function () {}, setPage: function () {}, setHeight: function () {}, onShown: event(), onHidden: event() }; if (typeof cb === "function") { try { cb(pane); } catch (e) {} } return pane; } },
-        sources: { onSelectionChanged: event(), createSidebarPane: function (title, cb) { var pane = { setObject: function () {}, setExpression: function () {}, setPage: function () {}, setHeight: function () {}, onShown: event(), onHidden: event() }; if (typeof cb === "function") { try { cb(pane); } catch (e) {} } return pane; } },
-        create: function (title, icon, page, cb) { if (typeof cb === "function") { try { cb({ onShown: event(), onHidden: event(), onSearch: event() }); } catch (e) {} } },
-        setOpenResourceHandler: function () {}, openResource: function (url, line, cb) { if (typeof cb === "function") cb(); },
-        onThemeChanged: event(),
-      },
-    });
+    // read chrome.devtools.network.onRequestFinished and friends on load, and a
+    // missing member throws. Backfill inert stubs so the devtools page loads.
+    // Only in a devtools context: where Safari already provides chrome.devtools, or
+    // in the manifest's devtools_page. Chrome has no chrome.devtools anywhere else,
+    // and bundles test for it to tell where they run (Web Scraper's side panel saw
+    // the stub, decided it was a devtools panel, asked tabs.get for the stub's
+    // inspected tab -1, and rendered blank).
+    var c2sDevtoolsDoc = false;
+    try {
+      var c2sDtPage = chrome.runtime && chrome.runtime.getManifest && chrome.runtime.getManifest().devtools_page;
+      c2sDevtoolsDoc = !!c2sDtPage && typeof location !== "undefined" && location.pathname === "/" + String(c2sDtPage).replace(/^\.?\//, "");
+    } catch (e) {}
+    if (chrome.devtools || c2sDevtoolsDoc) {
+      chrome.devtools = chrome.devtools || {};
+      fill(chrome.devtools, {
+        inspectedWindow: {
+          tabId: -1,
+          eval: function (expr, opts, cb) { if (typeof opts === "function") { cb = opts; } return dual(undefined, cb); },
+          getResources: function (cb) { return dual([], cb); },
+          reload: function () {},
+          onResourceAdded: event(), onResourceContentCommitted: event(),
+        },
+        network: {
+          getHAR: function (cb) { return dual({ entries: [] }, cb); },
+          onRequestFinished: event(), onNavigated: event(),
+        },
+        panels: {
+          themeName: "default",
+          // elements/sources sidebar panes: bundles call createSidebarPane(title, cb)
+          // at devtools-load (the elements panel extension pattern). Missing it throws
+          // and kills the devtools page. Hand back an inert ExtensionSidebarPane.
+          elements: { onSelectionChanged: event(), createSidebarPane: function (title, cb) { var pane = { setObject: function () {}, setExpression: function () {}, setPage: function () {}, setHeight: function () {}, onShown: event(), onHidden: event() }; if (typeof cb === "function") { try { cb(pane); } catch (e) {} } return pane; } },
+          sources: { onSelectionChanged: event(), createSidebarPane: function (title, cb) { var pane = { setObject: function () {}, setExpression: function () {}, setPage: function () {}, setHeight: function () {}, onShown: event(), onHidden: event() }; if (typeof cb === "function") { try { cb(pane); } catch (e) {} } return pane; } },
+          create: function (title, icon, page, cb) { if (typeof cb === "function") { try { cb({ onShown: event(), onHidden: event(), onSearch: event() }); } catch (e) {} } },
+          setOpenResourceHandler: function () {}, openResource: function (url, line, cb) { if (typeof cb === "function") cb(); },
+          onThemeChanged: event(),
+        },
+      });
+    }
 
     // chrome.app — legacy hosted-app probe; bundles read chrome.app.isInstalled
     // and chrome.app.getDetails() to detect a companion app. Report "no app".
