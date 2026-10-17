@@ -24,7 +24,8 @@ function runShim() {
     runtime: {
       id: "abc", lastError: null,
       getURL: (p) => "safari-web-extension://abc/" + p,
-      getManifest: () => ({}),
+      // Cloaked declares webNavigation; the shim only backfills it for extensions that do.
+      getManifest: () => ({ permissions: ["webNavigation"] }),
       sendMessage: () => Promise.resolve(),
       onMessage: { addListener: (f) => messageListeners.push(f), removeListener() {}, hasListener: () => false },
     },

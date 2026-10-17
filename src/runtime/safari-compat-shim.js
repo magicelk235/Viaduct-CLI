@@ -5370,15 +5370,27 @@ var __C2S_DEBUG__ = false;
     });
 
     // chrome.webNavigation — Safari ships a subset; backfill the events Chrome
-    // bundles read at module-eval plus frame queries.
-    chrome.webNavigation = chrome.webNavigation || {};
-    fill(chrome.webNavigation, {
-      getFrame: function (d, cb) { return dual(null, cb); },
-      getAllFrames: function (d, cb) { return dual([], cb); },
-      onBeforeNavigate: event(), onCommitted: event(), onDOMContentLoaded: event(),
-      onCompleted: event(), onErrorOccurred: event(), onCreatedNavigationTarget: event(),
-      onReferenceFragmentUpdated: event(), onTabReplaced: event(), onHistoryStateUpdated: event(),
-    });
+    // bundles read at module-eval plus frame queries. Only for an extension that
+    // asks for the permission: without it Chrome has no chrome.webNavigation, and
+    // bundles feature-detect on that. Web Scraper does (`webNavigationEnabled =
+    // chrome.webNavigation !== undefined`) without declaring the permission; the
+    // inert backfill told its scraper window page loads would be reported, it waited
+    // for events that never came, timed every page out, and stored no rows.
+    var c2sWantsWebNav = false;
+    try {
+      var c2sWnMf = (chrome.runtime && chrome.runtime.getManifest && chrome.runtime.getManifest()) || {};
+      c2sWantsWebNav = [].concat(c2sWnMf.permissions || [], c2sWnMf.optional_permissions || []).indexOf("webNavigation") >= 0;
+    } catch (e) {}
+    if (chrome.webNavigation || c2sWantsWebNav) {
+      chrome.webNavigation = chrome.webNavigation || {};
+      fill(chrome.webNavigation, {
+        getFrame: function (d, cb) { return dual(null, cb); },
+        getAllFrames: function (d, cb) { return dual([], cb); },
+        onBeforeNavigate: event(), onCommitted: event(), onDOMContentLoaded: event(),
+        onCompleted: event(), onErrorOccurred: event(), onCreatedNavigationTarget: event(),
+        onReferenceFragmentUpdated: event(), onTabReplaced: event(), onHistoryStateUpdated: event(),
+      });
+    }
 
     // Safari never fires onHistoryStateUpdated / onReferenceFragmentUpdated, and an inert
     // backfill is indistinguishable from a real event that just hasn't fired yet — so a
@@ -5395,7 +5407,7 @@ var __C2S_DEBUG__ = false;
     // actually happens, so it hooks pushState/replaceState/popstate/hashchange and
     // relays up; the background turns each relay back into the Chrome event shape.
     // tabs.onUpdated stays wired as a second source for hosts that do deliver it.
-    if (chrome.webNavigation.onHistoryStateUpdated && chrome.webNavigation.onHistoryStateUpdated.__c2sInert) {
+    if (chrome.webNavigation && chrome.webNavigation.onHistoryStateUpdated && chrome.webNavigation.onHistoryStateUpdated.__c2sInert) {
       var histEv = eventList();
       var fragEv = eventList();
       chrome.webNavigation.onHistoryStateUpdated = histEv;
