@@ -1,4 +1,4 @@
-import { writeFileSync, readFileSync, readdirSync, copyFileSync, existsSync } from "node:fs";
+import { writeFileSync, readFileSync, readdirSync, copyFileSync, existsSync, statSync } from "node:fs";
 import { join, dirname, relative, basename } from "node:path";
 import type { Manifest } from "../types.js";
 import { TEMPLATE_DIR, RUNTIME_DIR } from "../paths.js";
@@ -1334,27 +1334,10 @@ function neutralizeImportScripts(dir: string, rootRel: string, resolveDir: strin
     const end = matchBalancedParen(src, openParen); // index just past the ")"
     if (end < 0) continue; // unbalanced (shouldn't happen in valid JS) → leave as-is
     const argList = rootLiteralsFromGetURL(src.slice(openParen + 1, end - 1));
-    // Anything left after stripping STATIC literals and separators means an
-    // argument is computed at runtime (`o.p+o.u(t)`, a variable, an interpolated
-    // template) — the target can't be hoisted here. Strip "…"/'…' and only
-    // interpolation-free templates: a `${…}` template must NOT be stripped or its
-    // runtime value would masquerade as a static string and go undetected — the
-    // remaining `${…}` keeps the residue non-empty, correctly marking it dynamic.
-    const stripStatics = /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`$\\]|\$(?!\{))*`/g;
-    // Strip comments too before the emptiness test: `importScripts("a.js" /*x*/, "b.js")`
-    // is fully static, but a leftover comment would read as residue and wrongly flip the
-    // call to dynamic (→ needless webpack-chunk collection + module-mode background).
-    // Statics first, then comments — a comment token inside a string literal is already
-    // gone, so this can't strip a `//`/`/*` that was actually part of a path literal.
-    const stripComments = /\/\*[\s\S]*?\*\/|\/\/[^\n]*/g;
-    if (argList.replace(stripStatics, "").replace(stripComments, "").replace(/[\s,]/g, "") !== "") dynamic = true;
-    // Extract string OR interpolation-free template targets (`a.js`). A backtick
-    // with `${}` stays dynamic above, so only static templates reach here as
-    // hoistable literals (the `$(?!\{)` lets a literal `$` in a filename through).
-    const argRe = /"([^"]+)"|'([^']+)'|`((?:[^`$\\]|\$(?!\{))+)`/g;
-    let m: RegExpExecArray | null;
-    while ((m = argRe.exec(argList))) {
-      const literal = m[1] ?? m[2] ?? m[3]; // "…" | '…' | `…`
+    const classified = importScriptsTargets(src, mm.index, argList);
+    if (classified.dynamic) dynamic = true;
+    const literals = classified.literals;
+    for (const literal of literals) {
       // importScripts resolves each URL against the worker's location, so a leading
       // "/" is root-absolute — the extension root — while everything else is relative
       // to the worker's own dir. join() collapses the two: join("src",
@@ -1367,8 +1350,8 @@ function neutralizeImportScripts(dir: string, rootRel: string, resolveDir: strin
       // worker in a subdirectory: join(".", "/a.js") normalizes to "a.js" by luck.
       const fromRoot = (literal.startsWith("/") ? literal.slice(1) : join(resolveDir, literal))
         .split("\\").join("/");
-      // Unresolved → skip the tag; the no-op replacement still applies.
-      if (existsSync(join(dir, fromRoot))) targets.push(fromRoot);
+      // Unresolved, or not a file → skip the tag; the no-op replacement still applies.
+      if (isFile(join(dir, fromRoot))) targets.push(fromRoot);
     }
     out += src.slice(last, mm.index) + "void 0 /* importScripts hoisted to background.html */";
     last = end;
@@ -1381,6 +1364,103 @@ function neutralizeImportScripts(dir: string, rootRel: string, resolveDir: strin
   // de-fanged (it would throw on the undefined global), not just hoisted ones.
   if (neutralized > 0) writeFileSync(filePath, out, "utf-8");
   return { targets, dynamic };
+}
+
+/**
+ * Classify one importScripts call's arguments (getURL literals already rewritten):
+ * the file names it statically imports, and whether any argument is computed at
+ * runtime. A whole string literal names a file. A literal that is only part of an
+ * expression names nothing: Zotero's `importScripts('./' + script)` used to yield
+ * the target "./", the worker's own directory, which exists, so background.html got
+ * `<script src="./">` and none of the scripts the loop imports. That loop over a
+ * literal list is resolved instead. Shared with the analyzer.
+ */
+export function importScriptsTargets(src: string, callAt: number, argList: string): { literals: string[]; dynamic: boolean } {
+  const literals: string[] = [];
+  let dynamic = false;
+  // "…" | '…' | an interpolation-free template (a `${…}` one is runtime-computed).
+  const WHOLE_LITERAL = /^"([^"\\]*)"$|^'([^'\\]*)'$|^`((?:[^`$\\]|\$(?!\{))*)`$/;
+  for (const raw of splitTopLevelArgs(argList)) {
+    let arg = raw.trim();
+    let whole = WHOLE_LITERAL.exec(arg);
+    // Only drop comments when the argument isn't already one literal, so a URL's
+    // "//" survives while `"a.js" /*x*/` still reads as static.
+    if (!whole) {
+      arg = arg.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, "").trim();
+      if (!arg) continue;
+      whole = WHOLE_LITERAL.exec(arg);
+    }
+    if (whole) { literals.push(whole[1] ?? whole[2] ?? whole[3]); continue; }
+    const fromLoop = importsFromLiteralList(src, callAt, arg);
+    if (fromLoop) literals.push(...fromLoop);
+    else dynamic = true;
+  }
+  return { literals, dynamic };
+}
+
+function isFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Split a call's argument text at its top-level commas (strings, brackets aware). */
+function splitTopLevelArgs(argList: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < argList.length; i++) {
+    const c = argList[i];
+    if (c === '"' || c === "'" || c === "`") {
+      const close = argList.indexOf(c, i + 1);
+      if (close < 0) break;
+      i = close;
+    } else if (c === "(" || c === "[" || c === "{") depth++;
+    else if (c === ")" || c === "]" || c === "}") depth--;
+    else if (c === "," && depth === 0) {
+      out.push(argList.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(argList.slice(start));
+  return out;
+}
+
+/**
+ * The worker entry point that imports a list: `for (const s of SCRIPTS)
+ * importScripts(s)`, or with a prefix/suffix (`'./' + s`), where SCRIPTS is an array
+ * of string literals in the same file or inline in the loop (Zotero's
+ * background-worker.js). Returns the names in order, or null when the argument or
+ * the list is anything else.
+ */
+function importsFromLiteralList(src: string, callAt: number, arg: string): string[] | null {
+  const shape = /^(?:(["'`])([^"'`\\$]*)\1\s*\+\s*)?([A-Za-z_$][\w$]*)(?:\s*\+\s*(["'`])([^"'`\\$]*)\4)?$/.exec(arg);
+  if (!shape) return null;
+  const prefix = shape[2] ?? "", name = shape[3], suffix = shape[5] ?? "";
+  const loopRe = new RegExp(`\\bfor\\s*\\(\\s*(?:let|const|var)\\s+${name.replace(/\$/g, "\\$")}\\s+of\\s+`, "g");
+  let loopAt = -1, loopEnd = -1;
+  for (let m: RegExpExecArray | null; (m = loopRe.exec(src)) && m.index < callAt; ) { loopAt = m.index; loopEnd = m.index + m[0].length; }
+  if (loopAt < 0) return null;
+  let listText: string | null = null;
+  if (src[loopEnd] === "[") {
+    const close = src.indexOf("]", loopEnd);
+    if (close > 0) listText = src.slice(loopEnd + 1, close);
+  } else {
+    const ident = /^([A-Za-z_$][\w$]*)\s*\)/.exec(src.slice(loopEnd));
+    if (!ident) return null;
+    const decl = new RegExp(`\\b(?:var|let|const)\\s+${ident[1].replace(/\$/g, "\\$")}\\s*=\\s*\\[`).exec(src);
+    if (!decl) return null;
+    const open = decl.index + decl[0].length;
+    const close = src.indexOf("]", open);
+    if (close > 0) listText = src.slice(open, close);
+  }
+  if (listText === null) return null;
+  const body = listText.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, "");
+  if (!/^\s*(?:(["'`])[^"'`\\$]*\1\s*(?:,\s*|$))*$/.test(body)) return null;
+  const items = [...body.matchAll(/(["'`])([^"'`\\$]*)\1/g)].map((m) => prefix + m[2] + suffix);
+  return items.length ? items : null;
 }
 
 // A pure webpack async chunk is a single statement:

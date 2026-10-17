@@ -2,7 +2,7 @@ import { readdirSync, readFileSync, existsSync, realpathSync, statSync } from "n
 import { join, relative } from "node:path";
 import type { Issue, Manifest, Platforms } from "../types.js";
 import { UNSUPPORTED_APIS, parseJsonc, resolveI18nStringStrict } from "../manifest/manifest.js";
-import { matchBalancedParen, rootLiteralsFromGetURL } from "../runtime/shim.js";
+import { matchBalancedParen, rootLiteralsFromGetURL, importScriptsTargets } from "../runtime/shim.js";
 
 /**
  * Recursive file finder. Dirent-based so each entry costs no extra stat (only
@@ -213,17 +213,17 @@ function scanJsContent(content: string, rel: string, issues: Issue[], isServiceW
   // must not mask later dynamic ones (webpack/Workbox SWs commonly do a static
   // precache import first, then a dynamic chunk-loader call).
   // Static only when every arg is a string literal we can hoist verbatim (e.g.
-  // "a.js", 'b.js'), counting runtime.getURL("x") as the literal "/x", which the
-  // converter rewrites the same way. Anything else — a variable, a concat
-  // (base + "a.js") — can't be statically hoisted and silently loses its imported
-  // code, so it must warn, not reassure.
+  // "a.js", 'b.js'), counting runtime.getURL("x") as the literal "/x", or a loop
+  // over a literal list of names, both of which the converter hoists the same way
+  // (importScriptsTargets). Anything else — a variable, a concat (base + "a.js") —
+  // can't be statically hoisted and silently loses its imported code, so it must
+  // warn, not reassure.
   // Only the manifest-declared service worker is converted (importScripts hoisted
   // and neutralized). importScripts in any OTHER file — a genuine web worker —
   // keeps working in Safari untouched, so flagging it would be a false alarm.
   // Args are extracted with the same balanced-paren scan the converter uses
   // (matchBalancedParen); a [^)]* regex truncates at the first ")" inside an
   // argument (webpack's `importScripts(o.p+o.u(t))`) and misclassifies.
-  const STATIC_LITERAL_LIST = /^\s*(?:(["'])[^"']*\1\s*,\s*)*(["'])[^"']*\2\s*$/;
   const IS_OPEN_RE = /\bimportScripts\s*\(/g;
   let isFirstAt = -1;
   let isDynamicAt = -1;
@@ -233,7 +233,7 @@ function scanJsContent(content: string, rel: string, issues: Issue[], isServiceW
     if (end < 0) break;
     const argList = rootLiteralsFromGetURL(content.slice(m.index + m[0].length, end - 1));
     IS_OPEN_RE.lastIndex = end;
-    if (argList.trim() !== "" && !STATIC_LITERAL_LIST.test(argList)) {
+    if (argList.trim() !== "" && importScriptsTargets(content, m.index, argList).dynamic) {
       isDynamicAt = m.index;
       break;
     }
