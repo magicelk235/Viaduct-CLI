@@ -460,8 +460,26 @@ export function rewriteRuntimeIdUrlMatchers(stageDir: string): number {
 // `foo().ancestorOrigins…`), and the `|| ""` wrap then emits unbalanced `foo((…))` —
 // a SyntaxError that kills the whole file. (Latent: real bundles never call-through to
 // ancestorOrigins, but a token class must not be able to produce invalid output.)
-const ANCESTOR_ORIGINS_RE =
-  /((?:[\w$.]|\?\.)+\.ancestorOrigins(\?\.\[0\]|\[0\]))(?=\s*\.)/g;
+//
+// Found from the `.ancestorOrigins[0]` end and walked back, never by a pattern that
+// starts with the receiver: `(?:[\w$.]|\?\.)+\.ancestorOrigins` retries from every
+// position of every long word run and backtracks over the rest of it, which is
+// quadratic. Floccus ships multi-megabyte runs of identifier characters (inlined
+// data), and conversion sat in this step for over half an hour.
+const ANCESTOR_INDEX_RE = /\.ancestorOrigins(?:\?\.\[0\]|\[0\])(?=\s*\.)/g;
+
+/** Start of the dotted identifier chain (`a.b?.c`) that ends just before `end`. */
+function receiverChainStart(src: string, end: number): number {
+  let i = end;
+  while (i > 0) {
+    const c = src.charCodeAt(i - 1);
+    const word = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 36 || c === 46;
+    if (word) { i--; continue; }
+    if (c === 63 && src.charCodeAt(i) === 46) { i--; continue; } // the "?" of "?."
+    break;
+  }
+  return i;
+}
 
 export function guardAncestorOriginsAccess(stageDir: string): number {
   let modified = 0;
@@ -472,13 +490,19 @@ export function guardAncestorOriginsAccess(stageDir: string): number {
     } catch {
       continue;
     }
-    let changed = false;
-    const next = content.replace(ANCESTOR_ORIGINS_RE, (whole) => {
-      changed = true;
-      return "(" + whole + ' || "")';
-    });
-    if (changed) {
-      writeFileSync(file, next, "utf-8");
+    if (!content.includes("ancestorOrigins")) continue;
+    let out = "";
+    let last = 0;
+    for (let m: RegExpExecArray | null; (m = ANCESTOR_INDEX_RE.exec(content)); ) {
+      const start = receiverChainStart(content, m.index);
+      // `.ancestorOrigins` needs a receiver; a bare one is not this shape.
+      if (start === m.index || start < last) continue;
+      const end = m.index + m[0].length;
+      out += content.slice(last, start) + "(" + content.slice(start, end) + ' || "")';
+      last = end;
+    }
+    if (last > 0) {
+      writeFileSync(file, out + content.slice(last), "utf-8");
       modified++;
     }
   }
