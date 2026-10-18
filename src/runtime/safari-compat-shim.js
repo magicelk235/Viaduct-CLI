@@ -6811,6 +6811,45 @@ var __C2S_DEBUG__ = false;
       dbg("[c2s] DNR strip: " + (opts.addRules.length - safe.length) + " modifyHeaders rule(s) of " + opts.addRules.length + " (Safari never applies them)");
       return Object.assign({}, opts, { addRules: safe });
     };
+    // Safari refuses four of Chrome's resource types outright: submitting one rule per
+    // type on Safari Technology Preview, `object`, `csp_report`, `webtransport` and
+    // `webbundle` throw "The value in the `resourceTypes` array is invalid", and one such
+    // rule fails the whole update. The salvage below then re-adds the batch one rule per
+    // call, and every call recompiles the content rule list: AdGuard's 715 session rules
+    // landed about one per 7 s and its engine start never finished. Safari never
+    // classifies a request as any of these types, so drop them from the conditions: a
+    // rule left with no type can match nothing and goes, and an exclusion list emptied
+    // this way becomes every Safari type, because a condition with neither list would
+    // stop matching main_frame (Chrome's default) where the extension's rule matched it.
+    var DNR_SAFARI_TYPES = ["main_frame", "sub_frame", "stylesheet", "script", "image", "font",
+      "xmlhttprequest", "ping", "media", "websocket", "other"];
+    var DNR_REFUSED_TYPE = { object: 1, csp_report: 1, webtransport: 1, webbundle: 1 };
+    var dnrTypeOk = function (t) { return !DNR_REFUSED_TYPE[t]; };
+    var stripRefusedTypes = function (opts) {
+      if (!opts || !Array.isArray(opts.addRules)) return opts;
+      var changed = 0, dropped = 0;
+      var out = [];
+      opts.addRules.forEach(function (r) {
+        var c = r && r.condition;
+        var rt = c && Array.isArray(c.resourceTypes) ? c.resourceTypes.filter(dnrTypeOk) : null;
+        var ex = c && Array.isArray(c.excludedResourceTypes) ? c.excludedResourceTypes.filter(dnrTypeOk) : null;
+        var rtCut = rt && rt.length !== c.resourceTypes.length;
+        var exCut = ex && ex.length !== c.excludedResourceTypes.length;
+        if (!rtCut && !exCut) { out.push(r); return; }
+        changed++;
+        if (rt && !rt.length) { dropped++; return; }
+        var nc = Object.assign({}, c);
+        if (rtCut) nc.resourceTypes = rt;
+        if (exCut) {
+          if (ex.length) nc.excludedResourceTypes = ex;
+          else { delete nc.excludedResourceTypes; if (!rt) nc.resourceTypes = DNR_SAFARI_TYPES.slice(); }
+        }
+        out.push(Object.assign({}, r, { condition: nc }));
+      });
+      if (!changed) return opts;
+      dbg("[c2s] DNR types: " + changed + " rule(s) named a resource type Safari refuses; " + dropped + " had no other type and were dropped");
+      return Object.assign({}, opts, { addRules: out });
+    };
     var wrapDnrUpdate = function (name) {
       var orig = dnrNs[name];
       if (typeof orig !== "function") { dbg("[c2s] DNR " + name + ": absent, nothing to wrap"); return; }
@@ -6867,10 +6906,37 @@ var __C2S_DEBUG__ = false;
           return kept;
         });
       };
+      // Safari validates the whole batch synchronously and throws naming the FIRST rule
+      // it refuses ("… an error with rule at index 711: Rule with id 720 is invalid.
+      // `regexFilter` is not …"). A refused call never reaches the compiler, so dropping
+      // that rule and resubmitting is cheap, where the salvage above pays a full content
+      // rule list recompile per rule (about 7 s each on AdGuard's list, whose engine
+      // start waited on it). Only drop when the index AND the id point at the same rule,
+      // so any other throw still surfaces.
+      var callDropping = function (opts, cbArg) {
+        var cur = opts;
+        var reasons = DBG ? {} : null;
+        for (;;) {
+          try {
+            var r = cbArg ? orig.call(dnrNs, cur, cbArg) : orig.call(dnrNs, cur);
+            if (reasons) { for (var why in reasons) dbg("[c2s] DNR " + name + " dropped x" + reasons[why] + " before sending: " + why); }
+            return { r: r, opts: cur };
+          } catch (e) {
+            var msg = String((e && e.message) || e);
+            var m = /rule at index (\d+): Rule with id (-?\d+)/.exec(msg);
+            var list = cur && cur.addRules;
+            var idx = m ? +m[1] : -1;
+            if (!m || !Array.isArray(list) || !list[idx] || String(list[idx].id) !== m[2]) throw e;
+            if (reasons) { var k = msg.replace(/.*Rule with id -?\d+ is invalid\.?\s*/, ""); reasons[k] = (reasons[k] || 0) + 1; }
+            cur = Object.assign({}, cur, { addRules: list.slice(0, idx).concat(list.slice(idx + 1)) });
+          }
+        }
+      };
       var wrapped = function (opts, cb) {
         try { dnrNoteHeaderRules(opts); } catch (e) {}
         try { dnrNoteNavRules(name === "updateSessionRules" ? "session" : "dynamic", opts); } catch (e) {}
         try { opts = stripModifyHeaders(opts); } catch (e) {}
+        try { opts = stripRefusedTypes(opts); } catch (e) {}
         var addCount = (opts && opts.addRules && opts.addRules.length) || 0;
         var removeCount = (opts && opts.removeRuleIds && opts.removeRuleIds.length) || 0;
         dbg("[c2s] DNR " + name + ": +" + addCount + " -" + removeCount);
@@ -6888,16 +6954,24 @@ var __C2S_DEBUG__ = false;
           // rather than reporting through the callback, which would otherwise abort
           // the extension's own registration code mid-way. Catch it and salvage.
           try {
-            return orig.call(dnrNs, opts, function () {
+            var sentCb = callDropping(opts, function () {
               var err = null;
               try { err = chrome.runtime && chrome.runtime.lastError; } catch (e) {}
               if (!err) { try { cb(); } catch (e) {} return; }
               recover(err);
             });
+            opts = sentCb.opts;
+            addCount = (opts && opts.addRules && opts.addRules.length) || 0;
+            return sentCb.r;
           } catch (e) { recover(e); return; }
         }
         var p;
-        try { p = orig.call(dnrNs, opts); } catch (e) { p = Promise.reject(e); }
+        try {
+          var sent = callDropping(opts);
+          opts = sent.opts;
+          addCount = (opts && opts.addRules && opts.addRules.length) || 0;
+          p = sent.r;
+        } catch (e) { p = Promise.reject(e); }
         if (!p || typeof p.then !== "function") return p;
         return p.then(function (r) { dbg("[c2s] DNR " + name + " accepted " + addCount + " rule(s)"); return r; }, function (e) {
           dbg("[c2s] DNR " + name + " rejected: " + String((e && e.message) || e));
