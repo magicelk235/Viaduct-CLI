@@ -1238,6 +1238,21 @@ var __C2S_DEBUG__ = false;
     cacheWrap(port, w);
     return w;
   }
+  // The shim keeps its own runtime.connect channels to the background (the side-panel
+  // signal, opened from every action popup too; the action and debugger keep-alives; the
+  // service-worker bridge; the --debug RPC), all named __c2s… or __viaduct…. Chrome never
+  // shows an extension those ports, and some extensions treat an unknown port name as a
+  // bug: AdGuard's onConnect throws "There is no such pages __c2sPanelPort" on each one.
+  // So the onConnect wrap below hides them from the extension's listeners, and the shim's
+  // own listeners are tagged with internalListener() so they register unwrapped.
+  function isInternalPort(port) {
+    var n; try { n = port && port.name; } catch (e) {}
+    return typeof n === "string" && /^__(c2s|viaduct)/.test(n);
+  }
+  function internalListener(fn) {
+    try { fn.__c2sInternal = true; } catch (e) {}
+    return fn;
+  }
   // Canonicalize sender.origin on incoming connections/messages. Some extensions
   // privilege-gate their own pages with `sender.origin === getURL('').slice(0,-1)`; on a
   // mutable-sender browser where the case mismatches, align it. On Safari this is a no-op
@@ -1250,39 +1265,69 @@ var __C2S_DEBUG__ = false;
   // would silently not take.
   function wrapOnConnect(rt) {
     if (!rt || rt.__c2sOnConnect) return;
+    // Without a canonical origin there is no sender to fix, but internal ports still
+    // have to be hidden, so onConnect is wrapped either way.
     var canon = canonicalOrigin(rt);
-    if (!canon) return; // nothing to canonicalize against → skip (don't wrap for nothing)
     // Each event keeps an fn->wrapper map: the native event holds the WRAPPER, so
     // removeListener/hasListener must translate the caller's original reference —
     // a bare addListener-only wrap made every listener unremovable.
-    var wrapEvent = function (ev, makeWrapper) {
+    // `isLive(obj)` opts into the prototype patch below: WebKit holds event wrappers
+    // weakly, so a later read of rt.onConnect can return a FRESH wrapper without the
+    // instance override (measured live: AdGuard registers its onConnect listener during
+    // async init, reached the native addListener, and was handed __c2sPanelPort). Fresh
+    // wrappers inherit from the shared event prototype, so patch that too, applying the
+    // wrap only when `this` is the live event and passing every other event through.
+    var wrapEvent = function (ev, makeWrapper, isLive) {
       if (!ev || typeof ev.addListener !== "function" || ev.__c2sWrapped) return;
-      var nativeAdd = ev.addListener.bind(ev);
-      var nativeRemove = typeof ev.removeListener === "function" ? ev.removeListener.bind(ev) : null;
-      var nativeHas = typeof ev.hasListener === "function" ? ev.hasListener.bind(ev) : null;
       var pairs = [];
       var wrapped = function (fn) { for (var i = 0; i < pairs.length; i++) if (pairs[i][0] === fn) return pairs[i][1]; return null; };
-      var took = installOverride(ev, "addListener", function (fn) {
-        if (typeof fn !== "function") return nativeAdd(fn);
-        var w = wrapped(fn);
-        if (!w) { w = makeWrapper(fn); pairs.push([fn, w]); }
-        return nativeAdd(w);
-      });
-      if (nativeRemove) installOverride(ev, "removeListener", function (fn) {
-        var w = wrapped(fn);
-        if (w) { for (var i = 0; i < pairs.length; i++) if (pairs[i][0] === fn) { pairs.splice(i, 1); break; } return nativeRemove(w); }
-        return nativeRemove(fn);
-      });
-      if (nativeHas) installOverride(ev, "hasListener", function (fn) {
-        return nativeHas(wrapped(fn) || fn);
+      var ops = {
+        addListener: function (base, self, fn) {
+          if (typeof fn === "function" && fn.__c2sInternal) {
+            return base.call(self, fn);
+          }
+          if (typeof fn !== "function") return base.call(self, fn);
+          var w = wrapped(fn);
+          if (!w) { w = makeWrapper(fn); pairs.push([fn, w]); }
+          return base.call(self, w);
+        },
+        removeListener: function (base, self, fn) {
+          var w = wrapped(fn);
+          if (w) { for (var i = 0; i < pairs.length; i++) if (pairs[i][0] === fn) { pairs.splice(i, 1); break; } return base.call(self, w); }
+          return base.call(self, fn);
+        },
+        hasListener: function (base, self, fn) {
+          return base.call(self, wrapped(fn) || fn);
+        }
+      };
+      var took = false;
+      Object.keys(ops).forEach(function (name) {
+        var base = ev[name];
+        if (typeof base !== "function") return;
+        var ok = installOverride(ev, name, function (fn) { return ops[name](base, ev, fn); });
+        if (name === "addListener") took = ok;
       });
       if (took) { try { ev.__c2sWrapped = true; } catch (e) {} }
+      if (!isLive) return;
+      try {
+        var proto = Object.getPrototypeOf(ev);
+        while (proto && !Object.prototype.hasOwnProperty.call(proto, "addListener")) proto = Object.getPrototypeOf(proto);
+        if (!proto) return;
+        Object.keys(ops).forEach(function (name) {
+          var pbase = proto[name];
+          if (typeof pbase !== "function") return;
+          installOverride(proto, name, function (fn) {
+            return isLive(this) ? ops[name](pbase, this, fn) : pbase.apply(this, arguments);
+          });
+        });
+      } catch (e) {}
     };
     wrapEvent(rt.onConnect, function (fn) {
       return function (port) {
+        if (isInternalPort(port)) return;
         var out = port;
         try {
-          if (port) {
+          if (port && canon) {
             var already = cachedWrap(port);
             if (already) { out = already; }            // second listener, same dispatch
             else {
@@ -1319,8 +1364,8 @@ var __C2S_DEBUG__ = false;
         } catch (e) {}
         return fn.call(this, out);
       };
-    });
-    wrapEvent(rt.onMessage, function (fn) {
+    }, function (obj) { try { return obj === rt.onConnect; } catch (e) { return false; } });
+    if (canon) wrapEvent(rt.onMessage, function (fn) {
       return function (msg, sender, reply) {
         try { fixSenderOrigin(sender, canon); } catch (e) {}
         try { sender = senderWithFixedUrl(sender, canon); } catch (e) {}
@@ -1810,13 +1855,13 @@ var __C2S_DEBUG__ = false;
     // Backup: a runtime.connect port also keeps the bg alive while the panel is open.
     try {
       if (chrome.runtime && chrome.runtime.onConnect) {
-        chrome.runtime.onConnect.addListener(function (port) {
+        chrome.runtime.onConnect.addListener(internalListener(function (port) {
           if (!port || port.name !== "__c2sPanelPort") return;
           var wid = -2;
           try { if (port.sender && port.sender.tab && typeof port.sender.tab.windowId === "number") wid = port.sender.tab.windowId; } catch (e) {}
           port.onMessage.addListener(function (m) { if (m && typeof m.windowId === "number") { wid = m.windowId; c2sEmitPanel(wid, true); } });
           port.onDisconnect.addListener(function () { var _ = chrome.runtime.lastError; });
-        });
+        }));
       }
     } catch (e) {}
   }
@@ -2345,7 +2390,7 @@ var __C2S_DEBUG__ = false;
     };
     try {
       if (chrome.runtime && chrome.runtime.onConnect && chrome.runtime.onConnect.addListener) {
-        chrome.runtime.onConnect.addListener(function (port) {
+        chrome.runtime.onConnect.addListener(internalListener(function (port) {
           if (!port || port.name !== "__viaduct-cdp-keepalive") return;
           dbgKaPorts.push(port);
           try { cdpLog("KA-PORT+ " + port.name); } catch (e) {}
@@ -2358,7 +2403,7 @@ var __C2S_DEBUG__ = false;
               if (m.__c2sCdpNetwork) onNetworkReport(tid, m.__c2sCdpNetwork);
             });
           } catch (e) {}
-        });
+        }));
       }
     } catch (e) {}
     // A DECLARED content script (viaduct-cdp-keepalive.js on <all_urls>) holds the
@@ -2532,12 +2577,12 @@ var __C2S_DEBUG__ = false;
     // dies. Adds an OBSERVER listener only (does not consume/alter the port).
     try {
       if (chrome.runtime && chrome.runtime.onConnect && chrome.runtime.onConnect.addListener) {
-        chrome.runtime.onConnect.addListener(function (port) {
+        chrome.runtime.onConnect.addListener(internalListener(function (port) {
           try {
             cdpLog("PORT+ " + (port && port.name));
             if (port && port.onDisconnect && port.onDisconnect.addListener) port.onDisconnect.addListener(function () { try { cdpLog("PORT- " + (port && port.name)); } catch (e) {} });
           } catch (e) {}
-        });
+        }));
       }
     } catch (e) {}
 
@@ -3749,7 +3794,7 @@ var __C2S_DEBUG__ = false;
       // Background side: replay each tunneled postMessage as a `message` event on
       // self, the shape a real service worker receives.
       if (!rt.onConnect || typeof rt.onConnect.addListener !== "function") return;
-      rt.onConnect.addListener(function (port) {
+      rt.onConnect.addListener(internalListener(function (port) {
         if (!port || port.name !== CHANNEL) return;
         var bridged = {};   // pid → our end of the re-materialized MessagePort pair
         var lastSeq = 0;    // the connect proxy can replay a queued send; ports are ordered
@@ -3791,7 +3836,7 @@ var __C2S_DEBUG__ = false;
           for (var pid in bridged) { try { bridged[pid].close(); } catch (e) {} }
           bridged = {};
         });
-      });
+      }));
       return;
     }
 
@@ -4338,11 +4383,11 @@ var __C2S_DEBUG__ = false;
         try {
           if (chrome.runtime && chrome.runtime.onConnect) {
             var __vPorts = [];
-            chrome.runtime.onConnect.addListener(function (port) {
+            chrome.runtime.onConnect.addListener(internalListener(function (port) {
               if (!port || port.name !== "__viaduct-keepalive") return;
               __vPorts.push(port);
               port.onDisconnect.addListener(function () { var i = __vPorts.indexOf(port); if (i >= 0) __vPorts.splice(i, 1); });
-            });
+            }));
           }
         } catch (e) {}
         var getActive = function (cb) {

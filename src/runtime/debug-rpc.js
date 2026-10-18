@@ -271,7 +271,7 @@
     // Every extension context listens on its own end of each RPC port and answers
     // only the requests addressed to it.
     try {
-      api.runtime.onConnect.addListener(function (port) {
+      api.runtime.onConnect.addListener(internalListener(function (port) {
         if (!port || port.name !== PORT) return;
         port.onMessage.addListener(function (msg) {
           if (!msg || typeof msg !== "object" || !msg.__viaduct_rpc) return;
@@ -283,7 +283,7 @@
             try { port.postMessage({ __viaduct_rpc_reply: { id: req.id, res: res } }); } catch (e) {}
           });
         });
-      });
+      }));
     } catch (e) {}
     // Extension pages can also hop to one another over sendMessage, where Safari
     // excludes the sender's own page from delivery, so a page-to-page request has
