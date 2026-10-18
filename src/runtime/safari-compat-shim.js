@@ -176,7 +176,10 @@ var __C2S_DEBUG__ = false;
           var ns; try { ns = roots[ri][keys[ki]]; } catch (e) { continue; }
           if (!ns || typeof ns !== "object") continue;
           var proto = Object.getPrototypeOf(ns);
-          if (!proto || proto === Object.prototype) continue;
+          // A plain object's prototype is some realm's Object.prototype (null above it);
+          // rebinding that would rebind isPrototypeOf itself. Only real namespace
+          // prototypes, which sit above Object.prototype, qualify.
+          if (!proto || proto === Object.prototype || Object.getPrototypeOf(proto) === null) continue;
           var at = protos.indexOf(proto);
           if (at < 0) { protos.push(proto); owners.push(ns); }
           else if (owners[at] !== ns) owners[at] = null;
