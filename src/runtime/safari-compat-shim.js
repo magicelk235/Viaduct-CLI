@@ -5861,7 +5861,7 @@ var __C2S_DEBUG__ = false;
         for (var j = 0; j < os.length; j++) if (!matchOrigin(m.origins, os[j])) return false;
         return true;
       };
-      fill(chrome.permissions, {
+      var own = {
         contains: function (p, cb) { return dual(has(p), cb); },
         getAll: function (cb) { var m = manifestPerms(); return dual({ permissions: m.perms, origins: m.origins }, cb); },
         // Already-declared → already granted (resolve true). Anything else can't be
@@ -5869,6 +5869,32 @@ var __C2S_DEBUG__ = false;
         request: function (p, cb) { return dual(has(p), cb); },
         remove: function (p, cb) { return dual(false, cb); },
         onAdded: event(), onRemoved: event(),
+      };
+      fill(chrome.permissions, own);
+      // Safari's native contains/request/remove throw for any permission NAME Safari
+      // doesn't implement ("Invalid call to permissions.contains(). The 'permissions'
+      // value is invalid, because 'privacy' is not a valid permission."), where Chrome
+      // answers false for an optional permission the user hasn't granted. viaduct strips
+      // those names from the manifest, so the extension can never hold them: AdGuard's
+      // engine start awaited contains({permissions:['privacy']}) and died on the throw.
+      // Keep the native call and answer only that rejection, the same way the backfill
+      // above answers when there is no native at all.
+      var rejectedName = function (e) { return /is not a valid permission/i.test(String((e && e.message) || e)); };
+      ["contains", "request", "remove"].forEach(function (name) {
+        var ns = chrome.permissions;
+        var nat = ns[name];
+        if (typeof nat !== "function" || nat === own[name] || nat.__c2sPermWrap) return;
+        var wrapper = function (p, cb) {
+          var r;
+          try { r = nat.apply(ns, arguments); }
+          catch (e) { if (rejectedName(e)) return own[name](p, cb); throw e; }
+          if (r && typeof r.then === "function") {
+            return r.then(null, function (e) { if (rejectedName(e)) return own[name](p); throw e; });
+          }
+          return r;
+        };
+        wrapper.__c2sPermWrap = true;
+        installOverride(ns, name, wrapper);
       });
     })();
 
