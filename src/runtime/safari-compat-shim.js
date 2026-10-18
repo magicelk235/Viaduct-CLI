@@ -1284,6 +1284,12 @@ var __C2S_DEBUG__ = false;
       var ops = {
         addListener: function (base, self, fn) {
           if (typeof fn === "function" && fn.__c2sInternal) {
+            // An extension frame inside a web page must not listen for connections:
+            // the frame shares the content script's process, and while it holds an
+            // onConnect listener Safari delivers every message a content script posts
+            // on a port to the background TWICE (measured). The shim's own channels
+            // all end in the background or a top-level page, so the frame needs none.
+            if (c2sFramedInWebPage) return;
             return base.call(self, fn);
           }
           if (typeof fn !== "function") return base.call(self, fn);
