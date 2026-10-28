@@ -1512,6 +1512,49 @@ var __C2S_DEBUG__ = false;
   if (hasChrome && chrome.windows) wrapWindowTabs({ windows: mutableNamespace(chrome, "windows") || chrome.windows });
   if (typeof browser !== "undefined" && browser.windows && (!hasChrome || browser !== chrome)) wrapWindowTabs({ windows: mutableNamespace(browser, "windows") || browser.windows });
 
+  // Chrome's tabs.getCurrent resolves the tab the calling document is in, and undefined
+  // when it is in none: the background page, an action popup, a side panel. Safari falls
+  // back to the focused window's active tab. Measured: from the background page and
+  // from the action popover it returned the web page in front; from options.html in a
+  // background tab it returned that tab. A panel that reads "a tab" as "I was opened in
+  // a window" then refuses to run in the popover (Claude in Chrome 1.0.102 shows
+  // "Claude isn't available on this page"). Keep Safari's answer only when that tab is
+  // showing this document, the top one when this is a frame in the extension's own tab.
+  // An extension frame inside a web page already gets its tab from the frame relay.
+  function c2sUrlKey(u) {
+    var m = /^([a-z][a-z0-9+.-]*:\/\/[^\/?#]*)([^?#]*)/i.exec(typeof u === "string" ? u : "");
+    return m ? m[1].toLowerCase() + m[2] : null;
+  }
+  function wrapTabsGetCurrent(tabs) {
+    if (!tabs || typeof tabs.getCurrent !== "function" || tabs.__c2sOwnTab || c2sFramedInWebPage) return;
+    if (typeof location === "undefined" || !/^(safari-web-extension|chrome-extension|moz-extension):$/.test(location.protocol)) return;
+    var orig = tabs.getCurrent;
+    var ownKey = function () {
+      try {
+        var topWin = typeof window !== "undefined" ? window.top : null;
+        return c2sUrlKey(topWin && topWin !== window ? topWin.location.href : location.href);
+      } catch (e) { return null; }
+    };
+    var own = function (tab) {
+      var key = ownKey();
+      return !tab || !key || c2sUrlKey(tab.url) === key ? tab : undefined;
+    };
+    var wrapped = function (cb) {
+      if (typeof cb === "function") {
+        return orig.call(tabs, function (tab) {
+          var t = tab;
+          try { t = own(tab); } catch (e) {}
+          return cb.apply(this, [t].concat(Array.prototype.slice.call(arguments, 1)));
+        });
+      }
+      var ret = orig.call(tabs);
+      return ret && typeof ret.then === "function" ? ret.then(function (tab) { try { return own(tab); } catch (e) { return tab; } }) : ret;
+    };
+    if (installOverride(tabs, "getCurrent", wrapped)) { try { tabs.__c2sOwnTab = true; } catch (e) {} }
+  }
+  if (hasChrome && chrome.tabs) wrapTabsGetCurrent(mutableNamespace(chrome, "tabs") || chrome.tabs);
+  if (typeof browser !== "undefined" && browser.tabs && (!hasChrome || browser !== chrome)) wrapTabsGetCurrent(mutableNamespace(browser, "tabs") || browser.tabs);
+
   // Safari never delivers tabs.onActivated to a converted background page. Probed live
   // on Honey: the background registers the listener at boot, the user clicks between
   // three tabs, and not one event arrives while the page is demonstrably alive
