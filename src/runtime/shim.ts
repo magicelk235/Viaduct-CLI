@@ -15,6 +15,7 @@ export const POLYFILL_FILENAME = "browser-polyfill.min.js";
 // under this distinct name instead.
 export const POLYFILL_ALT_FILENAME = "viaduct-browser-polyfill.min.js";
 export const BACKGROUND_PAGE_FILENAME = "background.html";
+export const PAGE_SCRIPT_FILENAME = "viaduct-page-script.js";
 export const SW_LIFECYCLE_FILENAME = "viaduct-sw-lifecycle.js";
 export const ACTION_HOTKEY_FILENAME = "__viaduct-hotkey.js";
 export const USERSCRIPTS_CS_FILENAME = "__viaduct-userscripts.js";
@@ -418,6 +419,26 @@ export function injectShimIntoHtmlPages(dir: string, polyfillFile?: string): num
     const missing = [polyTag, shimTag, csTag].filter((t) => t && !html.includes(t));
     if (missing.length === 0) continue;
     html = insertAtHeadStart(html, missing.join("\n    "));
+    writeFileSync(file, html, "utf-8");
+    count++;
+  }
+  return count;
+}
+
+// --page-script: the user's own script, copied in and loaded in every shipped HTML page
+// right after the shim (or first in <head> when the shim is off), so it sees the same
+// backfilled APIs the page will and runs before any of the page's own scripts.
+export function injectPageScript(dir: string, source: string): number {
+  if (!existsSync(source) || !statSync(source).isFile()) throw new Error(`--page-script: no such file: ${source}`);
+  copyFileSync(source, join(dir, PAGE_SCRIPT_FILENAME));
+  const tag = `<script src="/${PAGE_SCRIPT_FILENAME}"></script>`;
+  const shimTag = `<script src="/${SHIM_FILENAME}"></script>`;
+  let count = 0;
+  for (const file of walkHtmlFiles(dir)) {
+    let html = readFileSync(file, "utf-8");
+    if (html.includes(tag)) continue;
+    const at = html.indexOf(shimTag);
+    html = at >= 0 ? html.slice(0, at + shimTag.length) + "\n    " + tag + html.slice(at + shimTag.length) : insertAtHeadStart(html, tag);
     writeFileSync(file, html, "utf-8");
     count++;
   }

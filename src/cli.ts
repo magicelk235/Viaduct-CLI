@@ -25,7 +25,7 @@ const CONFIG_KEYS = [
   "output", "bundle-id", "app-name", "min-safari", "platforms", "ci",
   "zip", "no-build", "open-xcode", "install", "install-dir",
   "no-safari-restart", "background-launch", "team", "no-shim", "no-oauth-bridge", "keep-module",
-  "panel-query", "force", "strict", "verify", "clean", "debug",
+  "panel-query", "page-script", "force", "strict", "verify", "clean", "debug",
 ] as const;
 
 // Boolean-typed config keys (mirror the `type: "boolean"` entries in parseArgs). A
@@ -177,6 +177,10 @@ OPTIONS
                             as a standalone window (mode=window), since a popover is one.
                             Pass "" to open the page bare. A page the extension opened
                             with a query of its own is left untouched.
+      --page-script <file>  Load <file> in every HTML page the extension ships (popup,
+                            side panel, options), after the shim and before the page's
+                            own scripts. For a fix only one extension needs, kept out of
+                            viaduct itself.
       --debug               Emit the shim with debug tracing enabled. Traces persist to a
                             bounded ring buffer (last 2000 entries, batched writes) in
                             storage.local under __viaduct_debug_log__ — read it live from
@@ -361,6 +365,7 @@ async function main(): Promise<void> {
         "no-oauth-bridge": { type: "boolean", default: false },
         "keep-module": { type: "boolean", default: false },
         "panel-query": { type: "string" },
+        "page-script": { type: "string" },
         debug: { type: "boolean", default: false },
         logs: { type: "string" },
         force: { type: "boolean", default: false },
@@ -647,6 +652,7 @@ async function main(): Promise<void> {
         keepModuleBackground: values["keep-module"],
         debug: values.debug,
         panelQuery: values["panel-query"],
+        pageScript: values["page-script"] ? resolve(values["page-script"]) : undefined,
       });
     } catch (e) {
       fail((e as Error).message);

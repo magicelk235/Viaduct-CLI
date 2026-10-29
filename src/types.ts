@@ -99,6 +99,10 @@ export interface ConvertOptions {
    *  branches on one its own code adds (a detached "window" mode of the panel) can
    *  be pointed at that branch when the default one cannot work in Safari. */
   panelQuery?: string;
+  /** A script of the user's own, loaded in every HTML page the extension ships, right
+   *  after the shim and before the page's own scripts. Not the generated background
+   *  page and not content scripts. */
+  pageScript?: string;
   /** Copy the built app into ~/Applications and register it with Safari. */
   install: boolean;
   /** Override the install target dir (default ~/Applications). */

@@ -7,7 +7,7 @@ import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths, raiseMinVersionForMainWorld, MAIN_WORLD_MIN_SAFARI_VERSION, dropEmptyReservedCommands } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
 import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteExtensionOriginFromRuntimeId, rewriteChromeSchemeLiterals, rewriteNativeMessagingCalls, rewriteExtensionIdPlaceholderUrls, guardAncestorOriginsAccess, guardGeckoSettingsAccess, rewriteSelfPageExtensionUrls, rewriteBackgroundContextChecks, idempotentContentScriptGlobals, guardContentScriptReruns, guardLocaleTailMessage } from "./input/stage.js";
-import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireUserScriptsContentScript, wireCdpKeepalive, deriveProxyHosts, derivePanelWindowQuery, backgroundHandlesFetch, DEBUG_RPC_TOKEN_FILENAME } from "./runtime/shim.js";
+import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPageScript, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireUserScriptsContentScript, wireCdpKeepalive, deriveProxyHosts, derivePanelWindowQuery, backgroundHandlesFetch, DEBUG_RPC_TOKEN_FILENAME } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
 import { synthesizePlaceholderIcons } from "./input/icons.js";
@@ -257,6 +257,10 @@ export function convert(opts: ConvertOptions): ConvertResult {
       const n = injectShimIntoHtmlPages(stageDir, polyfillFile);
       if (n > 0) ok(`Shim${polyfillFile ? " + polyfill" : ""} injected into ${n} HTML page(s)`);
       if (needsCdpShim) ok("chrome.debugger detected \u2192 enabled CDP emulation shim (kept scripting + <all_urls>)");
+    }
+    if (opts.pageScript) {
+      const n = injectPageScript(stageDir, opts.pageScript);
+      ok(`Page script ${basename(opts.pageScript)} loaded in ${n} HTML page(s) (--page-script)`);
     }
 
     const transformed = transformManifest(manifest, permissionsToRemove, stageDir, {
