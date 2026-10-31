@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, extname, join } from "node:path";
 import { run } from "../util.js";
+import { readProjectFile, writeProjectFile, type ProjectFile } from "./xcproj.js";
 import type { Manifest } from "../types.js";
 
 /**
@@ -246,9 +247,11 @@ function groupDir(groups: PbxGroup[], fileRef: string, root: string): string | n
  * already has one or has no asset catalog to sit next to.
  */
 export function writeAppearanceAwareIcon(xcodeproj: string, sourceIcon: string, invertInDark: boolean): string[] {
-  const pbxproj = join(xcodeproj, "project.pbxproj");
-  if (!existsSync(pbxproj)) return [];
-  let pbx = readFileSync(pbxproj, "utf-8");
+  const file = readProjectFile(xcodeproj);
+  if (!file) return [];
+  if (file.format === "xcproj") return writeAppearanceAwareIconXcproj(file, xcodeproj, sourceIcon, invertInDark);
+  const pbxproj = file.path;
+  let pbx = file.content;
   if (pbx.includes("folder.iconcomposer.icon")) return [];
   const root = dirname(xcodeproj);
   const groups = parseGroups(pbx);
@@ -278,4 +281,42 @@ export function writeAppearanceAwareIcon(xcodeproj: string, sourceIcon: string, 
   }
   if (written.length > 0) writeFileSync(pbxproj, pbx, "utf-8");
   return written;
+}
+
+// Xcode 27 projects list files by path under nested groups, each file carrying the
+// build phases it belongs to. The catalog line is
+//   { "path": "Assets.xcassets", "target-membership": [ "<App>/resources" ] },
+// so the icon bundle becomes the same line with its own path, right after it. The
+// group chain above the line gives the directory the catalog lives in.
+function writeAppearanceAwareIconXcproj(file: ProjectFile, xcodeproj: string, sourceIcon: string, invertInDark: boolean): string[] {
+  let content = file.content;
+  if (content.includes('"path": "AppIcon.icon"')) return [];
+  const root = dirname(xcodeproj);
+  const written: string[] = [];
+  const lineRe = /^([ \t]*)\{ "path": "Assets\.xcassets", "target-membership": \[ [^\]]*\] \},\n/gm;
+  const matches = Array.from(content.matchAll(lineRe));
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const m = matches[i];
+    const dir = xcprojGroupDir(content.slice(0, m.index!), root);
+    if (!existsSync(join(dir, "Assets.xcassets"))) continue;
+    const iconLine = m[0].replace('"path": "Assets.xcassets"', '"path": "AppIcon.icon"');
+    content = content.slice(0, m.index! + m[0].length) + iconLine + content.slice(m.index! + m[0].length);
+    writeIconBundle(dir, sourceIcon, invertInDark);
+    written.push(join(dir, "AppIcon.icon"));
+  }
+  if (written.length > 0) writeProjectFile(file, content);
+  return written;
+}
+
+// Directory of the group a line sits in: walk the text before it, pushing a group's
+// path when it opens and popping when its `children` array closes.
+function xcprojGroupDir(before: string, root: string): string {
+  const stack: string[] = [];
+  const tokens = before.matchAll(/"kind": "(group|variant-group)",\n[ \t]*(?:"path": "([^"]*)"|"name": "[^"]*")|^[ \t]*\],\n[ \t]*\},/gm);
+  for (const t of tokens) {
+    if (t[1] === "group") stack.push(t[2] ?? "");
+    else if (t[1] === "variant-group") stack.push("");
+    else stack.pop();
+  }
+  return join(root, ...stack.filter((p) => p && !p.startsWith("<")));
 }

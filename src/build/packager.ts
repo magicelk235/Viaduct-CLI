@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { tmpdir, homedir } from "node:os";
 import { join, basename, dirname } from "node:path";
 import { run, info, warn } from "../util.js";
+import { readProjectFile, writeProjectFile, editSettingsBlocks, getSetting, setSetting, isExtensionBlock } from "./xcproj.js";
 import type { Platforms } from "../types.js";
 
 function findFiles(dir: string, predicate: (name: string, full: string) => boolean, depth = 3, acc: string[] = []): string[] {
@@ -77,13 +78,19 @@ export function runPackager(opts: PackageOptions): string | null {
  * and `build` (CFBundleVersion) must be dotted integers.
  */
 export function setBuildVersion(xcodeproj: string, opts: { short: string; build: string }): void {
-  const pbxproj = join(xcodeproj, "project.pbxproj");
-  if (!existsSync(pbxproj)) return;
-  const content = readFileSync(pbxproj, "utf-8");
-  const next = content
-    .replace(/CURRENT_PROJECT_VERSION = [^;]+;/g, `CURRENT_PROJECT_VERSION = ${opts.build};`)
-    .replace(/MARKETING_VERSION = [^;]+;/g, `MARKETING_VERSION = ${opts.short};`);
-  if (next !== content) writeFileSync(pbxproj, next, "utf-8");
+  const file = readProjectFile(xcodeproj);
+  if (!file) return;
+  const content = file.content;
+  const next = file.format === "xcproj"
+    ? editSettingsBlocks(content, (body) => {
+        if (getSetting(body, "CURRENT_PROJECT_VERSION") !== null) body = setSetting(body, "CURRENT_PROJECT_VERSION", opts.build);
+        if (getSetting(body, "MARKETING_VERSION") !== null) body = setSetting(body, "MARKETING_VERSION", opts.short);
+        return body;
+      })
+    : content
+        .replace(/CURRENT_PROJECT_VERSION = [^;]+;/g, `CURRENT_PROJECT_VERSION = ${opts.build};`)
+        .replace(/MARKETING_VERSION = [^;]+;/g, `MARKETING_VERSION = ${opts.short};`);
+  writeProjectFile(file, next);
 }
 
 /**
@@ -92,10 +99,26 @@ export function setBuildVersion(xcodeproj: string, opts: { short: string; build:
  * This is best-effort; the authoritative check is verifyBuiltBundleId().
  */
 export function patchProjectBundleIds(xcodeproj: string, bundleId: string): void {
-  const pbxproj = join(xcodeproj, "project.pbxproj");
-  if (!existsSync(pbxproj)) return;
-  let content = readFileSync(pbxproj, "utf-8");
+  const file = readProjectFile(xcodeproj);
+  if (!file) return;
+  let content = file.content;
   const extId = `${bundleId}.Extension`;
+
+  if (file.format === "xcproj") {
+    content = editSettingsBlocks(content, (body) => {
+      const id = getSetting(body, "PRODUCT_BUNDLE_IDENTIFIER");
+      // Same rule as the plist branch below: the appex is whichever target the packager
+      // suffixed ".Extension", except the app id itself when the user chose one so named.
+      if (id !== null) body = setSetting(body, "PRODUCT_BUNDLE_IDENTIFIER", id.endsWith(".Extension") && id !== bundleId ? extId : bundleId);
+      if (getSetting(body, "ENABLE_APP_SANDBOX") === "YES" && getSetting(body, "ENABLE_OUTGOING_NETWORK_CONNECTIONS") === null) {
+        body = setSetting(body, "ENABLE_OUTGOING_NETWORK_CONNECTIONS", "YES", "ENABLE_APP_SANDBOX");
+      }
+      return body;
+    });
+    writeProjectFile(file, content);
+    patchExtensionIdInSwift(xcodeproj, extId);
+    return;
+  }
 
   // Extension targets carry a ".Extension" suffix in the generated id. Skip the
   // exact app id: a user bundle id that itself ends in ".Extension" (allowed by
@@ -130,9 +153,12 @@ export function patchProjectBundleIds(xcodeproj: string, bundleId: string): void
     "$1\n\t\t\t\tENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;"
   );
 
-  writeFileSync(pbxproj, content, "utf-8");
+  writeProjectFile(file, content);
+  patchExtensionIdInSwift(xcodeproj, extId);
+}
 
-  // The generated Swift references the extension id for "open preferences" deep links.
+// The generated Swift references the extension id for "open preferences" deep links.
+function patchExtensionIdInSwift(xcodeproj: string, extId: string): void {
   for (const swift of findFiles(xcodeproj.replace(/[^/]+\.xcodeproj$/, ""), (n) => n.endsWith(".swift"), 4)) {
     let s = readFileSync(swift, "utf-8");
     if (s.includes("extensionBundleIdentifier")) {
@@ -495,14 +521,17 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling, URLSessio
  * only blocks whose bundle id is NOT the ".Extension" appex.
  */
 export function unsandboxAppTarget(xcodeproj: string): void {
-  const pbxproj = join(xcodeproj, "project.pbxproj");
-  if (!existsSync(pbxproj)) return;
-  const content = readFileSync(pbxproj, "utf-8");
-  const next = content.replace(
-    /ENABLE_APP_SANDBOX = YES;([\s\S]*?PRODUCT_BUNDLE_IDENTIFIER = "?)([\w.\-$()]+)("?;)/g,
-    (m, mid, bid, tail) => (bid.endsWith(".Extension") ? m : "ENABLE_APP_SANDBOX = NO;" + mid + bid + tail),
-  );
-  if (next !== content) writeFileSync(pbxproj, next, "utf-8");
+  const file = readProjectFile(xcodeproj);
+  if (!file) return;
+  const content = file.content;
+  const next = file.format === "xcproj"
+    ? editSettingsBlocks(content, (body) =>
+        !isExtensionBlock(body) && getSetting(body, "ENABLE_APP_SANDBOX") === "YES" ? setSetting(body, "ENABLE_APP_SANDBOX", "NO") : body)
+    : content.replace(
+        /ENABLE_APP_SANDBOX = YES;([\s\S]*?PRODUCT_BUNDLE_IDENTIFIER = "?)([\w.\-$()]+)("?;)/g,
+        (m, mid, bid, tail) => (bid.endsWith(".Extension") ? m : "ENABLE_APP_SANDBOX = NO;" + mid + bid + tail),
+      );
+  writeProjectFile(file, next);
 }
 
 /**
@@ -514,15 +543,18 @@ export function unsandboxAppTarget(xcodeproj: string): void {
  * trick as unsandboxAppTarget, applied to the ".Extension" blocks only.
  */
 export function grantDownloadsFolder(xcodeproj: string): void {
-  const pbxproj = join(xcodeproj, "project.pbxproj");
-  if (!existsSync(pbxproj)) return;
-  const content = readFileSync(pbxproj, "utf-8");
+  const file = readProjectFile(xcodeproj);
+  if (!file) return;
+  const content = file.content;
   if (content.includes("ENABLE_FILE_ACCESS_DOWNLOADS_FOLDER")) return;
-  const next = content.replace(
-    /ENABLE_APP_SANDBOX = YES;([\s\S]*?PRODUCT_BUNDLE_IDENTIFIER = "?)([\w.\-$()]+)("?;)/g,
-    (m, mid, bid, tail) => (bid.endsWith(".Extension") ? "ENABLE_APP_SANDBOX = YES;\n\t\t\t\tENABLE_FILE_ACCESS_DOWNLOADS_FOLDER = readwrite;" + mid + bid + tail : m),
-  );
-  if (next !== content) writeFileSync(pbxproj, next, "utf-8");
+  const next = file.format === "xcproj"
+    ? editSettingsBlocks(content, (body) =>
+        isExtensionBlock(body) && getSetting(body, "ENABLE_APP_SANDBOX") === "YES" ? setSetting(body, "ENABLE_FILE_ACCESS_DOWNLOADS_FOLDER", "readwrite", "ENABLE_APP_SANDBOX") : body)
+    : content.replace(
+        /ENABLE_APP_SANDBOX = YES;([\s\S]*?PRODUCT_BUNDLE_IDENTIFIER = "?)([\w.\-$()]+)("?;)/g,
+        (m, mid, bid, tail) => (bid.endsWith(".Extension") ? "ENABLE_APP_SANDBOX = YES;\n\t\t\t\tENABLE_FILE_ACCESS_DOWNLOADS_FOLDER = readwrite;" + mid + bid + tail : m),
+      );
+  writeProjectFile(file, next);
 }
 
 /**
