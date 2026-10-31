@@ -47,6 +47,9 @@ implement, then runs Apple's `safari-web-extension-packager` and `xcodebuild` to
 produce a signed app. The result can be loaded straight into Safari for
 development or built through Xcode for TestFlight.
 
+Viaduct is also a Mac app that does this without a terminal:
+[magicelklabs.com/viaduct](https://magicelklabs.com/viaduct/).
+
 ## What it does
 
 ### Input
