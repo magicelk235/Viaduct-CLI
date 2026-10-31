@@ -180,7 +180,9 @@ OPTIONS
       --page-script <file>  Load <file> in every HTML page the extension ships (popup,
                             side panel, options), after the shim and before the page's
                             own scripts. For a fix only one extension needs, kept out of
-                            viaduct itself.
+                            viaduct itself. Without the flag, a file named after the
+                            extension's Chrome id in ~/.viaduct/page-scripts/ is loaded
+                            (e.g. fcoeoabgfenejglbffodgkkbkcdhcgfn.js for Claude).
       --debug               Emit the shim with debug tracing enabled. Traces persist to a
                             bounded ring buffer (last 2000 entries, batched writes) in
                             storage.local under __viaduct_debug_log__ — read it live from

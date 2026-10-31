@@ -7,7 +7,7 @@ import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths, raiseMinVersionForMainWorld, MAIN_WORLD_MIN_SAFARI_VERSION, dropEmptyReservedCommands } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
 import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteExtensionOriginFromRuntimeId, rewriteChromeSchemeLiterals, rewriteNativeMessagingCalls, rewriteExtensionIdPlaceholderUrls, guardAncestorOriginsAccess, guardGeckoSettingsAccess, rewriteSelfPageExtensionUrls, rewriteBackgroundContextChecks, idempotentContentScriptGlobals, guardContentScriptReruns, guardLocaleTailMessage } from "./input/stage.js";
-import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPageScript, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireUserScriptsContentScript, wireCdpKeepalive, deriveProxyHosts, derivePanelWindowQuery, backgroundHandlesFetch, DEBUG_RPC_TOKEN_FILENAME } from "./runtime/shim.js";
+import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPageScript, findPageScript, pageScriptsDir, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireUserScriptsContentScript, wireCdpKeepalive, deriveProxyHosts, derivePanelWindowQuery, backgroundHandlesFetch, DEBUG_RPC_TOKEN_FILENAME } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
 import { synthesizePlaceholderIcons } from "./input/icons.js";
@@ -258,9 +258,12 @@ export function convert(opts: ConvertOptions): ConvertResult {
       if (n > 0) ok(`Shim${polyfillFile ? " + polyfill" : ""} injected into ${n} HTML page(s)`);
       if (needsCdpShim) ok("chrome.debugger detected \u2192 enabled CDP emulation shim (kept scripting + <all_urls>)");
     }
-    if (opts.pageScript) {
-      const n = injectPageScript(stageDir, opts.pageScript);
-      ok(`Page script ${basename(opts.pageScript)} loaded in ${n} HTML page(s) (--page-script)`);
+    // --page-script wins; otherwise a script filed under the extension's Chrome id in
+    // the page-scripts directory applies, so the fix survives re-conversion and updates.
+    const pageScript = opts.pageScript ?? findPageScript(chromeId);
+    if (pageScript) {
+      const n = injectPageScript(stageDir, pageScript);
+      ok(`Page script ${basename(pageScript)} loaded in ${n} HTML page(s) (${opts.pageScript ? "--page-script" : `from ${pageScriptsDir()}`})`);
     }
 
     const transformed = transformManifest(manifest, permissionsToRemove, stageDir, {

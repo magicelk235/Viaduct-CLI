@@ -319,6 +319,11 @@ single-extension flags and are rejected here.
                          page as a standalone window (e.g. mode=window), since a
                          popover is one. Pass "" to open the page bare; a page the
                          extension opened with its own query is left untouched.
+    --page-script <file> Load <file> in every HTML page the extension ships (popup,
+                         side panel, options), after the shim and before the page's
+                         own scripts. For a fix only one extension needs. Without
+                         the flag, ~/.viaduct/page-scripts/<chrome-id>.js is loaded
+                         when it exists, so the fix sticks across re-conversions.
     --debug              Emit the shim with debug tracing enabled. Traces persist
                          to a bounded ring buffer (last 2000 entries) in
                          storage.local under __viaduct_debug_log__; read it with

@@ -1,5 +1,6 @@
 import { writeFileSync, readFileSync, readdirSync, copyFileSync, existsSync, statSync } from "node:fs";
 import { join, dirname, relative, basename } from "node:path";
+import { homedir } from "node:os";
 import type { Manifest } from "../types.js";
 import { TEMPLATE_DIR, RUNTIME_DIR } from "../paths.js";
 import { resolveI18nString } from "../manifest/manifest.js";
@@ -443,6 +444,24 @@ export function injectPageScript(dir: string, source: string): number {
     count++;
   }
   return count;
+}
+
+// Page scripts kept per extension, so a fix one bundle needs is applied on every
+// conversion of it without passing --page-script each time. The file is named after the
+// extension's Chrome id (derived from the manifest key, so the same bundle always maps to
+// the same file across updates). The directory can be moved with VIADUCT_PAGE_SCRIPTS.
+export function pageScriptsDir(): string {
+  return process.env.VIADUCT_PAGE_SCRIPTS || join(homedir(), ".viaduct", "page-scripts");
+}
+
+export function findPageScript(chromeId: string | undefined): string | undefined {
+  if (!chromeId) return undefined;
+  const file = join(pageScriptsDir(), `${chromeId}.js`);
+  try {
+    return statSync(file).isFile() ? file : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
