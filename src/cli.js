@@ -23,7 +23,11 @@ if (!existsSync(script)) {
 
 const result = await forward(script, args);
 if (help && result.code === 0) {
-  // Wait for the write so a piped --help isn't cut off by the exit.
-  await new Promise((resolve) => process.stdout.write(BROWSER_HELP, resolve));
+  // Wait for the write so a piped --help isn't cut off by the exit. A reader
+  // that already went away (`| head`) isn't an error.
+  await new Promise((resolve) => {
+    process.stdout.once("error", resolve);
+    process.stdout.write(BROWSER_HELP, resolve);
+  });
 }
 exitLike(result);

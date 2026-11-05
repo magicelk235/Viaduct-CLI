@@ -17,14 +17,21 @@ export function forward(script, args) {
       relays.push([signal, relay]);
       process.on(signal, relay);
     }
-    child.on("error", reject);
+    child.on("error", (error) => {
+      removeRelays();
+      reject(error);
+    });
     child.on("exit", (code, signal) => resolve({ code, signal }));
   });
 }
 
-export function exitLike({ code, signal }) {
+function removeRelays() {
   for (const [name, relay] of relays) process.off(name, relay);
   relays = [];
+}
+
+export function exitLike({ code, signal }) {
+  removeRelays();
   if (signal) {
     process.kill(process.pid, signal);
     // Still here when Node ignores the signal (SIGPIPE): use the shell's convention.

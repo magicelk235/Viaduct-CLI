@@ -33,7 +33,11 @@ test("SIGTERM reaches the engine and its exit code wins", async () => {
   // If forwarding breaks, don't leave either process behind.
   const guard = setTimeout(() => {
     harness.kill("SIGKILL");
-    if (enginePid) process.kill(enginePid, "SIGKILL");
+    try {
+      if (enginePid) process.kill(enginePid, "SIGKILL");
+    } catch {
+      // already gone
+    }
   }, 10_000);
   const maybeTerminate = () => {
     enginePid ??= Number(stderr.match(/^pid (\d+)\n/)?.[1]) || undefined;
