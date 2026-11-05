@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 
 const SRC = fileURLToPath(new URL("../src", import.meta.url));
 
-test("piped --help survives a reader that has already gone", async (t) => {
+// The stub install has only a Safari engine, and Safari is refused off macOS.
+test("piped --help survives a reader that has already gone", { skip: process.platform !== "darwin" && "Safari needs macOS" }, async (t) => {
   // An install layout with a Safari engine that prints nothing, then exits 0
   // after the reader has closed the pipe.
   const dir = mkdtempSync(join(tmpdir(), "viaduct-cli-"));

@@ -26,4 +26,5 @@ jobs:
       - run: npm test
       
       # The --provenance flag securely links the published package to this specific workflow run
-      - run: npm publish --provenance --access public
+      # A GitHub pre-release goes to `next`; Viaduct.app only installs `latest`.
+      - run: npm publish --provenance --access public --tag ${{ github.event.release.prerelease && 'next' || 'latest' }}
