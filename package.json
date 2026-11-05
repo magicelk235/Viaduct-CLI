@@ -1,56 +1,21 @@
 {
   "name": "@magicelk235/viaduct",
-  "version": "1.18.0",
-  "publishConfig": {
-    "access": "public"
-  },
-  "description": "Convert a Chrome extension into a Safari Web Extension (macOS/iOS) ready for local dev or CI/CD.",
+  "version": "2.0.0",
+  "description": "Convert a Chrome extension for Safari or Firefox.",
   "type": "module",
-  "bin": {
-    "viaduct": "dist/cli.js"
-  },
-  "files": [
-    "dist",
-    "README.md"
-  ],
+  "bin": { "viaduct": "dist/cli.js" },
+  "files": ["dist", "README.md"],
   "scripts": {
-    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc && node -e \"const f=require('node:fs');f.cpSync('src/templates','dist/templates',{recursive:true});f.cpSync('src/runtime','dist/runtime',{recursive:true})\" && node -e \"require('node:fs').chmodSync('dist/cli.js',0o755)\"",
-    "dev": "tsc --watch",
-    "start": "node dist/cli.js",
-    "typecheck": "tsc --noEmit",
+    "build": "node scripts/build.mjs",
     "test": "npm run build && node --test test/*.test.js",
-    "prepare": "npm run build",
     "prepublishOnly": "npm run build"
   },
-  "keywords": [
-    "chrome-extension",
-    "safari",
-    "safari-web-extension",
-    "web-extension",
-    "converter",
-    "manifest-v3",
-    "macos",
-    "xcode",
-    "cli"
-  ],
-  "author": "magicelk235",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/magicelk235/Viaduct-CLI.git"
-  },
-  "bugs": {
-    "url": "https://github.com/magicelk235/Viaduct-CLI/issues"
-  },
+  "publishConfig": { "access": "public" },
+  "repository": { "type": "git", "url": "git+https://github.com/magicelk235/Viaduct-CLI.git" },
+  "bugs": { "url": "https://github.com/magicelk235/Viaduct-CLI/issues" },
   "homepage": "https://github.com/magicelk235/Viaduct-CLI#readme",
-  "os": [
-    "darwin"
-  ],
-  "engines": {
-    "node": ">=18"
-  },
+  "author": "magicelk235",
+  "engines": { "node": ">=18" },
   "license": "PolyForm-Shield-1.0.0",
-  "devDependencies": {
-    "@types/node": "^22.0.0",
-    "typescript": "^5.6.0"
-  }
+  "devDependencies": { "@magicelk235/aqueduct": "1.18.1", "@magicelk235/lavaduct": "0.1.0" }
 }
