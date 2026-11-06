@@ -103,16 +103,18 @@ Viaduct.app downloads the npm `latest` tag and never downgrades, so a bad
    `npm install`.
 2. Bump `version` in `package.json`: patch for an engine patch, minor for an
    engine minor or a new option, major for anything that changes Safari output.
-3. Run `npm test`, tag `v<version>` and create the GitHub release as a
-   pre-release. The publish workflow sends a pre-release to the `next` dist-tag.
+3. Run `npm test`, commit and push the bump, then tag `v<version>` and create
+   the GitHub release as a pre-release. The publish workflow sends a
+   pre-release to the `next` dist-tag.
 
    ```sh
    npm test
+   git commit -am "<version>" && git push
    git tag v<version> && git push origin v<version>
    gh release create v<version> --title v<version> --notes-file notes.md --prerelease
    ```
 
-4. Quit Viaduct.app, install `next` into its engine folder the way the app's
+4. Quit Viaduct.app, install `next` into its CLI folder the way the app's
    updater does, and convert one extension in the app:
 
    ```sh
