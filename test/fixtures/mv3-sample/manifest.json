@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "MV3 Sample",
+  "version": "1.0.0",
+  "description": "Minimal MV3 extension exercising the analyzer.",
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html" },
+  "permissions": ["storage", "tabs"],
+  "host_permissions": ["https://example.com/*"],
+  "content_scripts": [
+    { "matches": ["https://example.com/*"], "js": ["content.js"] }
+  ]
+}
