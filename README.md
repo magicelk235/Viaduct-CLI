@@ -90,7 +90,7 @@ viaduct 1.18.0, because aqueduct is that code under a new name.
 ## Docs
 
 The wiki is at
-[github.com/magicelk235/Viaduct-CLI/wiki](https://github.com/magicelk235/Viaduct-CLI/wiki).
+[github.com/magicelk235/Aqueduct/wiki](https://github.com/magicelk235/Aqueduct/wiki).
 It documents aqueduct, which viaduct runs for Safari.
 
 ## Releasing
