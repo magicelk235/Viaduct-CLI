@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -91,4 +92,46 @@ test("guarding twice leaves one guard", () => {
   const once = readFileSync(join(dir, "content.js"), "utf-8");
   assert.equal(guardContentScriptReruns(dir, manifest), 0);
   assert.equal(readFileSync(join(dir, "content.js"), "utf-8"), once);
+});
+
+// Return YouTube Dislike (webpack's /******/ runtime) and MetaMask (LavaMoat's SES header)
+// open with a comment, have many more comments between whitespace, and no "use strict"
+// at the top. Looking for a prologue in files like these once backtracked through every
+// way of grouping those comments and never finished, so the conversion sat at
+// "Preparing assets". Runs in a child so a regression fails on the timeout instead of
+// hanging the suite.
+test("files with many leading comments and no prologue are guarded promptly", () => {
+  const dir = stage({
+    "ryd.content-script.js":
+      "/******/ (() => { // webpackBootstrap\n" +
+      "/******/ \t// The module cache\n".repeat(40) +
+      "/******/ \tvar __webpack_module_cache__ = {};\n",
+    "scripts/contentscript.js":
+      "/*! SES sources included by LavaMoat. Do not optimize or minify. */\n;\n// ses@2.2.0\n" +
+      "  /* comment */\n".repeat(40) +
+      "(functors => options => {\n  'use strict';\n})\n",
+  });
+  const manifest = { content_scripts: [{ matches: ["<all_urls>"], js: ["ryd.content-script.js", "scripts/contentscript.js"] }] };
+  const stageUrl = new URL("../dist/input/stage.js", import.meta.url).href;
+  const child = spawnSync(
+    process.execPath,
+    ["--input-type=module", "-e", `const { guardContentScriptReruns } = await import(${JSON.stringify(stageUrl)}); guardContentScriptReruns(${JSON.stringify(dir)}, ${JSON.stringify(manifest)});`],
+    { timeout: 5000, encoding: "utf-8" }
+  );
+  assert.equal(child.signal, null, "guarding did not finish within 5 s");
+  assert.equal(child.status, 0, child.stderr);
+  for (const rel of manifest.content_scripts[0].js) {
+    assert.ok(readFileSync(join(dir, rel), "utf-8").startsWith("if(typeof document"), `${rel} is guarded at its top`);
+  }
+});
+
+test("a prologue after doc comments and line comments keeps the file strict", () => {
+  const dir = stage({ "c.js": "/***/\n/** @license x */ // note\n\t\"use strict\";\nvar sloppy = (function () { return this; })();\nruns++;\n" });
+  guardContentScriptReruns(dir, { content_scripts: [{ matches: ["<all_urls>"], js: ["c.js"] }] });
+  const c = readFileSync(join(dir, "c.js"), "utf-8");
+  assert.ok(c.startsWith("/***/\n/** @license x */ // note\n\t\"use strict\";;if(typeof document"));
+  const { ctx } = world();
+  assert.equal(evaluate(ctx, c), null);
+  assert.equal(ctx.sloppy, undefined, "this is undefined inside a strict function");
+  assert.equal(ctx.runs, 1);
 });

@@ -701,9 +701,12 @@ export function idempotentContentScriptGlobals(
 // (scripting.executeScript re-injecting it, a second content_scripts entry at another
 // run_at) still runs, as in Chrome. DOM expandos are per world, so the isolated and page
 // worlds keep separate marks. Inserted after a "use strict" prologue so strictness is
-// kept, and on the first line so source-map line numbers don't move.
+// kept, and on the first line so source-map line numbers don't move. Each comment ends at
+// its own first */ and whitespace is taken one character at a time, so there's only one
+// way to read the leading run: a lazy [\s\S]*? comment could stretch to any later */ and
+// backtracked through every grouping on webpack and LavaMoat bundles, hanging the stage.
 const RERUN_GUARD_KEY = "__c2sRanContentScripts";
-const PROLOGUE_RE = /^(?:\s+|\/\/[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*(["'])use strict\1[ \t]*;?/;
+const PROLOGUE_RE = /^(?:\s|\/\/[^\n]*(?:\n|$)|\/\*(?:[^*]|\*(?!\/))*\*\/)*(["'])use strict\1[ \t]*;?/;
 
 export function guardContentScriptReruns(
   stageDir: string,
