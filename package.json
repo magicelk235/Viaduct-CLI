@@ -3,19 +3,36 @@
   "version": "2.0.0",
   "description": "Convert a Chrome extension for Safari or Firefox.",
   "type": "module",
-  "bin": { "viaduct": "dist/cli.js" },
-  "files": ["dist", "README.md"],
+  "bin": {
+    "viaduct": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "build": "node scripts/build.mjs",
     "test": "npm run build && node --test test/*.test.js",
     "prepublishOnly": "npm run build"
   },
-  "publishConfig": { "access": "public" },
-  "repository": { "type": "git", "url": "git+https://github.com/magicelk235/Viaduct-CLI.git" },
-  "bugs": { "url": "https://github.com/magicelk235/Viaduct-CLI/issues" },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/magicelk235/Viaduct-CLI.git"
+  },
+  "bugs": {
+    "url": "https://github.com/magicelk235/Viaduct-CLI/issues"
+  },
   "homepage": "https://github.com/magicelk235/Viaduct-CLI#readme",
   "author": "magicelk235",
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "license": "PolyForm-Shield-1.0.0",
-  "devDependencies": { "@magicelk235/aqueduct": "1.18.1", "@magicelk235/lavaduct": "0.1.1" }
+  "devDependencies": {
+    "@magicelk235/aqueduct": "1.18.1",
+    "@magicelk235/lavaduct": "0.1.2"
+  }
 }
