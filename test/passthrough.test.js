@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { cpSync, mkdtempSync, rmSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -78,6 +78,40 @@ test("a Safari conversion's log is byte-identical", { skip: !hasPackager() && "n
   const log = viaduct.stderr.toString();
   assert.ok(log.includes('Loaded "MV3 Sample"'), log);
   assert.ok(log.includes("Staging clean"), log);
+});
+
+// Return YouTube Dislike's webpack runtime and MetaMask's LavaMoat contentscript.js open
+// with a comment, then have many more comments between whitespace and no "use strict" at
+// the top. An engine that backtracks through every way of grouping those comments while
+// looking for the prologue never gets past "Preparing assets", and the app's install
+// queue waits behind it. The engine's SIGTERM handler can't run while it's stuck, so
+// the timeout kills the whole process group instead of signalling the umbrella.
+test("the bundled Safari engine converts webpack and LavaMoat content scripts promptly", { skip: !hasPackager() && "needs macOS with safari-web-extension-packager" }, async (t) => {
+  const tmp = tempDir(t);
+  const ext = join(tmp, "ext");
+  mkdirSync(join(ext, "scripts"), { recursive: true });
+  const js = ["ryd.content-script.js", "scripts/contentscript.js"];
+  writeFileSync(join(ext, "manifest.json"), JSON.stringify({
+    manifest_version: 3, name: "Long Prologue", version: "1.0.0",
+    content_scripts: [{ matches: ["https://example.com/*"], js }],
+  }));
+  writeFileSync(join(ext, js[0]),
+    "/******/ (() => { // webpackBootstrap\n" +
+    "/******/ \t// The module cache\n".repeat(40) +
+    "/******/ \tvar __webpack_module_cache__ = {};\n/******/ })();\n");
+  writeFileSync(join(ext, js[1]),
+    "/*! SES sources included by LavaMoat. Do not optimize or minify. */\n;\n// ses@2.2.0\n" +
+    "  /* comment */\n".repeat(40) +
+    "(functors => options => {\n  'use strict';\n});\n");
+  const cli = spawn(process.execPath, [VD, ext, "--no-build", "-o", join(tmp, "out")], { cwd: tmp, detached: true, stdio: ["ignore", "ignore", "pipe"] });
+  let stderr = "";
+  cli.stderr.setEncoding("utf8").on("data", (d) => { stderr += d; });
+  let stuck = false;
+  const guard = setTimeout(() => { stuck = true; process.kill(-cli.pid, "SIGKILL"); }, 60_000);
+  const [code] = await new Promise((resolve) => cli.on("close", (...r) => resolve(r)));
+  clearTimeout(guard);
+  assert.ok(!stuck, "the conversion did not finish within 60 s");
+  assert.equal(code, 0, stderr);
 });
 
 test("--browser firefox gives lavaduct's output", { skip: !firefoxNode && "lavaduct needs Node 22.13" }, () => {
