@@ -1,0 +1,29 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # aqueduct is `os: darwin`, so `npm ci` fails on Linux. The off-macOS
+    # routing is tested on macOS with test/fixtures/as-linux.mjs.
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        # 20 is the Node major Viaduct.app bundles.
+        node-version: [20, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm test
