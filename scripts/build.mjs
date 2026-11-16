@@ -1,10 +1,13 @@
 // Builds dist/: the umbrella's own source plus a copy of each engine's dist/.
-// The app never runs npm install, so everything the CLI runs has to be in here.
+// The bundled engines are the floor: dist/ has to run on its own, because old
+// Viaduct.app installs only keep dist/ and package.json. Newer in-range engines
+// come from node_modules at run time (src/engine.js).
 // Each engine sits in its own folder with a package.json beside its dist/,
 // because the engines read ../package.json for --version.
 
 import { chmodSync, cpSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { caretFloor } from "../src/engine.js";
 
 const at = (path) => fileURLToPath(new URL(`../${path}`, import.meta.url));
 const readJson = (path) => JSON.parse(readFileSync(path, "utf8"));
@@ -13,13 +16,19 @@ const pkg = readJson(at("package.json"));
 const ENGINES = ["aqueduct", "lavaduct"];
 
 // Check every engine before touching dist/, so a stale node_modules leaves the
-// last good build in place.
+// last good build in place. The bundled copy must be the bottom of the range,
+// or the floor promises less than it ships.
 const engines = ENGINES.map((engine) => {
   const root = at(`node_modules/@magicelk235/${engine}`);
   const installed = readJson(`${root}/package.json`);
-  const pinned = pkg.devDependencies[`@magicelk235/${engine}`];
-  if (installed.version !== pinned) {
-    console.error(`build: node_modules has ${engine} ${installed.version}, package.json pins ${pinned}. Run npm ci.`);
+  const range = pkg.optionalDependencies?.[`@magicelk235/${engine}`];
+  const floor = caretFloor(range)?.join(".");
+  if (!floor) {
+    console.error(`build: package.json's range for ${engine} is ${range}; it has to be ^X.Y.Z.`);
+    process.exit(1);
+  }
+  if (installed.version !== floor) {
+    console.error(`build: node_modules has ${engine} ${installed.version}, the bottom of ${range} is ${floor}. Run npm ci.`);
     process.exit(1);
   }
   return { engine, root, installed };

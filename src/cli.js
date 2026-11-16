@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { engineScript } from "./engine.js";
 import { route, BROWSER_HELP } from "./route.js";
 import { forward, exitLike } from "./forward.js";
 
@@ -16,7 +17,7 @@ const routed = route(process.argv.slice(2), { platform: process.platform, nodeVe
 if (!routed.ok) fail(routed.message, routed.exitCode);
 
 const { engine, args, help } = routed;
-const script = fileURLToPath(new URL(`./engines/${engine}/dist/cli.js`, import.meta.url));
+const script = engineScript(engine, fileURLToPath(new URL(".", import.meta.url)));
 if (!existsSync(script)) {
   fail(`This install of viaduct is missing its ${BROWSER_NAMES[engine]} engine (${engine}). Reinstall @magicelk235/viaduct.`, 1);
 }

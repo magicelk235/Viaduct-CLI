@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,4 +29,23 @@ test("piped --help survives a reader that has already gone", { skip: process.pla
   assert.equal(stderr, "");
   assert.equal(signal, null);
   assert.equal(code, 0);
+});
+
+test("the CLI runs the node_modules engine before the bundled one", { skip: process.platform !== "darwin" && "Safari needs macOS" }, (t) => {
+  // The app's layout: cli/dist/cli.js, cli/package.json, cli/node_modules/.
+  const root = mkdtempSync(join(tmpdir(), "viaduct-cli-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  cpSync(SRC, join(root, "dist"), { recursive: true });
+  writeFileSync(join(root, "package.json"), JSON.stringify({ optionalDependencies: { "@magicelk235/aqueduct": "^1.18.2" } }));
+  mkdirSync(join(root, "dist/engines/aqueduct/dist"), { recursive: true });
+  writeFileSync(join(root, "dist/engines/aqueduct/dist/cli.js"), "process.stdout.write('bundled');\n");
+  const run = () => spawnSync(process.execPath, [join(root, "dist/cli.js")], { encoding: "utf8" });
+
+  assert.equal(run().stdout, "bundled");
+
+  const installed = join(root, "node_modules/@magicelk235/aqueduct");
+  mkdirSync(join(installed, "dist"), { recursive: true });
+  writeFileSync(join(installed, "package.json"), JSON.stringify({ version: "1.18.3" }));
+  writeFileSync(join(installed, "dist/cli.js"), "process.stdout.write('node_modules');\n");
+  assert.equal(run().stdout, "node_modules");
 });

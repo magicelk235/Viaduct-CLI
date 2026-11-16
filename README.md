@@ -95,14 +95,31 @@ It documents aqueduct, which viaduct runs for Safari.
 
 ## Releasing
 
+viaduct declares a caret range for each engine in `optionalDependencies`, and
+bundles the bottom of each range in `dist/engines/`. npm and Viaduct.app 1.5.0
+or later install the newest engine inside the range next to it, and viaduct
+runs that copy before its bundled one. So an engine fix reaches users when that
+engine is promoted to `latest`; viaduct doesn't need a release for it.
+
+### When to release
+
+- viaduct's own code changes: routing, forwarding, help.
+- An engine ships a major version. Widen its range to the new major.
+- Optionally, to raise a bundled engine so old apps and offline installs get a
+  newer one. This never holds up an engine fix.
+
+### How
+
 Viaduct.app downloads the npm `latest` tag and never downgrades, so a bad
 `latest` can only be fixed by publishing a newer version. Every release goes to
 `next` first and is promoted to `latest` once it has converted in the app.
 
-1. To bump an engine, change its exact pin in `devDependencies` and run
-   `npm install`.
-2. Bump `version` in `package.json`: patch for an engine patch, minor for an
-   engine minor or a new option, major for anything that changes Safari output.
+1. To change an engine's range, set it to `^<version>` in
+   `optionalDependencies` and run `npm install`. `<version>` is the one that
+   gets bundled; the build refuses any other installed version.
+2. Bump `version` in `package.json`: patch for a fix or a raised bundled engine,
+   minor for a new option, major for a new engine major or anything that
+   changes Safari output.
 3. Run `npm test`, commit and push the bump, then tag `v<version>` and create
    the GitHub release as a pre-release. The publish workflow sends a
    pre-release to the `next` dist-tag.
@@ -115,7 +132,9 @@ Viaduct.app downloads the npm `latest` tag and never downgrades, so a bad
    ```
 
 4. Quit Viaduct.app, install `next` into its CLI folder the way the app's
-   updater does, and convert one extension in the app:
+   updater does, and convert one extension in the app. This leaves no
+   `node_modules` in the folder, so the app runs the bundled engines until its
+   updater installs newer ones:
 
    ```sh
    CLI="$HOME/Library/Application Support/Viaduct/cli"

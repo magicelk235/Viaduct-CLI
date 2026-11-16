@@ -13,6 +13,8 @@ const at = (path) => fileURLToPath(new URL(`../${path}`, import.meta.url));
 const AQ = at("node_modules/@magicelk235/aqueduct/dist/cli.js");
 const LV = at("node_modules/@magicelk235/lavaduct/dist/cli.js");
 const VD = at("dist/cli.js");
+// The copy old apps and offline installs run; dist/cli.js prefers node_modules.
+const BUNDLED_AQ = at("dist/engines/aqueduct/dist/cli.js");
 const FX = at("test/fixtures/mv3-sample");
 const AS_LINUX = at("test/fixtures/as-linux.mjs");
 
@@ -103,7 +105,7 @@ test("the bundled Safari engine converts webpack and LavaMoat content scripts pr
     "/*! SES sources included by LavaMoat. Do not optimize or minify. */\n;\n// ses@2.2.0\n" +
     "  /* comment */\n".repeat(40) +
     "(functors => options => {\n  'use strict';\n});\n");
-  const cli = spawn(process.execPath, [VD, ext, "--no-build", "-o", join(tmp, "out")], { cwd: tmp, detached: true, stdio: ["ignore", "ignore", "pipe"] });
+  const cli = spawn(process.execPath, [BUNDLED_AQ, ext, "--no-build", "-o", join(tmp, "out")], { cwd: tmp, detached: true, stdio: ["ignore", "ignore", "pipe"] });
   let stderr = "";
   cli.stderr.setEncoding("utf8").on("data", (d) => { stderr += d; });
   let stuck = false;

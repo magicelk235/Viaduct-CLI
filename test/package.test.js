@@ -10,16 +10,21 @@ const readJson = (path) => JSON.parse(readFileSync(at(path), "utf8"));
 const pkg = readJson("package.json");
 
 test("package.json keeps the contract", () => {
+  // aqueduct is darwin-only, so a hard dependency would fail every install off
+  // macOS; npm skips an optional one that doesn't fit the platform.
   assert.equal(pkg.dependencies, undefined);
   assert.equal(pkg.os, undefined);
   assert.equal(pkg.engines.node, ">=18");
   assert.deepEqual(pkg.bin, { viaduct: "dist/cli.js" });
-  for (const e of ["@magicelk235/aqueduct", "@magicelk235/lavaduct"]) assert.match(pkg.devDependencies[e], /^\d+\.\d+\.\d+$/);
+  for (const e of ["@magicelk235/aqueduct", "@magicelk235/lavaduct"]) {
+    assert.match(pkg.optionalDependencies[e], /^\^\d+\.\d+\.\d+$/);
+    assert.equal(pkg.devDependencies?.[e], undefined);
+  }
 });
 
-test("the bundled engines are the pinned versions", () => {
+test("the bundled engines are the bottom of their ranges", () => {
   for (const e of ["aqueduct", "lavaduct"])
-    assert.equal(readJson(`dist/engines/${e}/package.json`).version, pkg.devDependencies[`@magicelk235/${e}`]);
+    assert.equal(`^${readJson(`dist/engines/${e}/package.json`).version}`, pkg.optionalDependencies[`@magicelk235/${e}`]);
 });
 
 test("the tarball carries everything the app copies", () => {
