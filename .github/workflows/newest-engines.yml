@@ -1,0 +1,38 @@
+name: Newest engines
+
+# Runs the suite against the newest aqueduct and lavaduct inside package.json's
+# ranges: the engines a fresh install or Viaduct.app's updater picks up. An
+# engine patch or minor that broke the output the app parses shows up here
+# before most users have it.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 is the Node major Viaduct.app bundles.
+        node-version: [20, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      # Build from the lockfile, so dist/ bundles the bottom of each range.
+      - run: npm ci
+      - run: npm run build
+
+      # Then move node_modules to the newest in-range engines. dist/cli.js runs
+      # those before its bundled copies, the way an updated install does.
+      - run: npm update --no-save
+      - run: npm ls @magicelk235/aqueduct @magicelk235/lavaduct
+      - run: node --test test/*.test.js
