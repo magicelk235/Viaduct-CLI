@@ -23,9 +23,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Install on Node 24: on older Node npm skips lavaduct (it needs 22.13+).
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: 24
 
       # Build from the lockfile, so dist/ bundles the bottom of each range.
       - run: npm ci
@@ -35,4 +36,9 @@ jobs:
       # those before its bundled copies, the way an updated install does.
       - run: npm update --no-save
       - run: npm ls @magicelk235/aqueduct @magicelk235/lavaduct
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
       - run: node --test test/*.test.js
