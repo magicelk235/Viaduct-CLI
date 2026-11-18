@@ -16,6 +16,14 @@ body:
     validations:
       required: true
 
+  - type: input
+    id: browser
+    attributes:
+      label: Browser
+      placeholder: "Safari or Firefox"
+    validations:
+      required: false
+
   - type: textarea
     id: error
     attributes:
@@ -28,7 +36,7 @@ body:
   - type: input
     id: os
     attributes:
-      label: OS & Xcode version
-      placeholder: "e.g. macOS 15.2, Xcode 16.2"
+      label: OS & Xcode/Firefox version
+      placeholder: "e.g. macOS 15.2, Xcode 16.2, or Windows 11, Firefox 144"
     validations:
       required: true

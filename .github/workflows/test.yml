@@ -1,0 +1,37 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Off macOS npm skips aqueduct (`os: darwin`), so the build needs macOS.
+    # The off-macOS routing is tested on macOS with test/fixtures/as-linux.mjs.
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        # 20 is the Node major Viaduct.app bundles.
+        node-version: [20, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install and build on Node 24: on older Node npm skips lavaduct
+      # (it needs 22.13+), and the build has to bundle both engines.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - run: node --test test/*.test.js
