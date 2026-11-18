@@ -28,7 +28,8 @@ test("the bundled engines are the bottom of their ranges", () => {
 });
 
 test("the tarball carries everything the app copies", () => {
-  const [packed] = JSON.parse(execFileSync("npm", ["pack", "--dry-run", "--json"], { cwd: ROOT, encoding: "utf8" }));
+  // npm 11 prints an array of packages, npm 12 an object keyed by name.
+  const [packed] = Object.values(JSON.parse(execFileSync("npm", ["pack", "--dry-run", "--json"], { cwd: ROOT, encoding: "utf8" })));
   const paths = packed.files.map((f) => f.path);
   for (const f of ["dist/cli.js", "dist/route.js", "dist/forward.js",
     "dist/engines/aqueduct/package.json", "dist/engines/aqueduct/dist/cli.js",
